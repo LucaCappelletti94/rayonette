@@ -39,6 +39,16 @@ where
     })
 }
 
+/// The stable wire key for a task function: its `type_name`.
+///
+/// (DECISIONS.md decision 12.) The same function on both coordinator and agent
+/// produces the same key because it is the same compiled type. Pass the function
+/// *item* (not a coerced `fn` pointer) so the key is unique per function.
+#[must_use]
+pub fn fn_key<F: ?Sized>(_f: &F) -> &'static str {
+    std::any::type_name::<F>()
+}
+
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     payload
         .downcast_ref::<&str>()
@@ -73,6 +83,19 @@ impl Registry {
     pub fn with(mut self, key: impl Into<String>, handler: TaskHandler) -> Self {
         self.handlers.insert(key.into(), handler);
         self
+    }
+
+    /// Register a task function under its `type_name` key (see [`fn_key`]), the
+    /// same key the coordinator derives. This is what generated registry code
+    /// will call for each task function in Phase 3.
+    #[must_use]
+    pub fn with_fn<I, O, F>(self, f: F) -> Self
+    where
+        I: DeserializeOwned,
+        O: Serialize,
+        F: Fn(I) -> O + Send + Sync + 'static,
+    {
+        self.with(std::any::type_name::<F>(), handler(f))
     }
 
     fn get(&self, key: &str) -> Option<&TaskHandler> {

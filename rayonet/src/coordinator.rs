@@ -234,7 +234,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::run_job;
-    use crate::agent::{handler, serve, Registry};
+    use crate::agent::{fn_key, handler, serve, Registry};
     use crate::protocol::{FromAgent, ToAgent};
     use crate::testing::connection_pair;
     use proptest::prelude::*;
@@ -490,6 +490,24 @@ mod tests {
         fake.await.unwrap();
         // The duplicate (999) is ignored; the first result (100) stands.
         assert_eq!(out, vec![Ok(100), Ok(200)]);
+    }
+
+    #[tokio::test]
+    async fn a_function_is_keyed_by_its_type_name() {
+        fn triple(x: u32) -> u32 {
+            x * 3
+        }
+        let (client, server) = connection_pair(256);
+        let agent = tokio::spawn(serve(server, Registry::new().with_fn(triple), 2));
+
+        // The coordinator derives the same key the agent registered under.
+        let key = fn_key(&triple);
+        let out: Vec<Result<u32, String>> = run_job(vec![client], key, (0..5u32).collect())
+            .await
+            .unwrap();
+        agent.await.unwrap().unwrap();
+
+        assert_eq!(out, (0..5u32).map(|x| Ok(x * 3)).collect::<Vec<_>>());
     }
 
     #[tokio::test]
