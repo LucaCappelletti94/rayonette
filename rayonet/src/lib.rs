@@ -7,5 +7,6 @@
 pub mod agent;
 pub mod coordinator;
 pub mod framing;
+pub mod process;
 pub mod protocol;
 pub mod testing;

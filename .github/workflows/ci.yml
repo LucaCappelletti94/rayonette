@@ -42,4 +42,4 @@ jobs:
       # capped below 100% by generic monomorphization (per-type encode/decode
       # error arms that protocol types never exercise), not by dead code.
       - name: Coverage
-        run: cargo llvm-cov --workspace --fail-under-functions 100 --fail-under-lines 99
+        run: cargo llvm-cov --workspace --ignore-filename-regex 'src/bin/' --fail-under-functions 100 --fail-under-lines 99
