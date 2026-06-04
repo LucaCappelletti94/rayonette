@@ -12,3 +12,11 @@
 pub const fn extract() -> std::io::Result<()> {
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn placeholder_extract_succeeds() {
+        super::extract().unwrap();
+    }
+}

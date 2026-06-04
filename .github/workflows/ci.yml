@@ -26,3 +26,20 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+
+  # Coverage via cargo-llvm-cov (LLVM source-based instrumentation). llvm-cov's
+  # region attribution credits async/macro code that line-based tools miss.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      # 100% functions and ~100% lines are attainable; region coverage is
+      # capped below 100% by generic monomorphization (per-type encode/decode
+      # error arms that protocol types never exercise), not by dead code.
+      - name: Coverage
+        run: cargo llvm-cov --workspace --fail-under-functions 100 --fail-under-lines 99

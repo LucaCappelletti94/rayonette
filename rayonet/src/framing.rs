@@ -5,10 +5,69 @@
 //! wire format that plain serde does not provide on a continuous byte stream.
 
 use bytes::Bytes;
+use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
+    /// Split into independent send and receive halves so reads and writes can
+    /// proceed concurrently: the agent reads assignments while writing results,
+    /// and the coordinator writes assignments while a reader task drains results.
+    #[must_use]
+    pub fn split(self) -> (Sender<S>, Receiver<S>) {
+        let (sink, stream) = self.framed.split();
+        (Sender { sink }, Receiver { stream })
+    }
+}
+
+/// The send half of a split [`Connection`].
+pub struct Sender<S> {
+    sink: SplitSink<Framed<S, LengthDelimitedCodec>, Bytes>,
+}
+
+/// The receive half of a split [`Connection`].
+pub struct Receiver<S> {
+    stream: SplitStream<Framed<S, LengthDelimitedCodec>>,
+}
+
+impl<S> std::fmt::Debug for Sender<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sender").finish_non_exhaustive()
+    }
+}
+
+impl<S> std::fmt::Debug for Receiver<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Receiver").finish_non_exhaustive()
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> Sender<S> {
+    /// Serialize and send one message as a single length-delimited frame.
+    ///
+    /// # Errors
+    /// Returns an error if `msg` fails to serialize or the stream write fails.
+    pub async fn send<M: Serialize>(&mut self, msg: &M) -> std::io::Result<()> {
+        let bytes = postcard::to_allocvec(msg).map_err(invalid_data)?;
+        self.sink.send(Bytes::from(bytes)).await
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> Receiver<S> {
+    /// Receive and decode one message. Returns `Ok(None)` at clean end-of-stream.
+    ///
+    /// # Errors
+    /// Returns an error if the stream read fails or a frame fails to decode.
+    pub async fn recv<M: DeserializeOwned>(&mut self) -> std::io::Result<Option<M>> {
+        match self.stream.next().await {
+            Some(Ok(frame)) => Ok(Some(postcard::from_bytes(&frame).map_err(invalid_data)?)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+}
 
 fn invalid_data(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, e)
@@ -60,6 +119,7 @@ where
 mod tests {
     use super::Connection;
     use crate::protocol::{ToAgent, PROTOCOL_VERSION};
+    use crate::testing::FaultInjector;
     use bytes::{Bytes, BytesMut};
     use proptest::prelude::*;
     use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
@@ -165,5 +225,64 @@ mod tests {
             }
             prop_assert_eq!(frames, vec![payload]);
         }
+    }
+
+    #[tokio::test]
+    async fn recv_surfaces_a_read_error() {
+        let (_w, r) = tokio::io::duplex(64);
+        let mut conn = Connection::new(FaultInjector::error_reads_after(r, 0));
+        let res: std::io::Result<Option<ToAgent>> = conn.recv().await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn split_receiver_surfaces_a_read_error() {
+        let (_w, r) = tokio::io::duplex(64);
+        let (_tx, mut rx) = Connection::new(FaultInjector::error_reads_after(r, 0)).split();
+        let res: std::io::Result<Option<ToAgent>> = rx.recv().await;
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn debug_impls_render() {
+        let (a, _b) = tokio::io::duplex(8);
+        let conn = Connection::new(a);
+        assert!(format!("{conn:?}").contains("Connection"));
+        let (tx, rx) = conn.split();
+        assert!(format!("{tx:?}").contains("Sender"));
+        assert!(format!("{rx:?}").contains("Receiver"));
+    }
+
+    #[tokio::test]
+    async fn send_surfaces_a_serialize_error() {
+        use crate::testing::FailsToSerialize;
+        let (a, _b) = tokio::io::duplex(64);
+        let mut conn = Connection::new(a);
+        assert!(conn.send(&FailsToSerialize).await.is_err());
+
+        let (c, _d) = tokio::io::duplex(64);
+        let (mut tx, _rx) = Connection::new(c).split();
+        assert!(tx.send(&FailsToSerialize).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn recv_surfaces_a_decode_error() {
+        // A frame that arrives intact but does not decode as the expected type.
+        let (a, b) = tokio::io::duplex(64);
+        let mut sender = Connection::new(a);
+        let mut receiver = Connection::new(b);
+        sender.send(&255u8).await.unwrap();
+        let res: std::io::Result<Option<ToAgent>> = receiver.recv().await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn split_receiver_surfaces_a_decode_error() {
+        let (a, b) = tokio::io::duplex(64);
+        let (mut sender, _a_rx) = Connection::new(a).split();
+        let (_b_tx, mut receiver) = Connection::new(b).split();
+        sender.send(&255u8).await.unwrap();
+        let res: std::io::Result<Option<ToAgent>> = receiver.recv().await;
+        assert!(res.is_err());
     }
 }

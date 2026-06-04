@@ -4,6 +4,8 @@
 //! fans task-parallel work across machines on a network. See `DECISIONS.md` and
 //! `PLAN.md` at the repo root for the design and the phased build.
 
+pub mod agent;
+pub mod coordinator;
 pub mod framing;
 pub mod protocol;
 pub mod testing;

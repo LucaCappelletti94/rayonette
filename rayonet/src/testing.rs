@@ -21,22 +21,40 @@ pub fn connection_pair(max_buf: usize) -> (Connection<DuplexStream>, Connection<
     (Connection::new(a), Connection::new(b))
 }
 
-/// Wraps a byte stream and severs its read side after a fixed number of bytes,
-/// after which reads report a clean end-of-stream. Writes pass through. Used to
-/// simulate a host or link dropping mid-task.
+/// How a severed read reports: a clean end-of-stream, or an error.
+#[derive(Debug, Clone, Copy)]
+enum OnCut {
+    Eof,
+    Error,
+}
+
+/// Wraps a byte stream and severs its read side after a fixed number of bytes.
+/// Writes pass through. Used to simulate a host or link dropping mid-task.
 #[derive(Debug)]
 pub struct FaultInjector<S> {
     inner: S,
     read_budget: usize,
+    on_cut: OnCut,
 }
 
 impl<S> FaultInjector<S> {
-    /// Allow `bytes` more bytes to be read, then sever the read side (EOF).
+    /// Allow `bytes` more bytes to be read, then sever with a clean EOF.
     #[must_use]
     pub const fn cut_reads_after(inner: S, bytes: usize) -> Self {
         Self {
             inner,
             read_budget: bytes,
+            on_cut: OnCut::Eof,
+        }
+    }
+
+    /// Allow `bytes` more bytes to be read, then fail every read with an error.
+    #[must_use]
+    pub const fn error_reads_after(inner: S, bytes: usize) -> Self {
+        Self {
+            inner,
+            read_budget: bytes,
+            on_cut: OnCut::Error,
         }
     }
 }
@@ -49,8 +67,13 @@ impl<S: AsyncRead + Unpin> AsyncRead for FaultInjector<S> {
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         if this.read_budget == 0 {
-            // Severed: report a clean end-of-stream.
-            return Poll::Ready(Ok(()));
+            return match this.on_cut {
+                OnCut::Eof => Poll::Ready(Ok(())),
+                OnCut::Error => Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected read fault",
+                ))),
+            };
         }
         let max = this.read_budget.min(buf.remaining());
         let mut scratch = vec![0u8; max];
@@ -85,11 +108,22 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for FaultInjector<S> {
     }
 }
 
+/// A value whose serialization always fails, for exercising encode-error paths.
+#[derive(Debug)]
+pub struct FailsToSerialize;
+
+impl serde::Serialize for FailsToSerialize {
+    fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom("serialization always fails"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{connection_pair, FaultInjector};
     use crate::framing::Connection;
     use crate::protocol::ToAgent;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn connection_pair_roundtrips() {
@@ -129,7 +163,46 @@ mod tests {
         .unwrap();
 
         let res: std::io::Result<Option<ToAgent>> = rx.recv().await;
-        // A mid-frame cut must never yield the message; it is EOF or an error.
-        assert!(!matches!(res, Ok(Some(_))));
+        // A frame cut after 2 bytes (mid length-prefix) is a truncated-stream error.
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn error_mode_surfaces_an_error() {
+        let (_w, r) = tokio::io::duplex(64);
+        let mut rx = Connection::new(FaultInjector::error_reads_after(r, 0));
+        let res: std::io::Result<Option<ToAgent>> = rx.recv().await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn write_side_passes_through() {
+        let (w, mut r) = tokio::io::duplex(64);
+        let mut fi = FaultInjector::cut_reads_after(w, 1_000);
+        fi.write_all(b"hello").await.unwrap();
+        fi.flush().await.unwrap();
+        fi.shutdown().await.unwrap();
+
+        let mut buf = [0u8; 5];
+        r.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn debug_renders() {
+        let (w, _r) = tokio::io::duplex(8);
+        let fi = FaultInjector::cut_reads_after(w, 4);
+        assert!(format!("{fi:?}").contains("FaultInjector"));
+    }
+
+    #[tokio::test]
+    async fn read_pends_when_inner_has_no_data() {
+        use futures::FutureExt;
+        // Keep the writer alive (so it is not EOF) but write nothing: the inner
+        // read returns Pending, exercising the pass-through arm of poll_read.
+        let (_w, r) = tokio::io::duplex(64);
+        let mut fi = FaultInjector::cut_reads_after(r, 100);
+        let mut buf = [0u8; 4];
+        assert!(fi.read(&mut buf).now_or_never().is_none());
     }
 }
