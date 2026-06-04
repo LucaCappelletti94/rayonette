@@ -1,0 +1,25 @@
+[package]
+name = "rayonet"
+description = "SSH-transport task distribution: fan task-parallel work across machines."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
+futures = "0.3"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true
