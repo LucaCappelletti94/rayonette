@@ -91,7 +91,7 @@ This file records the architecture decisions made for rayonet during design disc
 ## Open and deferred
 
 - cfg-gating coordinator-only code out of the agent build (whole-crate refinement; would also let SQLite and other coordinator-only deps stop compiling on hosts).
-- Shipping and compiling the bundled source on a remote host. `extract()` already writes `OUT_DIR/rayonet_source.tar` (whole-crate `Cargo.toml`, `Cargo.lock` if present, and scanned `src/` files); Phase 4 transports and builds it. The local-subprocess path does not ship source.
+- Shipping rayonet itself when it is an unpublished `path` dependency of the consumer. The production path is a published rayonet (`rayonet = "0.x"`) so the consumer-only bundle builds remotely. The docker harness sidesteps this for now by shipping the whole workspace tar; a published-crate or path-dependency-copy story is the real fix.
 - Capturing closures.
 - Path-dependency copy cascade.
 - Reconnect-with-backoff for a dropped host (v1 abandons and redistributes).
@@ -99,5 +99,5 @@ This file records the architecture decisions made for rayonet during design disc
 - Coordinator-restart resume and any persistence of results / completed task ids.
 - SQLite/Diesel operational database, for out-of-process UIs (Dioxus web), post-mortem querying, and persistence. v1 uses in-memory state only.
 - Heartbeat and structured Log messages (v1 relies on stderr forwarding).
-- Multi-hop topology (Tunnel via ProxyJump, Relay subtrees). v1 is a flat depth-1 fleet.
+- Relay subtrees (rayonet itself forwarding tasks coordinator to relay to leaf). v1 is a flat depth-1 star. Note `ProxyJump` is already supported and tested (Phase 4c): ssh routes the coordinator to an otherwise-unreachable leaf through jump hosts, so the star reaches segmented networks without rayonet forwarding anything. Only rayonet-managed relaying is deferred.
 - Binary-copy of built artifacts between identical-target hosts (build-on-host optimization).

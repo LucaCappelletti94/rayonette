@@ -1,0 +1,16 @@
+[package]
+name = "rayonet-docker-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "rayonet-docker-consumer"
+path = "src/main.rs"
+
+[dependencies]
+rayonet = { path = "../../../rayonet" }
+tokio = { version = "1", features = ["full"] }
+
+[build-dependencies]
+rayonet-build = { path = "../../../rayonet-build" }

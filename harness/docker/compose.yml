@@ -1,0 +1,65 @@
+# Segmented multi-host network for rayonet's level-4 tests (PLAN.md Phase 4).
+#
+# The coordinator runs on the host and can only reach `bastion` (the one
+# published port). Every other node is reachable solely by name through an ssh
+# ProxyJump chain, so the topology forces real propagation through jump hosts:
+#
+#   host -> bastion                      (frontnet, published :2201)
+#   host -> bastion -> leaf-a/leaf-b     (backnet)
+#   host -> bastion -> relay -> leaf-deep (deepnet, 2-hop ProxyJump)
+#   host -> bastion -> leaf-blocked      (blockednet, no egress)
+#
+# See README.md for the full rationale.
+
+name: rayonet-harness
+
+networks:
+  frontnet: {}
+  backnet: {}
+  deepnet: {}
+  blockednet:
+    internal: true # no egress: rustup cannot fetch the toolchain here
+
+x-agent: &agent
+  init: true
+  volumes:
+    - ./secrets:/secrets:ro
+
+services:
+  bastion:
+    <<: *agent
+    image: rayonet-harness-base:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.base
+    networks: [frontnet, backnet, blockednet]
+    ports:
+      - "2201:22"
+
+  relay:
+    <<: *agent
+    image: rayonet-harness-base:latest
+    networks: [backnet, deepnet]
+
+  leaf-a:
+    <<: *agent
+    image: rayonet-harness-base:latest
+    networks: [backnet]
+
+  leaf-b:
+    <<: *agent
+    image: rayonet-harness-rust:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
+    networks: [backnet]
+
+  leaf-deep:
+    <<: *agent
+    image: rayonet-harness-base:latest
+    networks: [deepnet]
+
+  leaf-blocked:
+    <<: *agent
+    image: rayonet-harness-base:latest
+    networks: [blockednet]

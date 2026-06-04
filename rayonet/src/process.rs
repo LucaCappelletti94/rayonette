@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 use crate::framing::Connection;
 
 /// Environment marker the coordinator sets when launching an agent.
-const AGENT_ENV: &str = "RAYONET_AGENT";
+pub(crate) const AGENT_ENV: &str = "RAYONET_AGENT";
 
 /// True when this process was launched as a rayonet agent.
 #[must_use]

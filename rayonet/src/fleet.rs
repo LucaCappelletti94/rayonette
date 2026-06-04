@@ -92,10 +92,28 @@ impl<L: Launch> Fleet<L> {
         let key = fn_key(&f);
         let mut connections = Vec::with_capacity(self.launchers.len());
         let mut guards = Vec::with_capacity(self.launchers.len());
+        let mut failures = Vec::new();
+        // A host that fails to launch (for example a cold host that cannot
+        // install the toolchain) is dropped; its tasks are simply scheduled
+        // onto the survivors by the pull scheduler (DECISIONS.md decision 18).
         for launcher in &self.launchers {
-            let (connection, guard) = launcher.launch().await?;
-            connections.push(connection);
-            guards.push(guard);
+            match launcher.launch().await {
+                Ok((connection, guard)) => {
+                    connections.push(connection);
+                    guards.push(guard);
+                }
+                Err(failure) => failures.push(failure),
+            }
+        }
+        if connections.is_empty() {
+            let detail = failures
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(std::io::Error::other(format!(
+                "rayonet: every host failed to launch: {detail}"
+            )));
         }
         let result = run_job(connections, key, inputs).await;
         drop(guards); // agents already shut down via the job's `Shutdown`
@@ -223,10 +241,19 @@ mod tests {
     use tokio::io::DuplexStream;
     use tokio::task::JoinHandle;
 
-    /// A launcher that runs an agent in-process over a duplex pipe.
+    /// A launcher that runs an agent in-process over a duplex pipe. A `None`
+    /// registry simulates a host that fails to launch (for example a cold host
+    /// that cannot be provisioned).
     struct InProcess {
-        registry: Registry,
+        registry: Option<Registry>,
         capacity: u32,
+    }
+
+    impl InProcess {
+        fn serving(double: bool, capacity: u32) -> Self {
+            let registry = double.then(|| Registry::new().with_fn(self::double));
+            Self { registry, capacity }
+        }
     }
 
     impl Launch for InProcess {
@@ -234,8 +261,11 @@ mod tests {
         type Guard = JoinHandle<std::io::Result<()>>;
 
         async fn launch(&self) -> std::io::Result<(Connection<DuplexStream>, Self::Guard)> {
+            let Some(registry) = &self.registry else {
+                return Err(std::io::Error::other("simulated launch failure"));
+            };
             let (client, server) = connection_pair(256);
-            let task = tokio::spawn(serve(server, self.registry.clone(), self.capacity));
+            let task = tokio::spawn(serve(server, registry.clone(), self.capacity));
             Ok((client, task))
         }
     }
@@ -246,12 +276,7 @@ mod tests {
 
     #[tokio::test]
     async fn netmap_runs_a_function_across_the_fleet() {
-        let launchers = (0..3)
-            .map(|_| InProcess {
-                registry: Registry::new().with_fn(double),
-                capacity: 2,
-            })
-            .collect();
+        let launchers = (0..3).map(|_| InProcess::serving(true, 2)).collect();
         let fleet = Fleet::new(launchers);
 
         let out: Vec<Result<u32, String>> =
@@ -261,18 +286,39 @@ mod tests {
         assert!(format!("{fleet:?}").contains("Fleet"));
     }
 
+    #[tokio::test]
+    async fn netmap_proceeds_when_some_hosts_fail_to_launch() {
+        // One healthy host, two that fail to launch: the job still completes,
+        // the survivor absorbing every task (DECISIONS.md decision 18).
+        let launchers = vec![
+            InProcess::serving(false, 1),
+            InProcess::serving(true, 2),
+            InProcess::serving(false, 1),
+        ];
+        let fleet = Fleet::new(launchers);
+
+        let out: Vec<Result<u32, String>> =
+            fleet.netmap(double, (0..15u32).collect()).await.unwrap();
+
+        assert_eq!(out, (0..15u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn netmap_errors_when_every_host_fails_to_launch() {
+        let launchers = vec![InProcess::serving(false, 1), InProcess::serving(false, 1)];
+        let fleet = Fleet::new(launchers);
+
+        let error = fleet.netmap(double, (0..5u32).collect()).await.unwrap_err();
+        assert!(error.to_string().contains("every host failed"), "{error}");
+    }
+
     #[cfg(feature = "rayon")]
     #[test]
     fn netmap_composes_inside_a_rayon_chain() {
         use super::NetmapExt;
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-        let launchers = (0..2)
-            .map(|_| InProcess {
-                registry: Registry::new().with_fn(double),
-                capacity: 2,
-            })
-            .collect();
+        let launchers = (0..2).map(|_| InProcess::serving(true, 2)).collect();
         let fleet = Fleet::new(launchers);
 
         // rayon before -> distributed netmap -> rayon after.

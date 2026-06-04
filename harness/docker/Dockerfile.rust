@@ -1,0 +1,10 @@
+# A host that already has rust, to exercise the ladder's skip-install path.
+# Builds on the base image and installs the toolchain user-locally via rustup,
+# exactly as the ladder would.
+FROM rayonet-harness-base:latest
+
+USER rayonet
+ENV RUSTUP_HOME=/home/rayonet/.rustup CARGO_HOME=/home/rayonet/.cargo
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal
+USER root
