@@ -77,7 +77,6 @@ CI runs all four (decision 29).
 - `.netmap(evolve)` end to end (over the in-process or subprocess transport) returns an ordered `Vec` equal to a local `map`.
 - `.netmap` composes inside a rayon chain: `into_par_iter().map(..).netmap(..).map(..).reduce(..)` produces the correct reduction.
 - A fixture crate with a non-rayonet local `path = ".."` dependency makes `extract()` error with a message naming the offending crate (decision 15).
-- The machete-style trim removes a genuinely unused dep, the compile-verify accepts it, and an over-aggressive trim falls back to ship-all (decision 14).
 
 **Done when:** a user can write `.netmap(f)` plus the one-line build.rs, and the produced bundle compiles and runs locally with correct ordered results and clear errors on the unsupported cases.
 

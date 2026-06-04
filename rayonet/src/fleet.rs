@@ -59,6 +59,15 @@ impl<L: Launch> Fleet<L> {
     /// `netmap` is also what the build-time parser scans for to discover task
     /// functions (DECISIONS.md decision 12).
     ///
+    /// # Examples
+    /// A capturing closure is rejected at compile time (DECISIONS.md decision 8):
+    /// ```compile_fail
+    /// use rayonet::fleet::{Fleet, Subprocess};
+    /// let fleet: Fleet<Subprocess> = Fleet::new(vec![]);
+    /// let captured = 10u32;
+    /// let _job = async move { fleet.netmap(move |x: u32| x + captured, vec![1u32]).await };
+    /// ```
+    ///
     /// # Errors
     /// Returns an error if an agent cannot be launched or the run fails.
     pub async fn netmap<F, I, O>(
@@ -71,6 +80,15 @@ impl<L: Launch> Fleet<L> {
         I: Serialize,
         O: DeserializeOwned,
     {
+        // Reject capturing closures at compile time (DECISIONS.md decision 8): a
+        // named function or non-capturing closure is zero-sized; captured state
+        // is not. This keeps the unique fn-item type that the key relies on.
+        const {
+            assert!(
+                size_of::<F>() == 0,
+                "a `.netmap` task function must not capture; use a named function or a non-capturing closure"
+            );
+        }
         let key = fn_key(&f);
         let mut connections = Vec::with_capacity(self.launchers.len());
         let mut guards = Vec::with_capacity(self.launchers.len());
@@ -129,6 +147,73 @@ impl Launch for Subprocess {
     }
 }
 
+#[cfg(feature = "rayon")]
+mod rayon_bridge {
+    use super::{Fleet, Launch};
+    use rayon::iter::ParallelIterator;
+    use serde::{de::DeserializeOwned, Serialize};
+    use std::marker::PhantomData;
+
+    /// Adds `.netmap(f)` to any rayon `ParallelIterator`: the ordered barrier bridge.
+    ///
+    /// (DECISIONS.md decisions 5-6.) It drains the upstream iterator, runs `f`
+    /// distributed over a fleet, and returns outputs in input order so the chain
+    /// can re-enter rayon.
+    pub trait NetmapExt: ParallelIterator + Sized {
+        /// Begin a distributed map of `f` over this iterator's items; terminate
+        /// with [`NetMapJob::run`].
+        fn netmap<F, O>(self, f: F) -> NetMapJob<Self, F, O>
+        where
+            F: Fn(Self::Item) -> O,
+        {
+            NetMapJob {
+                upstream: self,
+                f,
+                _output: PhantomData,
+            }
+        }
+    }
+
+    impl<P: ParallelIterator> NetmapExt for P {}
+
+    /// A pending distributed map built by [`NetmapExt::netmap`].
+    pub struct NetMapJob<P, F, O> {
+        upstream: P,
+        f: F,
+        _output: PhantomData<O>,
+    }
+
+    impl<P, F, O> std::fmt::Debug for NetMapJob<P, F, O> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("NetMapJob").finish_non_exhaustive()
+        }
+    }
+
+    impl<P, F, O> NetMapJob<P, F, O>
+    where
+        P: ParallelIterator,
+        P::Item: Serialize + Send,
+        F: Fn(P::Item) -> O,
+        O: DeserializeOwned + Send,
+    {
+        /// Drain the upstream iterator and run the job over `fleet`. Blocks on a
+        /// fresh runtime, so it must be called outside a tokio runtime.
+        ///
+        /// # Errors
+        /// Returns an error if the runtime cannot start or the run fails.
+        pub fn run<L: Launch>(self, fleet: &Fleet<L>) -> std::io::Result<Vec<Result<O, String>>> {
+            let inputs: Vec<P::Item> = self.upstream.collect();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(fleet.netmap(self.f, inputs))
+        }
+    }
+}
+
+#[cfg(feature = "rayon")]
+pub use rayon_bridge::{NetMapJob, NetmapExt};
+
 #[cfg(test)]
 mod tests {
     use super::{Fleet, Launch};
@@ -174,5 +259,33 @@ mod tests {
 
         assert_eq!(out, (0..20u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
         assert!(format!("{fleet:?}").contains("Fleet"));
+    }
+
+    #[cfg(feature = "rayon")]
+    #[test]
+    fn netmap_composes_inside_a_rayon_chain() {
+        use super::NetmapExt;
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+        let launchers = (0..2)
+            .map(|_| InProcess {
+                registry: Registry::new().with_fn(double),
+                capacity: 2,
+            })
+            .collect();
+        let fleet = Fleet::new(launchers);
+
+        // rayon before -> distributed netmap -> rayon after.
+        let job = (0..10u32).into_par_iter().map(|x| x + 1).netmap(double);
+        assert!(format!("{job:?}").contains("NetMapJob"));
+        let out: Vec<u32> = job
+            .run(&fleet)
+            .unwrap()
+            .into_par_iter()
+            .map(|r| r.unwrap() + 100)
+            .collect();
+
+        let expected: Vec<u32> = (0..10u32).map(|x| (x + 1) * 2 + 100).collect();
+        assert_eq!(out, expected);
     }
 }

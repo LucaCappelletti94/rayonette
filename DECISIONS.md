@@ -22,7 +22,7 @@ This file records the architecture decisions made for rayonet during design disc
 
 7. **v1 task model is `fn(Input) -> Output`, with no per-agent shared-state machinery.** Input is serialized and shipped per task, output serialized back. A task fails only by **panicking**: the agent wraps each task in `catch_unwind` and turns a panic into the `Failed { task_id, error }` message, so one task's panic cannot kill the agent or lose its in-flight siblings. This keeps the signature exactly rayon's `map` shape; tasks wanting typed errors make `Output` a `Result<T, E>`. There is no `setup()` in the v1 API. A user who needs load-once-reuse state can use a plain `OnceLock` in their own code with zero framework support. Per-agent shared state, local-file availability, in-memory caching, and data staging are deferred optimizations, justified only when transport cost starts to rival compute cost (which the core assumption says it should not).
 
-8. **v1 supports non-capturing functions only, enforced by the type.** Because the argument is typed `fn(T) -> U`, a capturing closure (`|x| heavy(x, config)`) does not coerce and simply fails to compile. So the "no captures" rule is enforced by the type system rather than detected later. Named functions and non-capturing closures both work; captures are the documented future boundary (they would have to cross the network as serialized data or be loaded remotely via setup).
+8. **v1 supports non-capturing functions only, enforced at compile time.** `.netmap` is generic over the function type `F` (so its `type_name` stays unique per function, decision 12) and asserts `const { size_of::<F>() == 0 }`. A named function or non-capturing closure is zero-sized; captured state is not, so a capturing closure (`|x| heavy(x, config)`) fails to compile. (Typing the argument as a `fn(T) -> U` pointer would also reject captures but would erase the unique fn-item type the key relies on, so the const size assert is used instead.) A `compile_fail` doctest verifies the rejection. Captures are the documented future boundary (they would have to cross the network as serialized data or be loaded remotely via setup).
 
 ## Build-time mechanism
 
@@ -38,7 +38,7 @@ This file records the architecture decisions made for rayonet during design disc
 
 13. **Dependencies are inherited from the consumer crate's Cargo.toml verbatim,** with the Cargo.lock copied for version agreement. cargo does not drop unused declared deps, so the full set is the known-good floor.
 
-14. **Optional trimming via a self-rolled machete-style scan.** We reimplement the trivial unused-dependency scan ourselves (read declared deps, scan source for references, diff) rather than depending on cargo-machete, which is a CLI tool and not a library. A trimmed set is verified by compiling, and falls back to ship-all if it fails. Stable Rust only, no udeps.
+14. **No dependency trimming.** Dependencies are inherited and compiled as-is (decision 13). An earlier idea of a self-rolled machete-style unused-dependency scan is dropped entirely.
 
 15. **v1 errors on any non-rayonet local path dependency.** Detected via `cargo metadata` source labels, where a local path crate has a null source. The error names the offending crate. The path-dependency copy cascade is a documented future enhancement.
 
@@ -91,6 +91,7 @@ This file records the architecture decisions made for rayonet during design disc
 ## Open and deferred
 
 - cfg-gating coordinator-only code out of the agent build (whole-crate refinement; would also let SQLite and other coordinator-only deps stop compiling on hosts).
+- Shipping and compiling the bundled source on a remote host. `extract()` already writes `OUT_DIR/rayonet_source.tar` (whole-crate `Cargo.toml`, `Cargo.lock` if present, and scanned `src/` files); Phase 4 transports and builds it. The local-subprocess path does not ship source.
 - Capturing closures.
 - Path-dependency copy cascade.
 - Reconnect-with-backoff for a dropped host (v1 abandons and redistributes).

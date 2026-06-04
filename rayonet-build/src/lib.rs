@@ -73,27 +73,29 @@ pub fn extract() -> std::io::Result<()> {
     let out_dir = std::env::var_os("OUT_DIR")
         .ok_or_else(|| std::io::Error::other("OUT_DIR is unset (run from build.rs)"))?;
 
-    let src_dir = std::path::Path::new(&manifest_dir).join("src");
-    let sources = extract_into(&src_dir, std::path::Path::new(&out_dir))?;
+    let manifest_dir = std::path::Path::new(&manifest_dir);
+    check_path_dependencies(manifest_dir)?;
+    let sources = extract_into(manifest_dir, std::path::Path::new(&out_dir))?;
     for source in sources {
         println!("cargo:rerun-if-changed={}", source.display());
     }
     Ok(())
 }
 
-/// Scan `src_dir` for `.netmap` task functions and write the registry.
+/// Scan the crate's `src/` for `.netmap` task functions, write the registry, and
+/// bundle the whole-crate source for shipping.
 ///
 /// Returns the source files scanned (for rerun-if-changed).
 fn extract_into(
-    src_dir: &std::path::Path,
+    manifest_dir: &std::path::Path,
     out_dir: &std::path::Path,
 ) -> std::io::Result<Vec<std::path::PathBuf>> {
     let mut sources = Vec::new();
-    collect_rs_files(src_dir, &mut sources)?;
+    collect_rs_files(manifest_dir, std::path::Path::new("src"), &mut sources)?;
 
     let mut functions = Vec::new();
     for source in &sources {
-        let text = std::fs::read_to_string(source)?;
+        let text = std::fs::read_to_string(manifest_dir.join(source))?;
         let calls = find_netmap_calls(&text)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         for call in calls {
@@ -107,19 +109,78 @@ fn extract_into(
         out_dir.join("rayonet_registry.rs"),
         generate_registry(&functions),
     )?;
+    bundle_source(manifest_dir, &sources, out_dir)?;
     Ok(sources)
 }
 
+/// Tar the whole-crate source (`Cargo.toml`, `Cargo.lock` if present, and the
+/// scanned `src/` files) into `OUT_DIR/rayonet_source.tar` for Phase 4 to ship
+/// to remote hosts and compile there (DECISIONS.md decisions 2-3).
+fn bundle_source(
+    manifest_dir: &std::path::Path,
+    sources: &[std::path::PathBuf],
+    out_dir: &std::path::Path,
+) -> std::io::Result<()> {
+    let file = std::fs::File::create(out_dir.join("rayonet_source.tar"))?;
+    let mut tar = tar::Builder::new(file);
+
+    tar.append_path_with_name(manifest_dir.join("Cargo.toml"), "Cargo.toml")?;
+    let lock = manifest_dir.join("Cargo.lock");
+    if lock.exists() {
+        tar.append_path_with_name(&lock, "Cargo.lock")?;
+    }
+    // `sources` are already relative to `manifest_dir` (see `collect_rs_files`),
+    // so they serve directly as the archive entry names.
+    for source in sources {
+        tar.append_path_with_name(manifest_dir.join(source), source)?;
+    }
+    tar.finish()
+}
+
+/// Error if the consumer's `Cargo.toml` has a non-rayonet local `path`
+/// dependency (DECISIONS.md decision 15: v1 cannot ship local path crates).
+/// Detects direct path deps; the transitive cascade is a future enhancement.
+fn check_path_dependencies(manifest_dir: &std::path::Path) -> std::io::Result<()> {
+    let text = std::fs::read_to_string(manifest_dir.join("Cargo.toml"))?;
+    let manifest: toml::Table = text.parse().map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Cargo.toml: {e}"))
+    })?;
+
+    for section in ["dependencies", "build-dependencies", "dev-dependencies"] {
+        let Some(deps) = manifest.get(section).and_then(toml::Value::as_table) else {
+            continue;
+        };
+        for (name, spec) in deps {
+            if name == "rayonet" || name == "rayonet-build" {
+                continue;
+            }
+            if spec.as_table().is_some_and(|t| t.contains_key("path")) {
+                return Err(std::io::Error::other(format!(
+                    "rayonet does not support local path dependencies yet: `{name}` uses \
+                     `path = ...`; publish, vendor, or inline it (DECISIONS.md decision 15)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively collect `.rs` files under `base.join(rel)`, pushing each as a
+/// path relative to `base` (so `rel` accumulates down the tree). Relative paths
+/// double as archive entry names in [`bundle_source`] and as rerun-if-changed
+/// keys, with no fallible prefix stripping.
 fn collect_rs_files(
-    dir: &std::path::Path,
+    base: &std::path::Path,
+    rel: &std::path::Path,
     out: &mut Vec<std::path::PathBuf>,
 ) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            collect_rs_files(&path, out)?;
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(path);
+    for entry in std::fs::read_dir(base.join(rel))? {
+        let entry = entry?;
+        let child = rel.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            collect_rs_files(base, &child, out)?;
+        } else if child.extension().is_some_and(|ext| ext == "rs") {
+            out.push(child);
         }
     }
     Ok(())
@@ -132,6 +193,7 @@ mod tests {
     #[test]
     fn extract_into_scans_subdirs() {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"c\"\n").unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir_all(src.join("sub")).unwrap();
         std::fs::write(src.join("main.rs"), "fn a() { let _ = x.netmap(double); }").unwrap();
@@ -143,7 +205,7 @@ mod tests {
         let out = tmp.path().join("out");
         std::fs::create_dir(&out).unwrap();
 
-        let sources = super::extract_into(&src, &out).unwrap();
+        let sources = super::extract_into(tmp.path(), &out).unwrap();
         assert_eq!(sources.len(), 2);
         let registry = std::fs::read_to_string(out.join("rayonet_registry.rs")).unwrap();
         assert!(registry.contains("with_fn(double)"));
@@ -153,17 +215,48 @@ mod tests {
     #[test]
     fn extract_into_rejects_unparseable_source() {
         let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("src");
-        std::fs::create_dir(&src).unwrap();
-        std::fs::write(src.join("bad.rs"), "fn (").unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src").join("bad.rs"), "fn (").unwrap();
         let out = tmp.path().join("out");
         std::fs::create_dir(&out).unwrap();
-        assert!(super::extract_into(&src, &out).is_err());
+        assert!(super::extract_into(tmp.path(), &out).is_err());
+    }
+
+    #[test]
+    fn extract_into_bundles_source_and_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"c\"\n").unwrap();
+        std::fs::write(tmp.path().join("Cargo.lock"), "# lock\n").unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src").join("main.rs"),
+            "fn a() { let _ = x.netmap(double); }",
+        )
+        .unwrap();
+        let out = tmp.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+
+        super::extract_into(tmp.path(), &out).unwrap();
+
+        let archive = std::fs::File::open(out.join("rayonet_source.tar")).unwrap();
+        let names: Vec<String> = tar::Archive::new(archive)
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|n| n == "Cargo.toml"), "{names:?}");
+        assert!(names.iter().any(|n| n == "Cargo.lock"), "{names:?}");
+        assert!(names.iter().any(|n| n.ends_with("main.rs")), "{names:?}");
     }
 
     #[test]
     fn extract_reads_build_env_and_errors_when_unset() {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[dependencies]\nrayonet = { path = \"../rayonet\" }\n",
+        )
+        .unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir(&src).unwrap();
         std::fs::write(src.join("main.rs"), "fn a() { let _ = x.netmap(double); }").unwrap();
@@ -180,6 +273,43 @@ mod tests {
         assert!(super::extract().is_err());
         std::env::remove_var("CARGO_MANIFEST_DIR");
         assert!(super::extract().is_err());
+    }
+
+    #[test]
+    fn rejects_non_rayonet_path_dependencies() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[dependencies]\n\
+             rayonet = { path = \"../rayonet\" }\n\
+             helper = { path = \"../helper\" }\n\
+             serde = \"1\"\n",
+        )
+        .unwrap();
+        let err = super::check_path_dependencies(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("helper"));
+    }
+
+    #[test]
+    fn accepts_rayonet_path_and_registry_dependencies() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[dependencies]\n\
+             rayonet = { path = \"../rayonet\" }\n\
+             serde = \"1\"\n\
+             [build-dependencies]\n\
+             rayonet-build = { path = \"../rayonet-build\" }\n",
+        )
+        .unwrap();
+        super::check_path_dependencies(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn rejects_unparseable_cargo_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "not = = valid").unwrap();
+        assert!(super::check_path_dependencies(tmp.path()).is_err());
     }
 
     #[test]
