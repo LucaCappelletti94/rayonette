@@ -55,11 +55,13 @@ impl<L: Launch> Fleet<L> {
     /// Run `f` over `inputs` across the fleet, returning outputs in input order.
     ///
     /// The function is used only for its `type_name` key; the agents already
-    /// hold the matching handler (registered under the same key).
+    /// hold the matching handler (registered under the same key). The name
+    /// `netmap` is also what the build-time parser scans for to discover task
+    /// functions (DECISIONS.md decision 12).
     ///
     /// # Errors
     /// Returns an error if an agent cannot be launched or the run fails.
-    pub async fn map<F, I, O>(
+    pub async fn netmap<F, I, O>(
         &self,
         f: F,
         inputs: Vec<I>,
@@ -80,6 +82,50 @@ impl<L: Launch> Fleet<L> {
         let result = run_job(connections, key, inputs).await;
         drop(guards); // agents already shut down via the job's `Shutdown`
         result
+    }
+}
+
+/// Launches an agent by spawning a command as a subprocess.
+///
+/// Typically the consumer's own binary (DECISIONS.md decisions 3-4: one binary,
+/// two roles).
+pub struct Subprocess {
+    program: std::ffi::OsString,
+}
+
+impl std::fmt::Debug for Subprocess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Subprocess").finish_non_exhaustive()
+    }
+}
+
+impl Subprocess {
+    /// Launch the current executable as the agent (the common case: the
+    /// consumer's binary is both coordinator and agent).
+    ///
+    /// # Errors
+    /// Returns an error if the current executable path cannot be determined.
+    pub fn current_exe() -> std::io::Result<Self> {
+        Ok(Self {
+            program: std::env::current_exe()?.into_os_string(),
+        })
+    }
+
+    /// Launch the binary at `program` as the agent.
+    #[must_use]
+    pub fn command(program: impl Into<std::ffi::OsString>) -> Self {
+        Self {
+            program: program.into(),
+        }
+    }
+}
+
+impl Launch for Subprocess {
+    type Stream = tokio::io::Join<tokio::process::ChildStdout, tokio::process::ChildStdin>;
+    type Guard = crate::process::AgentProcess;
+
+    async fn launch(&self) -> std::io::Result<(Connection<Self::Stream>, Self::Guard)> {
+        crate::process::spawn(tokio::process::Command::new(&self.program))
     }
 }
 
@@ -114,7 +160,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn map_runs_a_function_across_the_fleet() {
+    async fn netmap_runs_a_function_across_the_fleet() {
         let launchers = (0..3)
             .map(|_| InProcess {
                 registry: Registry::new().with_fn(double),
@@ -123,7 +169,8 @@ mod tests {
             .collect();
         let fleet = Fleet::new(launchers);
 
-        let out: Vec<Result<u32, String>> = fleet.map(double, (0..20u32).collect()).await.unwrap();
+        let out: Vec<Result<u32, String>> =
+            fleet.netmap(double, (0..20u32).collect()).await.unwrap();
 
         assert_eq!(out, (0..20u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
         assert!(format!("{fleet:?}").contains("Fleet"));

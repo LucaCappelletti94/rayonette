@@ -72,6 +72,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "consumer"
+version = "0.0.0"
+dependencies = [
+ "rayonet",
+ "rayonet-build",
+ "tokio",
+]
+
+[[package]]
 name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -539,6 +548,10 @@ dependencies = [
 [[package]]
 name = "rayonet-build"
 version = "0.0.0"
+dependencies = [
+ "syn",
+ "tempfile",
+]
 
 [[package]]
 name = "redox_syscall"

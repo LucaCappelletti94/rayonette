@@ -44,6 +44,23 @@ async fn a_killed_agent_is_observed_as_a_failure() {
 }
 
 #[tokio::test]
+async fn subprocess_launcher_connects_and_runs() {
+    use rayonet::fleet::{Launch, Subprocess};
+
+    let launcher = Subprocess::command(env!("CARGO_BIN_EXE_rayonet-test-agent"));
+    assert!(format!("{launcher:?}").contains("Subprocess"));
+
+    let (connection, _guard) = launcher.launch().await.expect("launch");
+    let out: Vec<Result<u32, String>> = run_job(vec![connection], "double", (0..5u32).collect())
+        .await
+        .unwrap();
+    assert_eq!(out, (0..5u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+
+    // `current_exe` constructs without spawning.
+    let _ = Subprocess::current_exe().expect("current exe");
+}
+
+#[tokio::test]
 async fn the_binary_exits_when_not_in_agent_mode() {
     // Launched directly, without the agent marker the coordinator would set.
     let status = Command::new(env!("CARGO_BIN_EXE_rayonet-test-agent"))

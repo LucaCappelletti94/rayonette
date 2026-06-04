@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["rayonet", "rayonet-build"]
+members = ["rayonet", "rayonet-build", "fixtures/consumer"]
 
 [workspace.package]
 version = "0.0.0"
