@@ -1,8 +1,8 @@
 //! The coordinator side of a run.
 //!
 //! Hands a job's inputs to a set of agents, schedules them by pull (a free
-//! capacity slot gets the next pending task, DECISIONS.md decision 24), and
-//! assembles the results in input order (PLAN.md Phase 1).
+//! capacity slot gets the next pending task), and assembles the results in
+//! input order (PLAN.md Phase 1).
 //!
 //! Each agent connection is split: the coordinator keeps the send half to issue
 //! `Assign`/`Shutdown`, and a per-agent reader task drains the receive half into
@@ -19,11 +19,11 @@ use crate::framing::{Connection, Receiver, Sender};
 use crate::observability::{Event as Obs, EventSink, NodeState};
 use crate::protocol::{FromAgent, TaskId, ToAgent, PROTOCOL_VERSION};
 
-/// What a reader task forwards to the coordinator's central loop.
+/// What a reader task forwards to the coordinator's central loop. A read error
+/// and a clean disconnect are treated alike: the agent is lost.
 enum Event {
     Message(FromAgent),
-    Disconnected(usize),
-    Error(usize, std::io::Error),
+    Lost(usize),
 }
 
 fn spawn_reader<S>(
@@ -35,22 +35,14 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
+        // Forward each message; on a clean end-of-stream or a read error, report
+        // the agent lost and stop. A failed send means the coordinator is gone.
         loop {
-            match rx.recv::<FromAgent>().await {
-                Ok(Some(msg)) => {
-                    // If the coordinator is gone the send fails; we keep reading
-                    // and exit on the end-of-stream below.
-                    let _ = events.send(Event::Message(msg));
-                }
-                Ok(None) => {
-                    let _ = events.send(Event::Disconnected(agent));
-                    break;
-                }
-                Err(e) => {
-                    let _ = events.send(Event::Error(agent, e));
-                    break;
-                }
-            }
+            let Ok(Some(msg)) = rx.recv::<FromAgent>().await else {
+                let _ = events.send(Event::Lost(agent));
+                break;
+            };
+            let _ = events.send(Event::Message(msg));
         }
     })
 }
@@ -109,6 +101,8 @@ struct Job<S, O> {
     senders: Vec<Sender<S>>,
     capacities: Vec<u32>,
     inflight: Vec<u32>,
+    /// Whether each agent's connection is still up; a lost one takes no tasks.
+    alive: Vec<bool>,
     pending: VecDeque<usize>,
     /// `task_id` -> (agent, input index), for refill and dedup on completion.
     assigned: HashMap<TaskId, (usize, usize)>,
@@ -122,8 +116,12 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     O: DeserializeOwned,
 {
-    /// Fill an agent up to its capacity with pending tasks.
+    /// Fill an agent up to its capacity with pending tasks. A lost agent takes
+    /// nothing.
     async fn fill(&mut self, agent: usize) -> std::io::Result<()> {
+        if !self.alive[agent] {
+            return Ok(());
+        }
         while self.inflight[agent] < self.capacities[agent] {
             let Some(idx) = self.pending.pop_front() else {
                 break;
@@ -151,6 +149,31 @@ where
         self.results[idx] = Some(result);
         self.remaining -= 1;
         Some(agent)
+    }
+
+    /// Mark `agent` lost and return its in-flight tasks to the pending pool so
+    /// survivors re-run them. A task it had actually
+    /// finished is already out of `assigned`, so only genuinely lost work moves;
+    /// re-running a task is safe by the idempotency contract and deduped on
+    /// completion by `record`.
+    fn requeue_lost(&mut self, agent: usize) {
+        self.alive[agent] = false;
+        let lost: Vec<TaskId> = self
+            .assigned
+            .iter()
+            .filter(|(_, (owner, _))| *owner == agent)
+            .map(|(task, _)| *task)
+            .collect();
+        for task in lost {
+            if let Some((_, idx)) = self.assigned.remove(&task) {
+                self.pending.push_back(idx);
+            }
+        }
+    }
+
+    /// Whether any agent is still alive to take work.
+    fn any_alive(&self) -> bool {
+        self.alive.iter().any(|alive| *alive)
     }
 
     /// Record a terminal outcome, emit its task event, and refill the freed
@@ -221,6 +244,7 @@ where
         senders,
         capacities,
         inflight: vec![0; agent_count],
+        alive: vec![true; agent_count],
         pending: (0..num_tasks).collect(),
         assigned: HashMap::new(),
         results: (0..num_tasks).map(|_| None).collect(),
@@ -264,17 +288,21 @@ where
                 job.finish(task_id, Err(error), false, &labels, events)
                     .await?;
             }
-            Some(Event::Disconnected(agent)) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionReset,
-                    format!(
-                        "agent {agent} disconnected with {} tasks left",
-                        job.remaining
-                    ),
-                ));
-            }
-            Some(Event::Error(agent, e)) => {
-                return Err(std::io::Error::new(e.kind(), format!("agent {agent}: {e}")));
+            // A dropped or erroring agent is abandoned: mark it lost, requeue
+            // its in-flight tasks, and let the survivors absorb them. The run
+            // fails only when no agent is left.
+            Some(Event::Lost(agent)) => {
+                events.emit(Obs::node(&labels[agent], NodeState::Lost));
+                job.requeue_lost(agent);
+                if !job.any_alive() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "every agent was lost before the job completed",
+                    ));
+                }
+                for survivor in 0..agent_count {
+                    job.fill(survivor).await?;
+                }
             }
             None => {
                 return Err(std::io::Error::new(
@@ -285,12 +313,16 @@ where
         }
     }
 
-    for label in &labels {
-        events.emit(Obs::node(label, NodeState::Done));
+    for (agent, label) in labels.iter().enumerate() {
+        if job.alive[agent] {
+            events.emit(Obs::node(label, NodeState::Done));
+        }
     }
 
-    for tx in &mut job.senders {
-        tx.send(&ToAgent::Shutdown).await?;
+    for agent in 0..job.senders.len() {
+        if job.alive[agent] {
+            let _ = job.senders[agent].send(&ToAgent::Shutdown).await;
+        }
     }
     for reader in readers {
         let _ = reader.await;
@@ -307,7 +339,7 @@ mod tests {
     use crate::framing::Connection;
     use crate::observability::NoopSink;
     use crate::protocol::{FromAgent, ToAgent};
-    use crate::testing::connection_pair;
+    use crate::testing::{connection_pair, FaultInjector};
     use proptest::prelude::*;
     use serde::{de::DeserializeOwned, Serialize};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -488,6 +520,112 @@ mod tests {
         assert!(states
             .iter()
             .all(|s| { matches!(s, NodeState::Working | NodeState::Idle | NodeState::Done) }));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_agents_tasks_are_redistributed_and_run_once() {
+        use tokio::io::duplex;
+
+        // Agent A's coordinator-read is severed mid-run; agent B stays healthy.
+        let (raw_a, server_a) = duplex(256);
+        let (raw_b, server_b) = duplex(256);
+        let client_a = Connection::new(FaultInjector::cut_reads_after(raw_a, 50));
+        let client_b = Connection::new(FaultInjector::cut_reads_after(raw_b, usize::MAX));
+
+        let agent_a = tokio::spawn(serve(
+            Connection::new(server_a),
+            Registry::new().with("id", handler(|x: u32| x)),
+            1,
+        ));
+        let agent_b = tokio::spawn(serve(
+            Connection::new(server_b),
+            Registry::new().with("id", handler(|x: u32| x)),
+            1,
+        ));
+
+        let agents = vec![("a".to_string(), client_a), ("b".to_string(), client_b)];
+        let out: Vec<Result<u32, String>> = run_job(agents, "id", (0..20u32).collect(), &NoopSink)
+            .await
+            .unwrap();
+
+        // Every task completed exactly once, in input order, despite the drop.
+        assert_eq!(out, (0..20u32).map(Ok).collect::<Vec<_>>());
+
+        let _ = agent_a.await; // A's serve may error once its peer read is cut.
+        let _ = agent_b.await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_result_survives_its_agents_death() {
+        // Agent A fails task 0, then drops. The failure is terminal: it is not
+        // requeued to the survivor, and the error stands in the result.
+        let (client_a, server_a) = connection_pair(64);
+        let (client_b, server_b) = connection_pair(256);
+        let fake_a = tokio::spawn(async move {
+            let (mut tx, mut rx) = server_a.split();
+            let _hello: ToAgent = rx.recv().await.unwrap().unwrap();
+            tx.send(&FromAgent::Ready { capacity: 1 }).await.unwrap();
+            let _assign: ToAgent = rx.recv().await.unwrap().unwrap();
+            tx.send(&FromAgent::Failed {
+                task_id: 0,
+                error: "boom".to_string(),
+            })
+            .await
+            .unwrap();
+            // Drop without a shutdown: the coordinator sees A's stream end.
+        });
+        let agent_b = tokio::spawn(serve(
+            server_b,
+            Registry::new().with("id", handler(|x: u32| x)),
+            1,
+        ));
+
+        let agents = vec![("a".to_string(), client_a), ("b".to_string(), client_b)];
+        let out: Vec<Result<u32, String>> = run_job(agents, "id", vec![0u32, 1], &NoopSink)
+            .await
+            .unwrap();
+
+        assert!(out[0].as_ref().unwrap_err().contains("boom"));
+        assert_eq!(out[1], Ok(1));
+        fake_a.await.unwrap();
+        let _ = agent_b.await;
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        /// However early one of two agents is severed, every task still
+        /// completes exactly once, in input order.
+        #[test]
+        fn a_severed_agent_never_loses_or_duplicates_a_task(cut in 10usize..400) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (raw_a, server_a) = tokio::io::duplex(256);
+                let (raw_b, server_b) = tokio::io::duplex(256);
+                let client_a = Connection::new(FaultInjector::cut_reads_after(raw_a, cut));
+                let client_b = Connection::new(FaultInjector::cut_reads_after(raw_b, usize::MAX));
+                let agent_a = tokio::spawn(serve(
+                    Connection::new(server_a),
+                    Registry::new().with("id", handler(|x: u32| x)),
+                    1,
+                ));
+                let agent_b = tokio::spawn(serve(
+                    Connection::new(server_b),
+                    Registry::new().with("id", handler(|x: u32| x)),
+                    1,
+                ));
+                let agents = vec![("a".to_string(), client_a), ("b".to_string(), client_b)];
+                let out: Vec<Result<u32, String>> =
+                    run_job(agents, "id", (0..30u32).collect(), &NoopSink).await.unwrap();
+                prop_assert_eq!(out, (0..30u32).map(Ok).collect::<Vec<_>>());
+                let _ = agent_a.await;
+                let _ = agent_b.await;
+                Ok(())
+            })?;
+        }
     }
 
     #[tokio::test]

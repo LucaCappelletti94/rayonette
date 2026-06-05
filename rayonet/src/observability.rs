@@ -1,10 +1,10 @@
 //! The serializable event stream and the in-memory run state (PLAN.md Phase 5).
 //!
 //! The core emits a single stream of [`Event`]s, the one source of truth that
-//! every renderer subscribes to (DECISIONS.md decision 19). [`EventBus`] is the
+//! every renderer subscribes to. [`EventBus`] is the
 //! lossy broadcast: a slow observer drops events but can never backpressure the
 //! run. [`RunState`] reduces the stream into the live per-node and per-task
-//! picture a renderer draws (decision 27). Events are `Serialize` so a renderer
+//! picture a renderer draws. Events are `Serialize` so a renderer
 //! can be in-process or out-of-process.
 
 use std::collections::BTreeMap;
@@ -14,7 +14,7 @@ use tokio::sync::broadcast;
 
 use crate::protocol::TaskId;
 
-/// A node's place in its lifecycle, grown per phase (DECISIONS.md decision 20).
+/// A node's place in its lifecycle, grown per phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeState {
     /// Confirming the host responds (the `uname` probe).
@@ -33,10 +33,12 @@ pub enum NodeState {
     Idle,
     /// The run finished on this node.
     Done,
+    /// The node's connection dropped; its in-flight work was requeued.
+    Lost,
 }
 
 /// One observability event. The stream carries node lifecycle and task
-/// lifecycle; log lines and richer progress are deferred (decision 19, 23).
+/// lifecycle; log lines and richer progress are deferred.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
     /// The run began with this many tasks (the progress denominator).
@@ -80,9 +82,9 @@ impl Event {
     }
 }
 
-/// A consumer of the observability event stream (DECISIONS.md decision 19).
+/// A consumer of the observability event stream.
 pub trait EventSink: Send + Sync {
-    /// Record one event. Must not block the run (decision 19).
+    /// Record one event. Must not block the run.
     fn emit(&self, event: Event);
 }
 
@@ -98,7 +100,7 @@ impl EventSink for NoopSink {
 ///
 /// Backed by a bounded broadcast channel: [`EventBus::emit`] never blocks, and a
 /// receiver that falls behind silently drops the events it missed rather than
-/// slowing the producer (DECISIONS.md decision 19).
+/// slowing the producer.
 #[derive(Debug)]
 pub struct EventBus {
     sender: broadcast::Sender<Event>,
@@ -182,7 +184,7 @@ impl RunState {
 }
 
 /// A headless renderer: turns the event stream into a deterministic sequence of
-/// plain lines, for non-terminal runs, logs, and CI (DECISIONS.md decision 19).
+/// plain lines, for non-terminal runs, logs, and CI.
 #[derive(Debug, Default)]
 pub struct PlainRenderer {
     state: RunState,
@@ -306,6 +308,7 @@ mod tests {
             NodeState::Working,
             NodeState::Idle,
             NodeState::Done,
+            NodeState::Lost,
         ] {
             let bytes = postcard::to_allocvec(&state).unwrap();
             let back: NodeState = postcard::from_bytes(&bytes).unwrap();

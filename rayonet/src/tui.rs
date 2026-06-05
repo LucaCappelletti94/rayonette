@@ -2,7 +2,7 @@
 //!
 //! A pure [`draw`] turns a [`RunState`] snapshot into a frame: a summary line
 //! plus one row per node with its state and finished-task count. It is one of
-//! the pluggable views over the event stream (DECISIONS.md decision 19).
+//! the pluggable views over the event stream.
 
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;

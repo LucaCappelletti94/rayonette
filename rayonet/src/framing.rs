@@ -1,4 +1,4 @@
-//! Length-delimited framing over an async byte stream (DECISIONS.md decision 22).
+//! Length-delimited framing over an async byte stream.
 //!
 //! Messages are serde-encoded with postcard and framed with
 //! `tokio_util::codec::LengthDelimitedCodec`. Framing is the only part of the

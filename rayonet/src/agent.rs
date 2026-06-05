@@ -1,7 +1,7 @@
 //! The agent side: run a registry of task handlers against a connection,
 //! turning `Assign` messages into `Completed`/`Failed` (PLAN.md Phase 1).
 //!
-//! A task fails only by panicking (DECISIONS.md decision 7): each task runs
+//! A task fails only by panicking: each task runs
 //! under `catch_unwind` so a panic becomes a `Failed` message rather than
 //! tearing down the agent or losing its in-flight siblings. Phase 3 will
 //! generate the registry from the consumer's source; here it is built by hand.
@@ -25,7 +25,7 @@ pub type TaskHandler = Arc<dyn Fn(Vec<u8>) -> Result<Vec<u8>, String> + Send + S
 /// `catch_unwind` so a panic becomes a `Failed` outcome.
 ///
 /// Accepts any `Fn` for test ergonomics; the public API (Phase 3) restricts the
-/// surface to a non-capturing `fn(Input) -> Output` (decision 8).
+/// surface to a non-capturing `fn(Input) -> Output`.
 pub fn handler<I, O, F>(f: F) -> TaskHandler
 where
     I: DeserializeOwned,
@@ -41,9 +41,9 @@ where
 
 /// The stable wire key for a task function: its `type_name`.
 ///
-/// (DECISIONS.md decision 12.) The same function on both coordinator and agent
-/// produces the same key because it is the same compiled type. Pass the function
-/// *item* (not a coerced `fn` pointer) so the key is unique per function.
+/// The same function on both coordinator and agent produces the same key
+/// because it is the same compiled type. Pass the function *item* (not a
+/// coerced `fn` pointer) so the key is unique per function.
 #[must_use]
 pub fn fn_key<F: ?Sized>(_f: &F) -> &'static str {
     std::any::type_name::<F>()

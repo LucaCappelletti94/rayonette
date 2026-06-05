@@ -74,10 +74,10 @@ impl<L: Launch> Fleet<L> {
     /// The function is used only for its `type_name` key; the agents already
     /// hold the matching handler (registered under the same key). The name
     /// `netmap` is also what the build-time parser scans for to discover task
-    /// functions (DECISIONS.md decision 12).
+    /// functions.
     ///
     /// # Examples
-    /// A capturing closure is rejected at compile time (DECISIONS.md decision 8):
+    /// A capturing closure is rejected at compile time:
     /// ```compile_fail
     /// use rayonet::fleet::{Fleet, Subprocess};
     /// let fleet: Fleet<Subprocess> = Fleet::new(vec![]);
@@ -97,7 +97,7 @@ impl<L: Launch> Fleet<L> {
         I: Serialize,
         O: DeserializeOwned,
     {
-        // Reject capturing closures at compile time (DECISIONS.md decision 8): a
+        // Reject capturing closures at compile time: a
         // named function or non-capturing closure is zero-sized; captured state
         // is not. This keeps the unique fn-item type that the key relies on.
         const {
@@ -113,7 +113,7 @@ impl<L: Launch> Fleet<L> {
         let mut failures = Vec::new();
         // A host that fails to launch (for example a cold host that cannot
         // install the toolchain) is dropped; its tasks are simply scheduled
-        // onto the survivors by the pull scheduler (DECISIONS.md decision 18).
+        // onto the survivors by the pull scheduler.
         for launcher in &self.launchers {
             match launcher.launch(events).await {
                 Ok((connection, guard)) => {
@@ -141,8 +141,7 @@ impl<L: Launch> Fleet<L> {
 
 /// Launches an agent by spawning a command as a subprocess.
 ///
-/// Typically the consumer's own binary (DECISIONS.md decisions 3-4: one binary,
-/// two roles).
+/// Typically the consumer's own binary (one binary, two roles).
 pub struct Subprocess {
     program: std::ffi::OsString,
 }
@@ -200,9 +199,8 @@ mod rayon_bridge {
 
     /// Adds `.netmap(f)` to any rayon `ParallelIterator`: the ordered barrier bridge.
     ///
-    /// (DECISIONS.md decisions 5-6.) It drains the upstream iterator, runs `f`
-    /// distributed over a fleet, and returns outputs in input order so the chain
-    /// can re-enter rayon.
+    /// It drains the upstream iterator, runs `f` distributed over a fleet, and
+    /// returns outputs in input order so the chain can re-enter rayon.
     pub trait NetmapExt: ParallelIterator + Sized {
         /// Begin a distributed map of `f` over this iterator's items; terminate
         /// with [`NetMapJob::run`].
@@ -345,7 +343,7 @@ mod tests {
     #[tokio::test]
     async fn netmap_proceeds_when_some_hosts_fail_to_launch() {
         // One healthy host, two that fail to launch: the job still completes,
-        // the survivor absorbing every task (DECISIONS.md decision 18).
+        // the survivor absorbing every task.
         let launchers = vec![
             InProcess::serving(false, 1),
             InProcess::serving(true, 2),

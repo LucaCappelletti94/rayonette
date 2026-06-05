@@ -4,8 +4,7 @@
 //! ship and unpack the crate source, build it, and report the agent binary
 //! path. It runs against any [`Remote`] (real ssh in Phase 4b, a mock at
 //! level 1), emitting [`NodeState`] transitions to an [`EventSink`] as it goes.
-//! A content-addressed build directory lets a second run skip the rebuild
-//! (DECISIONS.md decisions 2-3, 18).
+//! A content-addressed build directory lets a second run skip the rebuild.
 
 use std::future::Future;
 use std::io;
@@ -67,7 +66,7 @@ fn remote_cache_dir(source_tar: &[u8]) -> String {
 ///
 /// The path is content-addressed on `source_tar`, so the same source maps to
 /// the same location on every host, which is what makes a repeat run a cache
-/// hit (DECISIONS.md decision 18).
+/// hit.
 #[must_use]
 pub fn remote_binary_path(source_tar: &[u8], binary_name: &str) -> String {
     format!(
@@ -94,7 +93,7 @@ fn require_success(host: &str, step: &str, out: &CommandOutput) -> io::Result<()
 /// Ships `source_tar` (the `extract()` bundle), installing the `toolchain` via
 /// rustup if rust is absent, and builds the crate whose agent binary is named
 /// `binary_name`. A content-addressed build dir makes a repeat run a cache hit
-/// that skips straight to [`NodeState::Ready`] (DECISIONS.md decision 18).
+/// that skips straight to [`NodeState::Ready`].
 ///
 /// # Errors
 /// Returns an error if any provisioning step fails on the host; the message
@@ -120,7 +119,7 @@ pub async fn provision<R: Remote>(
         return Ok(Provisioned { binary_path });
     }
 
-    // Install rust user-locally only when it is missing (decision 18).
+    // Install rust user-locally only when it is missing.
     let cargo = "command -v cargo >/dev/null 2>&1 || test -x \"$HOME/.cargo/bin/cargo\"";
     if remote.run(cargo).await?.status != 0 {
         events.emit(Event::node(host, NodeState::Installing));

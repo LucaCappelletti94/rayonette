@@ -1,4 +1,4 @@
-//! The rayonet wire message set (DECISIONS.md decision 23).
+//! The rayonet wire message set.
 
 use serde::{Deserialize, Serialize};
 

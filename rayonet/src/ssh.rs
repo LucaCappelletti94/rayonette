@@ -2,8 +2,8 @@
 //!
 //! [`SshRemote`] runs the provisioning ladder's commands over a live ssh
 //! session (it is a [`Remote`]); [`Ssh`] is a [`Launch`] that starts the agent
-//! on a host and bridges its stdio as the task transport (DECISIONS.md decision
-//! 21). System ssh is driven through openssh, so `~/.ssh/config`, connection
+//! on a host and bridges its stdio as the task transport. System ssh is driven
+//! through openssh, so `~/.ssh/config`, connection
 //! multiplexing, and `ProxyJump` apply unchanged, and no ports are opened.
 
 use std::io;
@@ -150,7 +150,7 @@ enum AgentSource {
     },
 }
 
-/// A [`Launch`] that starts the agent on a host over ssh (decision 21).
+/// A [`Launch`] that starts the agent on a host over ssh.
 ///
 /// Build it with [`Ssh::build`] to provision-then-spawn (the cold-host path),
 /// or [`Ssh::prebuilt`] to spawn an already-built binary.
@@ -179,7 +179,7 @@ impl Ssh {
 
     /// Provision the host from `source_tar` (the `extract()` bundle), building
     /// the `binary_name` agent with `toolchain`, then spawn it. Ladder
-    /// transitions are emitted to the sink passed at launch (decisions 18-20).
+    /// transitions are emitted to the sink passed at launch.
     #[must_use]
     pub fn build(
         config: SshConfig,

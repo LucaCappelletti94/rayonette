@@ -93,6 +93,20 @@ else
   fails=$((fails + 1))
 fi
 
+# Fault tolerance: a host is killed mid-run; the survivor must finish every
+# task (the caches are already warm from the fast/slow run above).
+echo "=== scenario: kill (leaf-slow dies mid-run) ==="
+RAYONET_SSH_CONFIG="$CONFIG" RAYONET_LEAVES="leaf-fast,leaf-slow" RAYONET_SOURCE_TAR="$TAR" \
+  RAYONET_TOOLCHAIN=stable RAYONET_TASK=crunch RAYONET_COUNT=120 \
+  "$BIN" >/tmp/rayonet-scenario-kill.log 2>&1 &
+consumer_pid=$!
+sleep 3 # provisioning is a cache hit, so the run is underway by now
+docker kill rayonet-harness-leaf-slow-1 >/dev/null 2>&1 && echo "  killed leaf-slow"
+wait "$consumer_pid"
+grep -E 'state leaf-slow|ok:|share' /tmp/rayonet-scenario-kill.log | tail -5
+expect kill 'state leaf-slow Lost' 'killed host is marked Lost'
+expect kill 'ok: 120 results'      'survivor finished every task'
+
 echo
 if [ "$fails" -eq 0 ]; then echo "ALL SCENARIOS PASSED"; else echo "$fails CHECK(S) FAILED"; fi
 exit "$fails"

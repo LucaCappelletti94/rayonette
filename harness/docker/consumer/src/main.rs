@@ -1,4 +1,4 @@
-//! The docker harness consumer: one binary, two roles (DECISIONS.md decision 4).
+//! The docker harness consumer: one binary, two roles.
 //!
 //! Built and shipped to the leaf containers, where it runs as an agent. Run on
 //! the host (coordinator role) it provisions the leaves named in `RAYONET_LEAVES`

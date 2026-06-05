@@ -1,10 +1,10 @@
-//! Build-time extraction for rayonet, called from a consumer crate's `build.rs`
-//! (DECISIONS.md decision 9). It parses the consumer crate, bundles whole-crate
-//! source for shipping, and generates the agent task registry.
+//! Build-time extraction for rayonet, called from a consumer crate's `build.rs`.
+//! It parses the consumer crate, bundles whole-crate source for shipping, and
+//! generates the agent task registry.
 //!
-//! Task functions are identified by their `.netmap(IDENT)` call sites
-//! (DECISIONS.md decision 12, option 1): each named function passed to `.netmap`
-//! is registered on the agent under its `type_name`.
+//! Task functions are identified by their `.netmap(IDENT)` call sites: each
+//! named function passed to `.netmap` is registered on the agent under its
+//! `type_name`.
 
 /// Find the named functions passed to `.netmap(...)` call sites in `source`,
 /// in source order. Closures and other non-path arguments are skipped (only
@@ -58,7 +58,7 @@ pub fn generate_registry(functions: &[String]) -> String {
     code
 }
 
-/// Build-script entry point (DECISIONS.md decision 9).
+/// Build-script entry point.
 ///
 /// Discovers task functions from `.netmap` call sites in the consumer crate's
 /// `src/` and writes the generated agent registry to `OUT_DIR/rayonet_registry.rs`
@@ -115,7 +115,7 @@ fn extract_into(
 
 /// Tar the whole-crate source (`Cargo.toml`, `Cargo.lock` if present, and the
 /// scanned `src/` files) into `OUT_DIR/rayonet_source.tar` for Phase 4 to ship
-/// to remote hosts and compile there (DECISIONS.md decisions 2-3).
+/// to remote hosts and compile there.
 fn bundle_source(
     manifest_dir: &std::path::Path,
     sources: &[std::path::PathBuf],
@@ -138,7 +138,7 @@ fn bundle_source(
 }
 
 /// Error if the consumer's `Cargo.toml` has a non-rayonet local `path`
-/// dependency (DECISIONS.md decision 15: v1 cannot ship local path crates).
+/// dependency (v1 cannot ship local path crates).
 /// Detects direct path deps; the transitive cascade is a future enhancement.
 fn check_path_dependencies(manifest_dir: &std::path::Path) -> std::io::Result<()> {
     let text = std::fs::read_to_string(manifest_dir.join("Cargo.toml"))?;
@@ -157,7 +157,7 @@ fn check_path_dependencies(manifest_dir: &std::path::Path) -> std::io::Result<()
             if spec.as_table().is_some_and(|t| t.contains_key("path")) {
                 return Err(std::io::Error::other(format!(
                     "rayonet does not support local path dependencies yet: `{name}` uses \
-                     `path = ...`; publish, vendor, or inline it (DECISIONS.md decision 15)"
+                     `path = ...`; publish, vendor, or inline it"
                 )));
             }
         }
