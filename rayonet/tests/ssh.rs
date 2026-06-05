@@ -5,12 +5,12 @@
 //! `cargo test -- --include-ignored` on a host where this user can ssh into
 //! itself with the `rayonet_localhost_ed25519` key (CI sets that up).
 
-use std::sync::{Arc, Mutex};
-
 use rayonet::coordinator::run_job;
 use rayonet::fleet::Launch;
-use rayonet::provisioning::{remote_binary_path, Event, EventSink, NodeState, Remote};
+use rayonet::observability::{NodeState, NoopSink};
+use rayonet::provisioning::{remote_binary_path, Remote};
 use rayonet::ssh::{Ssh, SshConfig, SshRemote};
+use rayonet::testing::EventRecorder as Recorder;
 
 /// The dedicated test key's path.
 fn keyfile() -> String {
@@ -21,24 +21,6 @@ fn keyfile() -> String {
 /// ssh into this same machine, authenticating with the dedicated test key.
 fn localhost() -> SshConfig {
     SshConfig::new("localhost").keyfile(keyfile())
-}
-
-/// Records the node-state transitions the ladder emits.
-#[derive(Default)]
-struct Recorder {
-    states: Mutex<Vec<NodeState>>,
-}
-
-impl EventSink for Recorder {
-    fn emit(&self, event: Event) {
-        self.states.lock().unwrap().push(event.state);
-    }
-}
-
-impl Recorder {
-    fn states(&self) -> Vec<NodeState> {
-        self.states.lock().unwrap().clone()
-    }
 }
 
 #[tokio::test]
@@ -71,11 +53,17 @@ async fn ssh_launch_runs_a_task_end_to_end() {
     let agent = env!("CARGO_BIN_EXE_rayonet-test-agent");
     let ssh = Ssh::prebuilt(localhost(), agent);
     assert!(format!("{ssh:?}").contains("Ssh"));
+    assert_eq!(ssh.label(), "localhost");
 
-    let (connection, guard) = ssh.launch().await.unwrap();
-    let out: Vec<Result<u32, String>> = run_job(vec![connection], "double", vec![1u32, 2, 3])
-        .await
-        .unwrap();
+    let (connection, guard) = ssh.launch(&NoopSink).await.unwrap();
+    let out: Vec<Result<u32, String>> = run_job(
+        vec![("localhost".to_string(), connection)],
+        "double",
+        vec![1u32, 2, 3],
+        &NoopSink,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(out, vec![Ok(2), Ok(4), Ok(6)]);
     drop(guard);
@@ -123,13 +111,18 @@ async fn ssh_build_with_warm_cache_provisions_and_runs() {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::copy(env!("CARGO_BIN_EXE_rayonet-test-agent"), &local_path).unwrap();
 
-    let events = Arc::new(Recorder::default());
-    let ssh = Ssh::build(config, tar, "stable", "rayonet-test-agent", events.clone());
+    let events = Recorder::default();
+    let ssh = Ssh::build(config, tar, "stable", "rayonet-test-agent");
 
-    let (connection, guard) = ssh.launch().await.unwrap();
-    let out: Vec<Result<u32, String>> = run_job(vec![connection], "double", vec![5u32])
-        .await
-        .unwrap();
+    let (connection, guard) = ssh.launch(&events).await.unwrap();
+    let out: Vec<Result<u32, String>> = run_job(
+        vec![("rayonet-local".to_string(), connection)],
+        "double",
+        vec![5u32],
+        &NoopSink,
+    )
+    .await
+    .unwrap();
     drop(guard);
 
     assert_eq!(out, vec![Ok(10)]);

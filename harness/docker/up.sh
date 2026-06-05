@@ -34,7 +34,7 @@ Host bastion
   HostName 127.0.0.1
   Port 2201
 
-Host leaf-a leaf-b leaf-blocked
+Host leaf-a leaf-b leaf-blocked leaf-fast leaf-slow
   ProxyJump bastion
 
 Host leaf-deep

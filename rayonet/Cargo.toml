@@ -13,6 +13,8 @@ categories.workspace = true
 [features]
 # Opt-in rayon `ParallelIterator` composition (`.netmap(f).run(&fleet)`).
 rayon = ["dep:rayon"]
+# Opt-in terminal TUI renderer for the live run view.
+tui = ["dep:ratatui"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -24,6 +26,7 @@ futures = "0.3"
 blake3 = "1"
 openssh = "0.11"
 rayon = { version = "1", optional = true }
+ratatui = { version = "0.29", optional = true }
 
 [dev-dependencies]
 proptest = "1"

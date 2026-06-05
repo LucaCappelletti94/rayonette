@@ -7,6 +7,7 @@
 //! subprocesses, or ssh (Phase 4).
 
 use std::future::Future;
+use std::sync::Arc;
 
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -14,6 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::agent::fn_key;
 use crate::coordinator::run_job;
 use crate::framing::Connection;
+use crate::observability::{EventSink, NoopSink};
 
 /// Launches one agent and yields a connection to it plus a lifecycle guard kept
 /// alive for the duration of a run.
@@ -23,33 +25,48 @@ pub trait Launch {
     /// A handle held for the run's duration (a process or task lifecycle).
     type Guard: Send;
 
-    /// Launch one agent.
+    /// A stable name for the host this launcher targets, used to attribute
+    /// observability events.
+    fn label(&self) -> String;
+
+    /// Launch one agent, emitting any provisioning progress to `events`.
     ///
     /// # Errors
     /// Returns an error if the agent cannot be launched.
     fn launch(
         &self,
+        events: &dyn EventSink,
     ) -> impl Future<Output = std::io::Result<(Connection<Self::Stream>, Self::Guard)>> + Send;
 }
 
-/// A homogeneous set of agent launchers.
+/// A homogeneous set of agent launchers, with an optional observer for the run.
 pub struct Fleet<L> {
     launchers: Vec<L>,
+    events: Arc<dyn EventSink>,
 }
 
 impl<L> std::fmt::Debug for Fleet<L> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Fleet")
             .field("agents", &self.launchers.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl<L: Launch> Fleet<L> {
-    /// Build a fleet from a set of launchers.
+    /// Build a fleet from a set of launchers, with the run unobserved.
     #[must_use]
-    pub const fn new(launchers: Vec<L>) -> Self {
-        Self { launchers }
+    pub fn new(launchers: Vec<L>) -> Self {
+        Self {
+            launchers,
+            events: Arc::new(NoopSink),
+        }
+    }
+
+    /// Build a fleet whose run emits its event stream to `events`.
+    #[must_use]
+    pub fn observed(launchers: Vec<L>, events: Arc<dyn EventSink>) -> Self {
+        Self { launchers, events }
     }
 
     /// Run `f` over `inputs` across the fleet, returning outputs in input order.
@@ -90,22 +107,23 @@ impl<L: Launch> Fleet<L> {
             );
         }
         let key = fn_key(&f);
-        let mut connections = Vec::with_capacity(self.launchers.len());
+        let events = self.events.as_ref();
+        let mut agents = Vec::with_capacity(self.launchers.len());
         let mut guards = Vec::with_capacity(self.launchers.len());
         let mut failures = Vec::new();
         // A host that fails to launch (for example a cold host that cannot
         // install the toolchain) is dropped; its tasks are simply scheduled
         // onto the survivors by the pull scheduler (DECISIONS.md decision 18).
         for launcher in &self.launchers {
-            match launcher.launch().await {
+            match launcher.launch(events).await {
                 Ok((connection, guard)) => {
-                    connections.push(connection);
+                    agents.push((launcher.label(), connection));
                     guards.push(guard);
                 }
                 Err(failure) => failures.push(failure),
             }
         }
-        if connections.is_empty() {
+        if agents.is_empty() {
             let detail = failures
                 .iter()
                 .map(ToString::to_string)
@@ -115,7 +133,7 @@ impl<L: Launch> Fleet<L> {
                 "rayonet: every host failed to launch: {detail}"
             )));
         }
-        let result = run_job(connections, key, inputs).await;
+        let result = run_job(agents, key, inputs, events).await;
         drop(guards); // agents already shut down via the job's `Shutdown`
         result
     }
@@ -160,7 +178,15 @@ impl Launch for Subprocess {
     type Stream = tokio::io::Join<tokio::process::ChildStdout, tokio::process::ChildStdin>;
     type Guard = crate::process::AgentProcess;
 
-    async fn launch(&self) -> std::io::Result<(Connection<Self::Stream>, Self::Guard)> {
+    fn label(&self) -> String {
+        self.program.to_string_lossy().into_owned()
+    }
+
+    // A local subprocess does not provision, so there is no progress to emit.
+    async fn launch(
+        &self,
+        _events: &dyn EventSink,
+    ) -> std::io::Result<(Connection<Self::Stream>, Self::Guard)> {
         crate::process::spawn(tokio::process::Command::new(&self.program))
     }
 }
@@ -234,7 +260,7 @@ pub use rayon_bridge::{NetMapJob, NetmapExt};
 
 #[cfg(test)]
 mod tests {
-    use super::{Fleet, Launch};
+    use super::{EventSink, Fleet, Launch};
     use crate::agent::{serve, Registry};
     use crate::framing::Connection;
     use crate::testing::connection_pair;
@@ -260,7 +286,14 @@ mod tests {
         type Stream = DuplexStream;
         type Guard = JoinHandle<std::io::Result<()>>;
 
-        async fn launch(&self) -> std::io::Result<(Connection<DuplexStream>, Self::Guard)> {
+        fn label(&self) -> String {
+            "in-process".to_string()
+        }
+
+        async fn launch(
+            &self,
+            _events: &dyn EventSink,
+        ) -> std::io::Result<(Connection<DuplexStream>, Self::Guard)> {
             let Some(registry) = &self.registry else {
                 return Err(std::io::Error::other("simulated launch failure"));
             };
@@ -284,6 +317,29 @@ mod tests {
 
         assert_eq!(out, (0..20u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
         assert!(format!("{fleet:?}").contains("Fleet"));
+    }
+
+    #[tokio::test]
+    async fn an_observed_fleet_emits_the_run_event_stream() {
+        use crate::observability::{NodeState, RunState};
+        use crate::testing::EventRecorder;
+        use std::sync::Arc;
+
+        let sink = Arc::new(EventRecorder::default());
+        let launchers = (0..2).map(|_| InProcess::serving(true, 2)).collect();
+        let fleet = Fleet::observed(launchers, sink.clone());
+
+        let out: Vec<Result<u32, String>> =
+            fleet.netmap(double, (0..10u32).collect()).await.unwrap();
+        assert_eq!(out.len(), 10);
+
+        let mut state = RunState::default();
+        for event in &sink.events() {
+            state.apply(event);
+        }
+        assert_eq!(state.total_tasks, 10);
+        assert_eq!(state.completed, 10);
+        assert_eq!(state.nodes["in-process"].state, NodeState::Done);
     }
 
     #[tokio::test]

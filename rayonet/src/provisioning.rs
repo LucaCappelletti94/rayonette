@@ -10,52 +10,7 @@
 use std::future::Future;
 use std::io;
 
-/// A node's place in its lifecycle, started minimal and grown per phase
-/// (DECISIONS.md decision 20). Phase 4 uses the provisioning states only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeState {
-    /// Confirming the host responds (the `uname` probe).
-    Probing,
-    /// Installing the rust toolchain user-locally via rustup.
-    Installing,
-    /// Shipping and unpacking the crate source.
-    Syncing,
-    /// Compiling the agent on the host.
-    Building,
-    /// Built and ready to receive tasks.
-    Ready,
-}
-
-/// A single observability event: a node entered a new [`NodeState`].
-///
-/// The event stream is the single source of truth that renderers subscribe to
-/// (DECISIONS.md decision 19); Phase 5 grows it and adds the broadcast.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Event {
-    /// The host the event is about.
-    pub host: String,
-    /// The state the host just entered.
-    pub state: NodeState,
-}
-
-impl Event {
-    /// Build a node-state-change event for `host`.
-    #[must_use]
-    pub fn node(host: &str, state: NodeState) -> Self {
-        Self {
-            host: host.to_string(),
-            state,
-        }
-    }
-}
-
-/// A consumer of the observability event stream (DECISIONS.md decision 19).
-///
-/// Renderers (the TUI, a plain progress line, a test recorder) implement this.
-pub trait EventSink: Send + Sync {
-    /// Record one event. Must not block the run (decision 19).
-    fn emit(&self, event: Event);
-}
+use crate::observability::{Event, EventSink, NodeState};
 
 /// The captured result of running a command to completion on a [`Remote`].
 #[derive(Debug, Clone)]
@@ -200,9 +155,7 @@ pub async fn provision<R: Remote>(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        content_hash, provision, CommandOutput, Event, EventSink, NodeState, Provisioned, Remote,
-    };
+    use super::{content_hash, provision, CommandOutput, NodeState, Provisioned, Remote};
     use std::sync::Mutex;
 
     /// A scripted host: it answers the ladder's probes by configuration and
@@ -286,22 +239,7 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct Recorder {
-        states: Mutex<Vec<NodeState>>,
-    }
-
-    impl EventSink for Recorder {
-        fn emit(&self, event: Event) {
-            self.states.lock().unwrap().push(event.state);
-        }
-    }
-
-    impl Recorder {
-        fn states(&self) -> Vec<NodeState> {
-            self.states.lock().unwrap().clone()
-        }
-    }
+    use crate::testing::EventRecorder as Recorder;
 
     #[tokio::test]
     async fn cold_host_runs_the_full_ladder() {
@@ -385,13 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn public_types_expose_debug_clone_and_eq() {
-        let event = Event::node("h1", NodeState::Ready);
-        let event_copy = event.clone();
-        assert_eq!(event, event_copy);
-        assert!(format!("{event:?}").contains("Ready"));
-        assert_eq!(format!("{:?}", NodeState::Building), "Building");
-
+    fn provisioning_types_expose_debug_clone_and_eq() {
         let provisioned = Provisioned {
             binary_path: "/x".to_string(),
         };

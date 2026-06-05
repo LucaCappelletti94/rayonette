@@ -7,11 +7,53 @@
 //! feature gate is a Phase 7 hardening item.)
 
 use std::pin::Pin;
+use std::sync::{Mutex, PoisonError};
 use std::task::{Context, Poll};
 
 use tokio::io::{duplex, AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 
 use crate::framing::Connection;
+use crate::observability::{Event, EventSink, NodeState};
+
+/// Collects the observability event stream so a test can assert what a run
+/// emitted: the full sequence via [`events`](Self::events), or just the
+/// node-state transitions via [`states`](Self::states).
+#[derive(Debug, Default)]
+pub struct EventRecorder {
+    events: Mutex<Vec<Event>>,
+}
+
+impl EventRecorder {
+    /// Every event emitted so far, in order.
+    #[must_use]
+    pub fn events(&self) -> Vec<Event> {
+        self.events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Just the node-state transitions, in order.
+    #[must_use]
+    pub fn states(&self) -> Vec<NodeState> {
+        self.events()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Node { state, .. } => Some(state),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+impl EventSink for EventRecorder {
+    fn emit(&self, event: Event) {
+        self.events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(event);
+    }
+}
 
 /// Create a connected pair of in-process connections over a `tokio` duplex pipe
 /// of the given per-direction buffer size. Small buffers force fragmentation.

@@ -26,11 +26,12 @@ tar -cf "$TAR" --exclude=./target --exclude=./.git --exclude=harness/docker/secr
 ( cd "$ROOT" && cargo build --release -p rayonet-docker-consumer >/dev/null 2>&1 )
 
 fails=0
-run() { # name, leaves
-  local name="$1" leaves="$2"
-  echo "=== scenario: $name (leaves=$leaves) ==="
+run() { # name, leaves, [task=double], [count=10]
+  local name="$1" leaves="$2" task="${3:-double}" count="${4:-10}"
+  echo "=== scenario: $name (leaves=$leaves task=$task count=$count) ==="
   RAYONET_SSH_CONFIG="$CONFIG" RAYONET_LEAVES="$leaves" \
     RAYONET_SOURCE_TAR="$TAR" RAYONET_TOOLCHAIN=stable \
+    RAYONET_TASK="$task" RAYONET_COUNT="$count" \
     "$BIN" 2>&1 | tee "/tmp/rayonet-scenario-$name.log"
 }
 expect() { # name, pattern, description
@@ -76,6 +77,20 @@ if grep -qE 'state leaf-blocked Ready' "/tmp/rayonet-scenario-blocked.log"; then
   echo "  FAIL: blocked host should never become Ready"; fails=$((fails + 1))
 else
   echo "  PASS: blocked host never becomes Ready"
+fi
+
+# Work-share: a CPU-bound batch across a full-speed and a throttled host. Warm
+# both build caches with a cheap pass first so the cap bites task execution.
+run fastslow-warmup "leaf-fast,leaf-slow" double 1
+run fastslow "leaf-fast,leaf-slow" crunch 40
+expect fastslow 'ok: 40 results' 'every task completed'
+fast=$(grep 'share leaf-fast ' "/tmp/rayonet-scenario-fastslow.log" | awk '{print $NF}')
+slow=$(grep 'share leaf-slow ' "/tmp/rayonet-scenario-fastslow.log" | awk '{print $NF}')
+if [ -n "${fast:-}" ] && [ -n "${slow:-}" ] && [ "$fast" -gt "$slow" ]; then
+  echo "  PASS: fast host took a larger share ($fast vs $slow)"
+else
+  echo "  FAIL: expected fast share > slow share (fast=${fast:-?} slow=${slow:-?})"
+  fails=$((fails + 1))
 fi
 
 echo

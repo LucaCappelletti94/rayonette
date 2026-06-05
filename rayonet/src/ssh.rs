@@ -15,8 +15,9 @@ use tokio::io::{join, AsyncWriteExt, Join};
 
 use crate::fleet::Launch;
 use crate::framing::Connection;
+use crate::observability::EventSink;
 use crate::process::AGENT_ENV;
-use crate::provisioning::{provision, CommandOutput, EventSink, Remote};
+use crate::provisioning::{provision, CommandOutput, Remote};
 
 /// Map an openssh error into the crate's uniform `io::Error` result type.
 fn to_io(error: openssh::Error) -> io::Error {
@@ -146,7 +147,6 @@ enum AgentSource {
         source_tar: Vec<u8>,
         toolchain: String,
         binary_name: String,
-        events: Arc<dyn EventSink>,
     },
 }
 
@@ -179,14 +179,13 @@ impl Ssh {
 
     /// Provision the host from `source_tar` (the `extract()` bundle), building
     /// the `binary_name` agent with `toolchain`, then spawn it. Ladder
-    /// transitions are emitted to `events` (DECISIONS.md decisions 18-20).
+    /// transitions are emitted to the sink passed at launch (decisions 18-20).
     #[must_use]
     pub fn build(
         config: SshConfig,
         source_tar: Vec<u8>,
         toolchain: impl Into<String>,
         binary_name: impl Into<String>,
-        events: Arc<dyn EventSink>,
     ) -> Self {
         Self {
             config,
@@ -194,7 +193,6 @@ impl Ssh {
                 source_tar,
                 toolchain: toolchain.into(),
                 binary_name: binary_name.into(),
-                events,
             },
         }
     }
@@ -204,7 +202,14 @@ impl Launch for Ssh {
     type Stream = Join<ChildStdout, ChildStdin>;
     type Guard = openssh::Child<Arc<Session>>;
 
-    async fn launch(&self) -> io::Result<(Connection<Self::Stream>, Self::Guard)> {
+    fn label(&self) -> String {
+        self.config.destination.clone()
+    }
+
+    async fn launch(
+        &self,
+        events: &dyn EventSink,
+    ) -> io::Result<(Connection<Self::Stream>, Self::Guard)> {
         let session = Arc::new(self.config.connect().await?);
         let binary_path = match &self.source {
             AgentSource::Prebuilt(path) => path.clone(),
@@ -212,7 +217,6 @@ impl Launch for Ssh {
                 source_tar,
                 toolchain,
                 binary_name,
-                events,
             } => {
                 let remote = SshRemote {
                     session: Arc::clone(&session),
@@ -223,7 +227,7 @@ impl Launch for Ssh {
                     toolchain,
                     binary_name,
                     &self.config.destination,
-                    events.as_ref(),
+                    events,
                 )
                 .await?;
                 provisioned.binary_path

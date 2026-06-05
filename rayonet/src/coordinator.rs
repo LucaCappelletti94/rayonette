@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::framing::{Connection, Receiver, Sender};
+use crate::observability::{Event as Obs, EventSink, NodeState};
 use crate::protocol::{FromAgent, TaskId, ToAgent, PROTOCOL_VERSION};
 
 /// What a reader task forwards to the coordinator's central loop.
@@ -52,6 +53,55 @@ where
             }
         }
     })
+}
+
+/// The per-agent state produced by the handshake.
+struct Agents<S> {
+    senders: Vec<Sender<S>>,
+    capacities: Vec<u32>,
+    labels: Vec<String>,
+    readers: Vec<JoinHandle<()>>,
+}
+
+/// Handshake with every agent (send `Hello`, receive `Ready`) and spawn each
+/// agent's reader task feeding the central channel.
+async fn connect_agents<S>(
+    agents: Vec<(String, Connection<S>)>,
+    fn_key: &str,
+    events_tx: &mpsc::UnboundedSender<Event>,
+) -> std::io::Result<Agents<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut out = Agents {
+        senders: Vec::with_capacity(agents.len()),
+        capacities: Vec::with_capacity(agents.len()),
+        labels: Vec::with_capacity(agents.len()),
+        readers: Vec::with_capacity(agents.len()),
+    };
+    for (agent_id, (label, conn)) in agents.into_iter().enumerate() {
+        let (mut tx, mut rx) = conn.split();
+        tx.send(&ToAgent::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            fn_key: fn_key.to_string(),
+        })
+        .await?;
+        let capacity = match rx.recv::<FromAgent>().await? {
+            Some(FromAgent::Ready { capacity }) => capacity,
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("expected Ready, got {other:?}"),
+                ));
+            }
+        };
+        out.senders.push(tx);
+        out.capacities.push(capacity);
+        out.labels.push(label);
+        out.readers
+            .push(spawn_reader(rx, agent_id, events_tx.clone()));
+    }
+    Ok(out)
 }
 
 /// Mutable scheduling state for one run.
@@ -103,14 +153,26 @@ where
         Some(agent)
     }
 
-    /// Record a terminal outcome and, if it freed a slot, refill that agent.
-    async fn complete(
+    /// Record a terminal outcome, emit its task event, and refill the freed
+    /// agent. Emits an `Idle` node event when the agent runs dry.
+    async fn finish(
         &mut self,
         task_id: TaskId,
         result: Result<O, String>,
+        ok: bool,
+        labels: &[String],
+        events: &dyn EventSink,
     ) -> std::io::Result<()> {
         if let Some(agent) = self.record(task_id, result) {
+            events.emit(Obs::TaskFinished {
+                host: labels[agent].clone(),
+                task: task_id,
+                ok,
+            });
             self.fill(agent).await?;
+            if self.inflight[agent] == 0 {
+                events.emit(Obs::node(&labels[agent], NodeState::Idle));
+            }
         }
         Ok(())
     }
@@ -126,9 +188,10 @@ where
 /// Returns an error on a handshake failure or transport error, or (in v1) if an
 /// agent disconnects before the job completes (requeue/reconnect is Phase 6).
 pub async fn run_job<S, I, O>(
-    agents: Vec<Connection<S>>,
+    agents: Vec<(String, Connection<S>)>,
     fn_key: &str,
     inputs: Vec<I>,
+    events: &dyn EventSink,
 ) -> std::io::Result<Vec<Result<O, String>>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -145,30 +208,12 @@ where
     let num_tasks = payloads.len();
 
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let mut senders = Vec::with_capacity(agents.len());
-    let mut capacities = Vec::with_capacity(agents.len());
-    let mut readers = Vec::with_capacity(agents.len());
-
-    for (agent_id, conn) in agents.into_iter().enumerate() {
-        let (mut tx, mut rx) = conn.split();
-        tx.send(&ToAgent::Hello {
-            protocol_version: PROTOCOL_VERSION,
-            fn_key: fn_key.to_string(),
-        })
-        .await?;
-        let capacity = match rx.recv::<FromAgent>().await? {
-            Some(FromAgent::Ready { capacity }) => capacity,
-            other => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("expected Ready, got {other:?}"),
-                ));
-            }
-        };
-        senders.push(tx);
-        capacities.push(capacity);
-        readers.push(spawn_reader(rx, agent_id, events_tx.clone()));
-    }
+    let Agents {
+        senders,
+        capacities,
+        labels,
+        readers,
+    } = connect_agents(agents, fn_key, &events_tx).await?;
     drop(events_tx); // the channel ends when every reader does
 
     let agent_count = senders.len();
@@ -183,21 +228,41 @@ where
         payloads,
     };
 
-    for agent in 0..agent_count {
+    events.emit(Obs::RunStarted { tasks: num_tasks });
+    for (agent, label) in labels.iter().enumerate() {
         job.fill(agent).await?;
+        if job.inflight[agent] > 0 {
+            events.emit(Obs::node(label, NodeState::Working));
+        }
     }
 
     while job.remaining > 0 {
         let event = events_rx.recv().await;
         match event {
-            Some(Event::Message(FromAgent::Started { .. } | FromAgent::Ready { .. })) => {}
+            Some(Event::Message(FromAgent::Ready { .. })) => {
+                // Ready is a handshake message; a second one is a protocol error.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "agent sent Ready more than once",
+                ));
+            }
+            Some(Event::Message(FromAgent::Started { task_id })) => {
+                if let Some((agent, _)) = job.assigned.get(&task_id) {
+                    events.emit(Obs::TaskStarted {
+                        host: labels[*agent].clone(),
+                        task: task_id,
+                    });
+                }
+            }
             Some(Event::Message(FromAgent::Completed { task_id, output })) => {
                 let result =
                     postcard::from_bytes::<O>(&output).map_err(|e| format!("decode output: {e}"));
-                job.complete(task_id, result).await?;
+                let ok = result.is_ok();
+                job.finish(task_id, result, ok, &labels, events).await?;
             }
             Some(Event::Message(FromAgent::Failed { task_id, error })) => {
-                job.complete(task_id, Err(error)).await?;
+                job.finish(task_id, Err(error), false, &labels, events)
+                    .await?;
             }
             Some(Event::Disconnected(agent)) => {
                 return Err(std::io::Error::new(
@@ -220,6 +285,10 @@ where
         }
     }
 
+    for label in &labels {
+        events.emit(Obs::node(label, NodeState::Done));
+    }
+
     for tx in &mut job.senders {
         tx.send(&ToAgent::Shutdown).await?;
     }
@@ -235,11 +304,35 @@ where
 mod tests {
     use super::run_job;
     use crate::agent::{fn_key, handler, serve, Registry};
+    use crate::framing::Connection;
+    use crate::observability::NoopSink;
     use crate::protocol::{FromAgent, ToAgent};
     use crate::testing::connection_pair;
     use proptest::prelude::*;
+    use serde::{de::DeserializeOwned, Serialize};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use tokio::io::{AsyncRead, AsyncWrite};
+
+    /// Run a job over unlabeled connections, discarding events: most tests care
+    /// only about results, not the observability stream.
+    async fn run<S, I, O>(
+        conns: Vec<Connection<S>>,
+        key: &str,
+        inputs: Vec<I>,
+    ) -> std::io::Result<Vec<Result<O, String>>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        I: Serialize,
+        O: DeserializeOwned,
+    {
+        let labeled = conns
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| (format!("a{i}"), c))
+            .collect();
+        run_job(labeled, key, inputs, &NoopSink).await
+    }
 
     #[tokio::test]
     async fn ordered_results_from_one_agent() {
@@ -251,8 +344,7 @@ mod tests {
         ));
 
         let inputs: Vec<u32> = (0u32..10).collect();
-        let out: Vec<Result<u32, String>> =
-            run_job(vec![client], "sq", inputs.clone()).await.unwrap();
+        let out: Vec<Result<u32, String>> = run(vec![client], "sq", inputs.clone()).await.unwrap();
 
         let expected: Vec<Result<u32, String>> = inputs.iter().map(|x| Ok(x * x)).collect();
         assert_eq!(out, expected);
@@ -275,7 +367,7 @@ mod tests {
         ));
 
         let inputs: Vec<u32> = (0u32..6).collect();
-        let out: Vec<Result<u32, String>> = run_job(vec![client], "evens", inputs).await.unwrap();
+        let out: Vec<Result<u32, String>> = run(vec![client], "evens", inputs).await.unwrap();
         agent.await.unwrap().unwrap();
 
         for (i, r) in out.iter().enumerate() {
@@ -305,7 +397,7 @@ mod tests {
         let agent = tokio::spawn(serve(server, Registry::new().with("id", task), 3));
 
         let inputs: Vec<u32> = (0u32..12).collect();
-        let out: Vec<Result<u32, String>> = run_job(vec![client], "id", inputs).await.unwrap();
+        let out: Vec<Result<u32, String>> = run(vec![client], "id", inputs).await.unwrap();
         agent.await.unwrap().unwrap();
 
         assert_eq!(out.len(), 12);
@@ -336,9 +428,8 @@ mod tests {
         let agent_b = tokio::spawn(serve(server_b, Registry::new().with("id", slow), 1));
 
         let inputs: Vec<u32> = (0u32..50).collect();
-        let out: Vec<Result<u32, String>> = run_job(vec![client_a, client_b], "id", inputs)
-            .await
-            .unwrap();
+        let out: Vec<Result<u32, String>> =
+            run(vec![client_a, client_b], "id", inputs).await.unwrap();
         agent_a.await.unwrap().unwrap();
         agent_b.await.unwrap().unwrap();
 
@@ -346,6 +437,72 @@ mod tests {
         let (f, s) = (fast_n.load(Ordering::SeqCst), slow_n.load(Ordering::SeqCst));
         assert_eq!(f + s, 50);
         assert!(f > s, "fast agent ({f}) should out-produce slow ({s})");
+    }
+
+    #[tokio::test]
+    async fn the_event_stream_attributes_work_per_host() {
+        use crate::observability::{NodeState, RunState};
+        use crate::testing::EventRecorder;
+
+        let fast = handler(|x: u32| x);
+        let slow = handler(|x: u32| {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            x
+        });
+        let (client_a, server_a) = connection_pair(256);
+        let (client_b, server_b) = connection_pair(256);
+        let agent_a = tokio::spawn(serve(server_a, Registry::new().with("id", fast), 1));
+        let agent_b = tokio::spawn(serve(server_b, Registry::new().with("id", slow), 1));
+
+        let collector = EventRecorder::default();
+        let agents = vec![
+            ("fast".to_string(), client_a),
+            ("slow".to_string(), client_b),
+        ];
+        let out: Vec<Result<u32, String>> = run_job(agents, "id", (0..40u32).collect(), &collector)
+            .await
+            .unwrap();
+        agent_a.await.unwrap().unwrap();
+        agent_b.await.unwrap().unwrap();
+        assert_eq!(out.len(), 40);
+
+        let mut state = RunState::default();
+        for event in &collector.events() {
+            state.apply(event);
+        }
+
+        assert_eq!(state.total_tasks, 40);
+        assert_eq!(state.completed, 40);
+        assert_eq!(
+            state.nodes["fast"].completed + state.nodes["slow"].completed,
+            40
+        );
+        let (fast, slow) = (state.nodes["fast"].completed, state.nodes["slow"].completed);
+        assert!(fast > slow, "fast {fast} vs slow {slow}");
+        assert_eq!(state.nodes["fast"].state, NodeState::Done);
+        assert_eq!(state.nodes["slow"].state, NodeState::Done);
+
+        // The node-state projection drops the task events from the mixed stream.
+        let states = collector.states();
+        assert!(states.contains(&NodeState::Done));
+        assert!(states
+            .iter()
+            .all(|s| { matches!(s, NodeState::Working | NodeState::Idle | NodeState::Done) }));
+    }
+
+    #[tokio::test]
+    async fn errors_when_agent_readies_twice() {
+        let (client, server) = connection_pair(64);
+        let fake = tokio::spawn(async move {
+            let (mut tx, mut rx) = server.split();
+            let _hello: ToAgent = rx.recv().await.unwrap().unwrap();
+            tx.send(&FromAgent::Ready { capacity: 1 }).await.unwrap();
+            tx.send(&FromAgent::Ready { capacity: 1 }).await.unwrap();
+            let _ = rx.recv::<ToAgent>().await;
+        });
+        let res = run::<_, u32, u32>(vec![client], "k", vec![1u32, 2, 3]).await;
+        assert!(res.is_err());
+        fake.await.unwrap();
     }
 
     proptest! {
@@ -367,7 +524,7 @@ mod tests {
                 ));
                 let inputs: Vec<u64> = (0..n as u64).collect();
                 let out: Vec<Result<u64, String>> =
-                    run_job(vec![client], "id", inputs.clone()).await.unwrap();
+                    run(vec![client], "id", inputs.clone()).await.unwrap();
                 agent.await.unwrap().unwrap();
                 let got: Vec<u64> = out.into_iter().map(Result::unwrap).collect();
                 prop_assert_eq!(got, inputs);
@@ -384,7 +541,7 @@ mod tests {
             let _hello: ToAgent = rx.recv().await.unwrap().unwrap();
             tx.send(&FromAgent::Started { task_id: 0 }).await.unwrap();
         });
-        let res = run_job::<_, u32, u32>(vec![client], "k", vec![1u32]).await;
+        let res = run::<_, u32, u32>(vec![client], "k", vec![1u32]).await;
         assert!(res.is_err());
         fake.await.unwrap();
     }
@@ -399,14 +556,14 @@ mod tests {
             let _assign: ToAgent = rx.recv().await.unwrap().unwrap();
             // Drop without completing: the coordinator sees end-of-stream.
         });
-        let res = run_job::<_, u32, u32>(vec![client], "k", vec![1u32, 2, 3]).await;
+        let res = run::<_, u32, u32>(vec![client], "k", vec![1u32, 2, 3]).await;
         assert!(res.is_err());
         fake.await.unwrap();
     }
 
     #[tokio::test]
     async fn errors_with_no_agents_but_pending_work() {
-        let res = run_job::<tokio::io::DuplexStream, u32, u32>(vec![], "k", vec![1u32, 2, 3]).await;
+        let res = run::<tokio::io::DuplexStream, u32, u32>(vec![], "k", vec![1u32, 2, 3]).await;
         assert!(res.is_err());
     }
 
@@ -427,7 +584,7 @@ mod tests {
             .unwrap();
             let _shutdown: ToAgent = rx.recv().await.unwrap().unwrap();
         });
-        let out: Vec<Result<u32, String>> = run_job(vec![client], "k", vec![7u32]).await.unwrap();
+        let out: Vec<Result<u32, String>> = run(vec![client], "k", vec![7u32]).await.unwrap();
         fake.await.unwrap();
         assert_eq!(out.len(), 1);
         assert!(out[0].as_ref().unwrap_err().contains("decode output"));
@@ -445,7 +602,7 @@ mod tests {
                                             // then drops); receiving that or EOF ends this task with no dead line.
             let _ = rx.recv::<ToAgent>().await;
         });
-        let res = run_job::<_, u32, u32>(vec![client], "k", vec![1u32, 2, 3]).await;
+        let res = run::<_, u32, u32>(vec![client], "k", vec![1u32, 2, 3]).await;
         assert!(res.is_err());
         fake.await.unwrap();
     }
@@ -485,8 +642,7 @@ mod tests {
             let _shutdown: ToAgent = rx.recv().await.unwrap().unwrap();
         });
 
-        let out: Vec<Result<u32, String>> =
-            run_job(vec![client], "k", vec![10u32, 20]).await.unwrap();
+        let out: Vec<Result<u32, String>> = run(vec![client], "k", vec![10u32, 20]).await.unwrap();
         fake.await.unwrap();
         // The duplicate (999) is ignored; the first result (100) stands.
         assert_eq!(out, vec![Ok(100), Ok(200)]);
@@ -502,9 +658,8 @@ mod tests {
 
         // The coordinator derives the same key the agent registered under.
         let key = fn_key(&triple);
-        let out: Vec<Result<u32, String>> = run_job(vec![client], key, (0..5u32).collect())
-            .await
-            .unwrap();
+        let out: Vec<Result<u32, String>> =
+            run(vec![client], key, (0..5u32).collect()).await.unwrap();
         agent.await.unwrap().unwrap();
 
         assert_eq!(out, (0..5u32).map(|x| Ok(x * 3)).collect::<Vec<_>>());
@@ -513,7 +668,7 @@ mod tests {
     #[tokio::test]
     async fn a_serialize_error_fails_the_run() {
         use crate::testing::FailsToSerialize;
-        let res = run_job::<tokio::io::DuplexStream, FailsToSerialize, u32>(
+        let res = run::<tokio::io::DuplexStream, FailsToSerialize, u32>(
             vec![],
             "k",
             vec![FailsToSerialize],
