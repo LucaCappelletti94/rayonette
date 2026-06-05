@@ -1,25 +1,16 @@
 # Monte Carlo with rayonet
 
-Estimate pi by Monte Carlo, distributed across a small local docker "swarm" with
-rayonet. Each task draws millions of random points and counts how many land in
-the unit quarter circle; summing the hits gives pi. The tasks are independent
-and compute-bound, exactly what rayonet is for.
+Estimate pi by Monte Carlo, distributed across a small local docker "swarm" with rayonet. Each task draws millions of random points and counts how many land in the unit quarter circle, and summing the hits gives pi. The tasks are independent and compute-bound, exactly what rayonet is for.
 
 This one program is the whole rayonet contract:
 
-- **One binary, two roles.** Run normally it is the coordinator; rayonet launches
-  the same binary on each worker as the agent.
-- **One line of build glue.** `build.rs` calls `rayonet_build::extract()`, which
-  finds the `.net_map(sample)` call and generates the agent's task registry;
-  `rayonet::embed_microcrates!()` pulls it in.
-- **Blank hosts, no manual deploy.** The workers are bare ssh containers with no
-  rust. rayonet provisions each one from cold: install rust, ship the source,
-  build the agent, launch it.
+- **One binary, two roles.** Run normally it is the coordinator, and rayonet launches the same binary on each worker as the agent.
+- **One line of build glue.** `build.rs` calls `rayonet_build::extract()`, which finds the `.net_map(sample)` call and generates the agent's task registry, and `rayonet::embed_microcrates!()` pulls it in.
+- **Blank hosts, no manual deploy.** The workers are bare ssh containers with no rust. rayonet provisions each one from cold: install rust, ship the source, build the agent, launch it.
 
 ## Run it
 
-The swarm is three blank ssh containers managed by `docker compose`. Docker is
-required.
+The swarm is three blank ssh containers managed by `docker compose`. Docker is required.
 
 ```sh
 # 1. Start the swarm: builds the worker image, starts the workers, and writes a
@@ -44,18 +35,10 @@ pi ~= 3.14159 (from 160000000 samples across 32 tasks on 3 workers)
 
 ## The swarm
 
-`cluster/compose.yml` defines three identical workers built from `cluster/Dockerfile`,
-a `debian` image with `sshd` and the tools rustup needs, but **no rust**, that is
-what makes this a real cold-provisioning demo. Each worker publishes its ssh port
-(`2201`, `2202`, `2203`) so the coordinator can reach `root@localhost:<port>`.
+`cluster/compose.yml` defines three identical workers built from `cluster/Dockerfile`, a `debian` image with `sshd` and the tools rustup needs but **no rust**, which is what makes this a real cold-provisioning demo. Each worker publishes its ssh port (`2201`, `2202`, `2203`) so the coordinator can reach `root@localhost:<port>`.
 
-To use more or fewer workers, add or remove services in `compose.yml` (with
-matching published ports) and the corresponding `host port` lines that
-`cluster/up.sh` writes to `cluster/fleet`.
+To use more or fewer workers, add or remove services in `compose.yml` (with matching published ports) and the corresponding `host port` lines that `cluster/up.sh` writes to `cluster/fleet`.
 
 ## What gets shipped
 
-rayonet ships the whole workspace as the source bundle (because rayonet itself is
-an unpublished path dependency here) and builds only this package on each worker
-(`cargo build -p montecarlo`). A real consumer that depends on a published
-rayonet would ship just its own crate.
+rayonet ships the whole workspace as the source bundle (because rayonet itself is an unpublished path dependency here) and builds only this package on each worker (`cargo build -p montecarlo`). A real consumer that depends on a published rayonet would ship just its own crate.
