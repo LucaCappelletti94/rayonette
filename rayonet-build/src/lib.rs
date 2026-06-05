@@ -2,38 +2,43 @@
 //! It generates the agent task registry and bundles a buildable source tree to
 //! ship to workers, both included by `rayonet::embed_microcrates!()`.
 //!
-//! Task functions are identified by their `.netmap(IDENT)` call sites: each
-//! named function passed to `.netmap` is registered on the agent under its
-//! `type_name`. The source bundle is the consumer's whole workspace (excluding
-//! build output), so a worker can resolve and build it even when rayonet is an
-//! unpublished path dependency.
+//! Task functions are identified by their `.net_map(IDENT)` (and
+//! `.net_map_with_fleet(IDENT, ...)`) call sites: each named function passed to a
+//! `net_map` adapter is registered on the agent under its `type_name`. The
+//! source bundle is the consumer's whole workspace (excluding build output), so
+//! a worker can resolve and build it even when rayonet is an unpublished path
+//! dependency.
 
-/// Find the named functions passed to `.netmap(...)` call sites in `source`,
-/// in source order. Closures and other non-path arguments are skipped (only
-/// named functions can be registered by name).
+/// Find the named functions passed to `net_map` call sites in `source`.
+///
+/// Recognizes `.net_map(IDENT)` and `.net_map_with_fleet(IDENT, ...)`, in source
+/// order. Closures and other non-path arguments are skipped (only named
+/// functions can be registered by name).
 ///
 /// # Errors
 /// Returns an error if `source` is not parseable Rust.
-pub fn find_netmap_calls(source: &str) -> syn::Result<Vec<String>> {
+pub fn find_net_map_calls(source: &str) -> syn::Result<Vec<String>> {
     let file = syn::parse_file(source)?;
-    let mut finder = NetmapFinder::default();
+    let mut finder = NetMapFinder::default();
     syn::visit::Visit::visit_file(&mut finder, &file);
     Ok(finder.calls)
 }
 
 #[derive(Default)]
-struct NetmapFinder {
+struct NetMapFinder {
     calls: Vec<String>,
 }
 
-impl<'ast> syn::visit::Visit<'ast> for NetmapFinder {
+impl<'ast> syn::visit::Visit<'ast> for NetMapFinder {
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-        if call.method == "netmap" {
+        // The task function is the first argument of any `net_map` adapter:
+        // `inputs.net_map(map)` (global fleet) or `.net_map_with_fleet(map, f)`.
+        if call.method == "net_map" || call.method == "net_map_with_fleet" {
             if let Some(syn::Expr::Path(arg)) = call.args.first() {
                 self.calls.push(path_string(&arg.path));
             }
         }
-        // Recurse so nested and chained `.netmap(..)` calls are found too.
+        // Recurse so nested and chained calls are found too.
         syn::visit::visit_expr_method_call(self, call);
     }
 }
@@ -85,7 +90,7 @@ pub fn extract() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Scan the crate's `src/` for `.netmap` task functions, write the registry, and
+/// Scan the crate's `src/` for `.net_map` task functions, write the registry, and
 /// bundle the buildable source tree.
 ///
 /// Returns the bundled files (for rerun-if-changed).
@@ -99,7 +104,7 @@ fn extract_into(
     let mut functions = Vec::new();
     for source in &src_files {
         let text = std::fs::read_to_string(manifest_dir.join(source))?;
-        let calls = find_netmap_calls(&text)
+        let calls = find_net_map_calls(&text)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         for call in calls {
             if !functions.contains(&call) {
@@ -234,7 +239,7 @@ fn collect_rs_files(
 
 #[cfg(test)]
 mod tests {
-    use super::find_netmap_calls;
+    use super::find_net_map_calls;
 
     #[test]
     fn extract_into_scans_subdirs() {
@@ -242,17 +247,17 @@ mod tests {
         std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"c\"\n").unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir_all(src.join("sub")).unwrap();
-        std::fs::write(src.join("main.rs"), "fn a() { let _ = x.netmap(double); }").unwrap();
+        std::fs::write(src.join("main.rs"), "fn a() { let _ = x.net_map(double); }").unwrap();
         std::fs::write(
             src.join("sub").join("more.rs"),
-            "fn b() { let _ = y.netmap(triple); }",
+            "fn b() { let _ = y.net_map(triple); }",
         )
         .unwrap();
         let out = tmp.path().join("out");
         std::fs::create_dir(&out).unwrap();
 
         let bundled = super::extract_into(tmp.path(), &out).unwrap();
-        // Both nested `.netmap` functions are registered, and the nested source
+        // Both nested `.net_map` functions are registered, and the nested source
         // file is in the bundle.
         let registry = std::fs::read_to_string(out.join("rayonet_registry.rs")).unwrap();
         assert!(registry.contains("with_fn(double)"));
@@ -288,7 +293,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             tmp.path().join("member/src/main.rs"),
-            "fn a() { let _ = x.netmap(go); }",
+            "fn a() { let _ = x.net_map(go); }",
         )
         .unwrap();
         let out = tmp.path().join("out");
@@ -314,7 +319,7 @@ mod tests {
         std::fs::create_dir(tmp.path().join("src")).unwrap();
         std::fs::write(
             tmp.path().join("src").join("main.rs"),
-            "fn a() { let _ = x.netmap(double); }",
+            "fn a() { let _ = x.net_map(double); }",
         )
         .unwrap();
         // Build output and VCS metadata that must never be shipped.
@@ -360,7 +365,7 @@ mod tests {
         std::fs::create_dir(tmp.path().join("src")).unwrap();
         std::fs::write(
             tmp.path().join("src").join("main.rs"),
-            "fn a() { let _ = x.netmap(double); }",
+            "fn a() { let _ = x.net_map(double); }",
         )
         .unwrap();
         let out = tmp.path().join("out");
@@ -389,7 +394,7 @@ mod tests {
         .unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir(&src).unwrap();
-        std::fs::write(src.join("main.rs"), "fn a() { let _ = x.netmap(double); }").unwrap();
+        std::fs::write(src.join("main.rs"), "fn a() { let _ = x.net_map(double); }").unwrap();
         let out = tmp.path().join("out");
         std::fs::create_dir(&out).unwrap();
 
@@ -446,19 +451,27 @@ mod tests {
     fn finds_named_function_netmap_call_sites() {
         let source = r"
             fn run() {
-                let a = data.into_par_iter().netmap(evolve).collect();
-                things.netmap(score);
-                ignored.netmap(|x| x);
+                let a = data.into_par_iter().net_map(evolve).collect();
+                things.net_map(score);
+                inputs.net_map_with_fleet(tally, &fleet).net_reduce(add);
+                ignored.net_map(|x| x);
                 regular_call(foo);
             }
         ";
-        let calls = find_netmap_calls(source).unwrap();
-        assert_eq!(calls, vec!["evolve".to_string(), "score".to_string()]);
+        let calls = find_net_map_calls(source).unwrap();
+        assert_eq!(
+            calls,
+            vec![
+                "evolve".to_string(),
+                "score".to_string(),
+                "tally".to_string()
+            ]
+        );
     }
 
     #[test]
     fn rejects_unparseable_source() {
-        assert!(find_netmap_calls("fn (").is_err());
+        assert!(find_net_map_calls("fn (").is_err());
     }
 
     #[test]

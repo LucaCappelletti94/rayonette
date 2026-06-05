@@ -1,9 +1,9 @@
 //! A fixture consumer for the Phase 3 end-to-end test. The same binary is both
 //! coordinator and agent: as the agent it serves the registry generated from
-//! this file's `.netmap` call sites; as the coordinator it runs a real
-//! `.netmap` over subprocess agents (copies of itself).
+//! this file's `.net_map` call sites; as the coordinator it runs a real
+//! `.net_map` over subprocess agents (copies of itself).
 
-use rayonet::fleet::{Fleet, Subprocess};
+use rayonet::fleet::{Fleet, NetMapExt, Subprocess};
 use rayonet::process;
 
 fn double(x: u32) -> u32 {
@@ -31,10 +31,12 @@ async fn main() {
             .collect(),
     );
     let inputs: Vec<u32> = (0..10).collect();
-    let out = fleet
-        .netmap(double, inputs.clone())
+    let out = inputs
+        .clone()
+        .net_map_with_fleet(double, &fleet)
+        .collect()
         .await
-        .expect("netmap failed");
+        .expect("net_map failed");
 
     let expected: Vec<Result<u32, String>> = inputs.iter().map(|x| Ok(x * 2)).collect();
     assert_eq!(out, expected);

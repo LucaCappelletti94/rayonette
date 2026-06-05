@@ -10,7 +10,7 @@ This one program is the whole rayonet contract:
 - **One binary, two roles.** Run normally it is the coordinator; rayonet launches
   the same binary on each worker as the agent.
 - **One line of build glue.** `build.rs` calls `rayonet_build::extract()`, which
-  finds the `.netmap(sample)` call and generates the agent's task registry;
+  finds the `.net_map(sample)` call and generates the agent's task registry;
   `rayonet::embed_microcrates!()` pulls it in.
 - **Blank hosts, no manual deploy.** The workers are bare ssh containers with no
   rust. rayonet provisions each one from cold: install rust, ship the source,

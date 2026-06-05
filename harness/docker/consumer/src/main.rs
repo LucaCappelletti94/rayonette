@@ -4,13 +4,13 @@
 //! the host (coordinator role) it provisions the leaves named in `RAYONET_LEAVES`
 //! over ssh, ships the workspace source bundle that `build.rs` embedded (via
 //! `__rayonet_source`), builds itself on each leaf, then runs a distributed
-//! `.netmap`. It prints each
+//! `.net_map`. It prints each
 //! node-state transition (so the harness can assert the ladder) and, at the end,
 //! a per-host completed-task count (so the harness can assert work-share).
 
 use std::sync::{Arc, Mutex};
 
-use rayonet::fleet::Fleet;
+use rayonet::fleet::{Fleet, NetMapExt};
 use rayonet::observability::{Event, EventSink, RunState};
 use rayonet::process;
 use rayonet::ssh::{Ssh, SshConfig};
@@ -88,11 +88,19 @@ async fn main() {
 
     let inputs: Vec<u32> = (0..count).collect();
     let out = if task == "crunch" {
-        fleet.netmap(crunch, inputs.clone()).await
+        inputs
+            .clone()
+            .net_map_with_fleet(crunch, &fleet)
+            .collect()
+            .await
     } else {
-        fleet.netmap(double, inputs.clone()).await
+        inputs
+            .clone()
+            .net_map_with_fleet(double, &fleet)
+            .collect()
+            .await
     }
-    .expect("netmap failed");
+    .expect("net_map failed");
 
     assert_eq!(out.len(), inputs.len());
     assert!(out.iter().all(Result::is_ok), "some task failed: {out:?}");

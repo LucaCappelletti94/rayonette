@@ -7,7 +7,7 @@
 //!   agent marker (which rayonet sets when it launches a worker) it serves the
 //!   task. The very same binary runs on every worker.
 //! - **One line of build glue.** `build.rs` calls `rayonet_build::extract()`,
-//!   which finds the `.netmap(sample)` call below and generates the agent's task
+//!   which finds the `.net_map(sample)` call below and generates the agent's task
 //!   registry; `rayonet::embed_microcrates!()` pulls in both that registry and
 //!   the source bundle to ship (so this program never tars its own source).
 //! - **Point it at blank hosts; it ships and builds your code there.** The
@@ -26,7 +26,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rayonet::fleet::Fleet;
+use rayonet::fleet::{Fleet, NetMapExt};
 use rayonet::observability::{Event, EventSink};
 use rayonet::process;
 use rayonet::ssh::{Ssh, SshConfig};
@@ -114,11 +114,14 @@ async fn main() {
 
     let fleet = Fleet::observed(launchers, Arc::new(Progress));
     println!("provisioning {workers} workers and distributing {TASKS} tasks...");
-    let results = fleet
-        .netmap(sample, (0..TASKS).collect())
+    // Map `sample` across the fleet, then sum the per-task hit counts: the
+    // reduce folds on the coordinator as the results come back.
+    let hits: u64 = (0..TASKS)
+        .net_map_with_fleet(sample, &fleet)
+        .net_reduce(|a, b| a + b)
         .await
-        .expect("distributed run failed");
-    let hits: u64 = results.into_iter().map(|r| r.expect("a task failed")).sum();
+        .expect("distributed run failed")
+        .unwrap_or(0);
 
     let total = u64::from(TASKS) * SAMPLES_PER_TASK;
     #[allow(clippy::cast_precision_loss)]
