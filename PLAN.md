@@ -42,7 +42,7 @@ CI runs all four (decision 29).
 - A worker returning a mix of `Ok` and `Err` yields the right per-task `Completed`/`Failed`, and `Failed` is terminal (never re-sent).
 - Capacity N: the coordinator keeps exactly N tasks in flight on an agent, never N+1, never idling a free slot while work is pending.
 - Two agents with scripted fast/slow latencies: the fast one provably drains more tasks (work-stealing falls out), and every task still completes.
-- Proptest invariants over random task counts/latencies/capacities: every task completes exactly once, output order equals input order, no task is lost or duplicated in the assembled result.
+- Proptest invariants over random task counts and latencies: every task completes exactly once, output order equals input order, no task is lost or duplicated in the assembled result.
 - Clean `Shutdown` drains in-flight work and closes without dropping a completed result.
 
 **Done when:** the scheduling/assembly/dispatch core is proven correct and invariant under property testing, entirely in-process.
@@ -65,20 +65,20 @@ CI runs all four (decision 29).
 
 ---
 
-## Phase 3 - The `.netmap` API and build-time extraction
+## Phase 3 - The `.net_map` API and build-time extraction
 
 **Goal:** the public surface and the codegen that makes it work, validated without shipping anything.
 
-**Deliverables:** `rayonet_build::extract()` (parse the consumer crate via `cargo metadata`/syn, bundle whole-crate source + Cargo.lock, build the `type_name` registry, write the `OUT_DIR` blob, emit rerun-if-changed); `embed_microcrates!()` (decision 11); the `.netmap` lazy job builder with `fn(T)->U` typing and `type_name` keying (decisions 5, 12); rayon composition (decision 6).
+**Deliverables:** `rayonet_build::extract()` (parse the consumer crate via `cargo metadata`/syn, bundle whole-crate source + Cargo.lock, build the `type_name` registry, write the `OUT_DIR` blob, emit rerun-if-changed); `embed_microcrates!()` (decision 11); the `.net_map` lazy job builder with `fn(T)->U` typing and `type_name` keying (decisions 5, 12); rayon composition (decision 6).
 
 **Tests (fixture consumer crate + in-process/subprocess)**
 - `extract()` on a fixture crate produces a blob containing the crate source and a copied lockfile; the generated registry maps `type_name::<evolve>()` to glue that deserializes, calls, and re-serializes.
-- A capturing closure fails to compile against `.netmap` (a `compile_fail` trybuild test), confirming decision 8.
-- `.netmap(evolve)` end to end (over the in-process or subprocess transport) returns an ordered `Vec` equal to a local `map`.
-- `.netmap` composes inside a rayon chain: `into_par_iter().map(..).netmap(..).map(..).reduce(..)` produces the correct reduction.
+- A capturing closure fails to compile against `.net_map` (a `compile_fail` trybuild test), confirming decision 8.
+- `.net_map(evolve)` end to end (over the in-process or subprocess transport) returns an ordered `Vec` equal to a local `map`.
+- `.net_map` composes inside a rayon chain: `into_par_iter().map(..).net_map(..).map(..).reduce(..)` produces the correct reduction.
 - A fixture crate with a non-rayonet local `path = ".."` dependency makes `extract()` error with a message naming the offending crate (decision 15).
 
-**Done when:** a user can write `.netmap(f)` plus the one-line build.rs, and the produced bundle compiles and runs locally with correct ordered results and clear errors on the unsupported cases.
+**Done when:** a user can write `.net_map(f)` plus the one-line build.rs, and the produced bundle compiles and runs locally with correct ordered results and clear errors on the unsupported cases.
 
 ---
 
@@ -135,7 +135,7 @@ CI runs all four (decision 29).
 
 **Goal:** ship-ready v1.
 
-**Deliverables:** a flagship map-reduce example (Monte Carlo estimation of pi: each task draws millions of random samples, the reduce sums the hits), which exercises the `.netmap` surface and the rayon composition end to end; user docs (the one-line build.rs, the `.netmap` surface, the idempotency contract); CI green across all four pyramid levels; clippy/fmt gates enforced.
+**Deliverables:** a flagship map-reduce example (Monte Carlo estimation of pi: each task draws millions of random samples, the reduce sums the hits), which exercises the `.net_map` surface and the rayon composition end to end; user docs (the one-line build.rs, the `.net_map` surface, the idempotency contract); CI green across all four pyramid levels; clippy/fmt gates enforced.
 
 **Tests**
 - The example runs across a fleet and produces a value matching a local single-machine baseline (the same chunks summed without distribution).
