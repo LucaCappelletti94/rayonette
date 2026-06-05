@@ -177,6 +177,30 @@ where
         }
         Ok(Some(acc))
     }
+
+    /// Fold the task outputs into an accumulator on the coordinator with `op`,
+    /// like [`Iterator::fold`]: starting from `init`, each output is folded in
+    /// input order. Unlike [`NetMap::net_reduce`] the accumulator type `B` may
+    /// differ from the task output, and an empty run returns `init`. The first
+    /// task to panic short-circuits to an error.
+    ///
+    /// `op` runs only on the coordinator and may capture. The fold is a strict
+    /// left fold over the inputs, so `op` need not be associative.
+    ///
+    /// # Errors
+    /// Returns an error if an agent cannot be launched, the run fails, or any
+    /// task panics (the first panic message is surfaced).
+    pub async fn net_fold<O, B>(self, init: B, op: impl Fn(B, O) -> B) -> std::io::Result<B>
+    where
+        F: Fn(I) -> O,
+        O: DeserializeOwned,
+    {
+        let mut acc = init;
+        for output in self.fleet.run_map(self.map, self.inputs).await? {
+            acc = op(acc, output.map_err(std::io::Error::other)?);
+        }
+        Ok(acc)
+    }
 }
 
 /// Distributed map as an iterator adapter.
@@ -407,7 +431,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn netreduce_folds_outputs_on_the_coordinator() {
+    async fn net_reduce_folds_outputs_on_the_coordinator() {
         let launchers = (0..3).map(|_| InProcess::serving(true)).collect();
         let fleet = Fleet::new(launchers);
 
@@ -419,7 +443,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn netreduce_is_none_for_empty_input() {
+    async fn net_reduce_is_none_for_empty_input() {
         let launchers = (0..2).map(|_| InProcess::serving(true)).collect();
         let fleet = Fleet::new(launchers);
 
@@ -433,7 +457,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn netreduce_short_circuits_on_the_first_task_failure() {
+    async fn net_reduce_short_circuits_on_the_first_task_failure() {
         let launchers = vec![
             InProcess::serving_registry(Registry::new().with_fn(boom)),
             InProcess::serving_registry(Registry::new().with_fn(boom)),
@@ -443,6 +467,62 @@ mod tests {
         let err = (0..10u32)
             .net_map_with_fleet(boom, &fleet)
             .net_reduce(add)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("too big"), "{err}");
+    }
+
+    // A named fold op for the net_fold tests: accumulates u32 outputs into a u64
+    // (the accumulator type differs from the task output), shared so the empty
+    // case leaves no uncovered closure.
+    fn add_u64(acc: u64, x: u32) -> u64 {
+        acc + u64::from(x)
+    }
+
+    #[tokio::test]
+    async fn net_fold_accumulates_into_a_seed() {
+        let launchers = (0..3).map(|_| InProcess::serving(true)).collect();
+        let fleet = Fleet::new(launchers);
+
+        let total = (0..10u32)
+            .net_map_with_fleet(double, &fleet)
+            .net_fold(100u64, add_u64)
+            .await
+            .unwrap();
+
+        // seed 100 plus the sum of the doubled inputs, accumulated as u64.
+        assert_eq!(
+            total,
+            100 + (0..10u32).map(|x| u64::from(x * 2)).sum::<u64>()
+        );
+    }
+
+    #[tokio::test]
+    async fn net_fold_returns_the_seed_for_empty_input() {
+        let launchers = (0..2).map(|_| InProcess::serving(true)).collect();
+        let fleet = Fleet::new(launchers);
+
+        let total = Vec::<u32>::new()
+            .net_map_with_fleet(double, &fleet)
+            .net_fold(42u64, add_u64)
+            .await
+            .unwrap();
+
+        assert_eq!(total, 42);
+    }
+
+    #[tokio::test]
+    async fn net_fold_short_circuits_on_the_first_task_failure() {
+        let launchers = vec![
+            InProcess::serving_registry(Registry::new().with_fn(boom)),
+            InProcess::serving_registry(Registry::new().with_fn(boom)),
+        ];
+        let fleet = Fleet::new(launchers);
+
+        let err = (0..10u32)
+            .net_map_with_fleet(boom, &fleet)
+            .net_fold(0u64, add_u64)
             .await
             .unwrap_err();
 
