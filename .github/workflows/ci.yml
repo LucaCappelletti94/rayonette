@@ -54,11 +54,11 @@ jobs:
       # capped below 100% by generic monomorphization (per-type encode/decode
       # error arms that protocol types never exercise), not by dead code.
       - name: Coverage
-        run: cargo llvm-cov --workspace --all-features --ignore-filename-regex 'src/bin/|fixtures/|harness/' --fail-under-functions 100 --fail-under-lines 99 -- --include-ignored
+        run: cargo llvm-cov --workspace --all-features --ignore-filename-regex 'src/bin/|fixtures/|harness/|examples/' --fail-under-functions 100 --fail-under-lines 99 -- --include-ignored
 
   # Pyramid level 4: the segmented multi-host docker network. Provisions cold
   # hosts (install -> ship -> build -> run), proves the cache, multi-hop
-  # ProxyJump, and legible per-host failure (DECISIONS.md decision 29).
+  # ProxyJump, and legible per-host failure. Also runs the flagship example.
   docker:
     runs-on: ubuntu-latest
     steps:
@@ -72,3 +72,10 @@ jobs:
       - name: Tear down
         if: always()
         run: bash harness/docker/down.sh
+      - name: Flagship example, distributed run over a docker swarm
+        run: |
+          examples/montecarlo/cluster/up.sh
+          out=$(cargo run -p montecarlo)
+          echo "$out"
+          examples/montecarlo/cluster/down.sh
+          echo "$out" | grep -qE 'pi ~= 3\.1[0-9]' || { echo "pi estimate missing or wrong"; exit 1; }

@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["rayonet", "rayonet-build", "fixtures/consumer", "harness/docker/consumer"]
+members = [
+    "rayonet",
+    "rayonet-build",
+    "fixtures/consumer",
+    "harness/docker/consumer",
+    "examples/montecarlo",
+]
 
 [workspace.package]
 version = "0.0.0"

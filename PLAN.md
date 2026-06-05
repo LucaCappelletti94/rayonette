@@ -131,18 +131,18 @@ CI runs all four (decision 29).
 
 ---
 
-## Phase 7 - Harden, document, port the first consumer
+## Phase 7 - Harden, document, flagship example
 
 **Goal:** ship-ready v1.
 
-**Deliverables:** the SMARTS-classifier batch ported onto `.netmap`; user docs (the one-line build.rs, the `.netmap` surface, the idempotency contract); CI green across all four pyramid levels; clippy/fmt gates enforced.
+**Deliverables:** a flagship map-reduce example (Monte Carlo estimation of pi: each task draws millions of random samples, the reduce sums the hits), which exercises the `.netmap` surface and the rayon composition end to end; user docs (the one-line build.rs, the `.netmap` surface, the idempotency contract); CI green across all four pyramid levels; clippy/fmt gates enforced.
 
 **Tests**
-- The ported consumer runs a real batch across a docker fleet and produces results matching a local rayon baseline.
+- The example runs across a fleet and produces a value matching a local single-machine baseline (the same chunks summed without distribution).
 - Doc examples compile and run (`cargo test --doc`).
 - A soak test: a long multi-host run with periodic induced host kills finishes complete and correct.
 
-**Done when:** the motivating workload runs on rayonet end to end, docs match behavior, and the full pyramid is green in CI.
+**Done when:** the Monte Carlo example runs on rayonet end to end, docs match behavior, and the full pyramid is green in CI.
 
 ---
 

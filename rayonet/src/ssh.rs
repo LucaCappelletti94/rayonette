@@ -34,6 +34,7 @@ pub struct SshConfig {
     destination: String,
     keyfile: Option<PathBuf>,
     config_file: Option<PathBuf>,
+    port: Option<u16>,
 }
 
 impl SshConfig {
@@ -44,6 +45,7 @@ impl SshConfig {
             destination: destination.into(),
             keyfile: None,
             config_file: None,
+            port: None,
         }
     }
 
@@ -51,6 +53,13 @@ impl SshConfig {
     #[must_use]
     pub fn keyfile(mut self, path: impl Into<PathBuf>) -> Self {
         self.keyfile = Some(path.into());
+        self
+    }
+
+    /// Connect on `port` instead of 22 (for example a published container port).
+    #[must_use]
+    pub const fn port(mut self, port: u16) -> Self {
+        self.port = Some(port);
         self
     }
 
@@ -71,6 +80,9 @@ impl SshConfig {
         }
         if let Some(path) = &self.keyfile {
             builder.keyfile(path);
+        }
+        if let Some(port) = self.port {
+            builder.port(port);
         }
         builder.connect(&self.destination).await.map_err(to_io)
     }
@@ -203,7 +215,10 @@ impl Launch for Ssh {
     type Guard = openssh::Child<Arc<Session>>;
 
     fn label(&self) -> String {
-        self.config.destination.clone()
+        self.config.port.map_or_else(
+            || self.config.destination.clone(),
+            |port| format!("{}:{port}", self.config.destination),
+        )
     }
 
     async fn launch(

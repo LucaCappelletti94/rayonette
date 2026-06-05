@@ -54,6 +54,10 @@ async fn ssh_launch_runs_a_task_end_to_end() {
     let ssh = Ssh::prebuilt(localhost(), agent);
     assert!(format!("{ssh:?}").contains("Ssh"));
     assert_eq!(ssh.label(), "localhost");
+    assert_eq!(
+        Ssh::prebuilt(localhost().port(2222), agent).label(),
+        "localhost:2222"
+    );
 
     let (connection, guard) = ssh.launch(&NoopSink).await.unwrap();
     let out: Vec<Result<u32, String>> = run_job(
@@ -67,6 +71,13 @@ async fn ssh_launch_runs_a_task_end_to_end() {
 
     assert_eq!(out, vec![Ok(2), Ok(4), Ok(6)]);
     drop(guard);
+}
+
+#[tokio::test]
+#[ignore = "needs ssh localhost self-login; run with --include-ignored"]
+async fn ssh_remote_honors_an_explicit_port() {
+    let remote = SshRemote::connect(&localhost().port(22)).await.unwrap();
+    assert_eq!(remote.run("true").await.unwrap().status, 0);
 }
 
 #[tokio::test]

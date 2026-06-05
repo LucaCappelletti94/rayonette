@@ -143,9 +143,12 @@ pub async fn provision<R: Remote>(
     let extract = format!("tar -xf {dir}/source.tar -C {dir}");
     require_success(host, "extract", &remote.run(&extract).await?)?;
 
-    // Build the agent on the host.
+    // Build just the consumer's package (not every member of a shipped
+    // workspace) on the host.
     events.emit(Event::node(host, NodeState::Building));
-    let build = format!("cd {dir} && PATH=\"$HOME/.cargo/bin:$PATH\" cargo build --release");
+    let build = format!(
+        "cd {dir} && PATH=\"$HOME/.cargo/bin:$PATH\" cargo build --release -p {binary_name}"
+    );
     require_success(host, "build", &remote.run(&build).await?)?;
 
     events.emit(Event::node(host, NodeState::Ready));

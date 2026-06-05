@@ -611,6 +611,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "montecarlo"
+version = "0.0.0"
+dependencies = [
+ "rayonet",
+ "rayonet-build",
+ "tokio",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
