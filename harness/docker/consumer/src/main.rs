@@ -2,8 +2,9 @@
 //!
 //! Built and shipped to the leaf containers, where it runs as an agent. Run on
 //! the host (coordinator role) it provisions the leaves named in `RAYONET_LEAVES`
-//! over ssh, ships the whole-workspace source tar at `RAYONET_SOURCE_TAR`,
-//! builds itself on each leaf, then runs a distributed `.netmap`. It prints each
+//! over ssh, ships the workspace source bundle that `build.rs` embedded (via
+//! `__rayonet_source`), builds itself on each leaf, then runs a distributed
+//! `.netmap`. It prints each
 //! node-state transition (so the harness can assert the ladder) and, at the end,
 //! a per-host completed-task count (so the harness can assert work-share).
 
@@ -61,7 +62,7 @@ async fn main() {
 
     let config_path = env("RAYONET_SSH_CONFIG");
     let leaves = env("RAYONET_LEAVES");
-    let tar = std::fs::read(env("RAYONET_SOURCE_TAR")).expect("read source tar");
+    let tar = __rayonet_source();
     let toolchain = std::env::var("RAYONET_TOOLCHAIN").unwrap_or_else(|_| "stable".to_string());
     let task = std::env::var("RAYONET_TASK").unwrap_or_else(|_| "double".to_string());
     let count: u32 = std::env::var("RAYONET_COUNT")

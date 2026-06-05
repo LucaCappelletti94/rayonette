@@ -8,7 +8,6 @@ set -uo pipefail
 cd "$(dirname "$0")"
 ROOT=../..
 CONFIG="$(pwd)/secrets/ssh_config"
-TAR=/tmp/rayonet-workspace.tar
 BIN="$ROOT/target/release/rayonet-docker-consumer"
 
 # Start from fresh containers so "cold host" means cold (no rust, no cache).
@@ -20,9 +19,8 @@ for _ in $(seq 1 60); do
   sleep 0.5
 done
 
-# One tar, reused across scenarios, so the content-addressed cache can hit.
-tar -cf "$TAR" --exclude=./target --exclude=./.git --exclude=harness/docker/secrets \
-  -C "$(cd "$ROOT" && pwd)" .
+# The consumer's build.rs bundles the workspace source (embedded via
+# __rayonet_source), so the script no longer needs to tar anything.
 ( cd "$ROOT" && cargo build --release -p rayonet-docker-consumer >/dev/null 2>&1 )
 
 fails=0
@@ -30,7 +28,7 @@ run() { # name, leaves, [task=double], [count=10]
   local name="$1" leaves="$2" task="${3:-double}" count="${4:-10}"
   echo "=== scenario: $name (leaves=$leaves task=$task count=$count) ==="
   RAYONET_SSH_CONFIG="$CONFIG" RAYONET_LEAVES="$leaves" \
-    RAYONET_SOURCE_TAR="$TAR" RAYONET_TOOLCHAIN=stable \
+    RAYONET_TOOLCHAIN=stable \
     RAYONET_TASK="$task" RAYONET_COUNT="$count" \
     "$BIN" 2>&1 | tee "/tmp/rayonet-scenario-$name.log"
 }
@@ -96,7 +94,7 @@ fi
 # Fault tolerance: a host is killed mid-run; the survivor must finish every
 # task (the caches are already warm from the fast/slow run above).
 echo "=== scenario: kill (leaf-slow dies mid-run) ==="
-RAYONET_SSH_CONFIG="$CONFIG" RAYONET_LEAVES="leaf-fast,leaf-slow" RAYONET_SOURCE_TAR="$TAR" \
+RAYONET_SSH_CONFIG="$CONFIG" RAYONET_LEAVES="leaf-fast,leaf-slow" \
   RAYONET_TOOLCHAIN=stable RAYONET_TASK=crunch RAYONET_COUNT=120 \
   "$BIN" >/tmp/rayonet-scenario-kill.log 2>&1 &
 consumer_pid=$!

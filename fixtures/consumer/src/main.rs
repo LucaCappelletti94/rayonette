@@ -21,6 +21,10 @@ async fn main() {
         return;
     }
 
+    // The source bundle rayonet would ship to a remote worker (unused here, since
+    // subprocess agents are copies of this exe, but it must be embedded and valid).
+    assert!(!__rayonet_source().is_empty(), "empty source bundle");
+
     let fleet = Fleet::new(
         (0..2)
             .map(|_| Subprocess::current_exe().expect("current exe"))

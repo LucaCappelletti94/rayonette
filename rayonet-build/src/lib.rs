@@ -1,10 +1,12 @@
 //! Build-time extraction for rayonet, called from a consumer crate's `build.rs`.
-//! It parses the consumer crate, bundles whole-crate source for shipping, and
-//! generates the agent task registry.
+//! It generates the agent task registry and bundles a buildable source tree to
+//! ship to workers, both included by `rayonet::embed_microcrates!()`.
 //!
 //! Task functions are identified by their `.netmap(IDENT)` call sites: each
 //! named function passed to `.netmap` is registered on the agent under its
-//! `type_name`.
+//! `type_name`. The source bundle is the consumer's whole workspace (excluding
+//! build output), so a worker can resolve and build it even when rayonet is an
+//! unpublished path dependency.
 
 /// Find the named functions passed to `.netmap(...)` call sites in `source`,
 /// in source order. Closures and other non-path arguments are skipped (only
@@ -60,13 +62,13 @@ pub fn generate_registry(functions: &[String]) -> String {
 
 /// Build-script entry point.
 ///
-/// Discovers task functions from `.netmap` call sites in the consumer crate's
-/// `src/` and writes the generated agent registry to `OUT_DIR/rayonet_registry.rs`
-/// for `rayonet::embed_microcrates!` to include.
+/// Writes the generated agent registry to `OUT_DIR/rayonet_registry.rs` and the
+/// shippable source bundle to `OUT_DIR/rayonet_source.tar`, both for
+/// `rayonet::embed_microcrates!` to include.
 ///
 /// # Errors
 /// Returns an error if the build environment is missing, a source file cannot be
-/// read or parsed, or the registry cannot be written.
+/// read or parsed, or an output cannot be written.
 pub fn extract() -> std::io::Result<()> {
     let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
         .ok_or_else(|| std::io::Error::other("CARGO_MANIFEST_DIR is unset (run from build.rs)"))?;
@@ -75,26 +77,27 @@ pub fn extract() -> std::io::Result<()> {
 
     let manifest_dir = std::path::Path::new(&manifest_dir);
     check_path_dependencies(manifest_dir)?;
-    let sources = extract_into(manifest_dir, std::path::Path::new(&out_dir))?;
-    for source in sources {
-        println!("cargo:rerun-if-changed={}", source.display());
+    let bundled = extract_into(manifest_dir, std::path::Path::new(&out_dir))?;
+    // Re-run (re-bundle) whenever any bundled source file changes.
+    for path in bundled {
+        println!("cargo:rerun-if-changed={}", path.display());
     }
     Ok(())
 }
 
 /// Scan the crate's `src/` for `.netmap` task functions, write the registry, and
-/// bundle the whole-crate source for shipping.
+/// bundle the buildable source tree.
 ///
-/// Returns the source files scanned (for rerun-if-changed).
+/// Returns the bundled files (for rerun-if-changed).
 fn extract_into(
     manifest_dir: &std::path::Path,
     out_dir: &std::path::Path,
 ) -> std::io::Result<Vec<std::path::PathBuf>> {
-    let mut sources = Vec::new();
-    collect_rs_files(manifest_dir, std::path::Path::new("src"), &mut sources)?;
+    let mut src_files = Vec::new();
+    collect_rs_files(manifest_dir, std::path::Path::new("src"), &mut src_files)?;
 
     let mut functions = Vec::new();
-    for source in &sources {
+    for source in &src_files {
         let text = std::fs::read_to_string(manifest_dir.join(source))?;
         let calls = find_netmap_calls(&text)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
@@ -109,32 +112,75 @@ fn extract_into(
         out_dir.join("rayonet_registry.rs"),
         generate_registry(&functions),
     )?;
-    bundle_source(manifest_dir, &sources, out_dir)?;
-    Ok(sources)
+    bundle_source(&workspace_root(manifest_dir), out_dir)
 }
 
-/// Tar the whole-crate source (`Cargo.toml`, `Cargo.lock` if present, and the
-/// scanned `src/` files) into `OUT_DIR/rayonet_source.tar` for Phase 4 to ship
-/// to remote hosts and compile there.
+/// The consumer's workspace root: the highest ancestor whose `Cargo.toml`
+/// declares a `[workspace]`, or the crate itself if there is none.
+fn workspace_root(manifest_dir: &std::path::Path) -> std::path::PathBuf {
+    let mut root = manifest_dir.to_path_buf();
+    for dir in manifest_dir.ancestors() {
+        if let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) {
+            if text
+                .parse::<toml::Table>()
+                .is_ok_and(|manifest| manifest.contains_key("workspace"))
+            {
+                root = dir.to_path_buf();
+            }
+        }
+    }
+    root
+}
+
+/// Tar the source tree under `root` (a buildable tree: the whole workspace, so
+/// path dependencies resolve) into `OUT_DIR/rayonet_source.tar`, skipping build
+/// output and VCS metadata. Returns the bundled files.
 fn bundle_source(
-    manifest_dir: &std::path::Path,
-    sources: &[std::path::PathBuf],
+    root: &std::path::Path,
     out_dir: &std::path::Path,
-) -> std::io::Result<()> {
+) -> std::io::Result<Vec<std::path::PathBuf>> {
     let file = std::fs::File::create(out_dir.join("rayonet_source.tar"))?;
     let mut tar = tar::Builder::new(file);
+    let mut bundled = Vec::new();
+    append_tree(
+        &mut tar,
+        root,
+        std::path::Path::new(""),
+        out_dir,
+        &mut bundled,
+    )?;
+    tar.finish()?;
+    Ok(bundled)
+}
 
-    tar.append_path_with_name(manifest_dir.join("Cargo.toml"), "Cargo.toml")?;
-    let lock = manifest_dir.join("Cargo.lock");
-    if lock.exists() {
-        tar.append_path_with_name(&lock, "Cargo.lock")?;
+/// Recursively add the files under `root.join(rel)` to `tar` (named by their
+/// path relative to `root`), skipping `target`, `.git`, and `out_dir`.
+fn append_tree<W: std::io::Write>(
+    tar: &mut tar::Builder<W>,
+    root: &std::path::Path,
+    rel: &std::path::Path,
+    out_dir: &std::path::Path,
+    bundled: &mut Vec<std::path::PathBuf>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(root.join(rel))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "target" || name == ".git" {
+            continue;
+        }
+        let absolute = entry.path();
+        if absolute == out_dir {
+            continue;
+        }
+        let child = rel.join(&name);
+        if entry.file_type()?.is_dir() {
+            append_tree(tar, root, &child, out_dir, bundled)?;
+        } else {
+            tar.append_path_with_name(&absolute, &child)?;
+            bundled.push(absolute);
+        }
     }
-    // `sources` are already relative to `manifest_dir` (see `collect_rs_files`),
-    // so they serve directly as the archive entry names.
-    for source in sources {
-        tar.append_path_with_name(manifest_dir.join(source), source)?;
-    }
-    tar.finish()
+    Ok(())
 }
 
 /// Error if the consumer's `Cargo.toml` has a non-rayonet local `path`
@@ -205,11 +251,95 @@ mod tests {
         let out = tmp.path().join("out");
         std::fs::create_dir(&out).unwrap();
 
-        let sources = super::extract_into(tmp.path(), &out).unwrap();
-        assert_eq!(sources.len(), 2);
+        let bundled = super::extract_into(tmp.path(), &out).unwrap();
+        // Both nested `.netmap` functions are registered, and the nested source
+        // file is in the bundle.
         let registry = std::fs::read_to_string(out.join("rayonet_registry.rs")).unwrap();
         assert!(registry.contains("with_fn(double)"));
         assert!(registry.contains("with_fn(triple)"));
+        assert!(
+            bundled.iter().any(|p| p.ends_with("more.rs")),
+            "{bundled:?}"
+        );
+    }
+
+    #[test]
+    fn bundles_from_the_workspace_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\n",
+        )
+        .unwrap();
+        // A sibling path-dependency crate the member would build against.
+        std::fs::create_dir_all(tmp.path().join("dep/src")).unwrap();
+        std::fs::write(
+            tmp.path().join("dep/Cargo.toml"),
+            "[package]\nname = \"dep\"\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("dep/src/lib.rs"), "").unwrap();
+        // The consumer member.
+        std::fs::create_dir_all(tmp.path().join("member/src")).unwrap();
+        std::fs::write(
+            tmp.path().join("member/Cargo.toml"),
+            "[package]\nname = \"member\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("member/src/main.rs"),
+            "fn a() { let _ = x.netmap(go); }",
+        )
+        .unwrap();
+        let out = tmp.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+
+        super::extract_into(&tmp.path().join("member"), &out).unwrap();
+
+        // The bundle is rooted at the workspace, so the sibling dep is included.
+        let archive = std::fs::File::open(out.join("rayonet_source.tar")).unwrap();
+        let names: Vec<String> = tar::Archive::new(archive)
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|n| n == "dep/src/lib.rs"), "{names:?}");
+        assert!(names.iter().any(|n| n == "member/src/main.rs"), "{names:?}");
+    }
+
+    #[test]
+    fn bundle_skips_build_output_and_vcs() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"c\"\n").unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src").join("main.rs"),
+            "fn a() { let _ = x.netmap(double); }",
+        )
+        .unwrap();
+        // Build output and VCS metadata that must never be shipped.
+        std::fs::create_dir(tmp.path().join("target")).unwrap();
+        std::fs::write(tmp.path().join("target").join("junk.rs"), "garbage").unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join(".git").join("config"), "[core]").unwrap();
+        let out = tmp.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+
+        super::extract_into(tmp.path(), &out).unwrap();
+
+        let archive = std::fs::File::open(out.join("rayonet_source.tar")).unwrap();
+        let names: Vec<String> = tar::Archive::new(archive)
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|n| n.ends_with("main.rs")), "{names:?}");
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.starts_with("target") || n.starts_with(".git")),
+            "build output or vcs leaked: {names:?}"
+        );
     }
 
     #[test]
