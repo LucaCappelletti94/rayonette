@@ -270,13 +270,12 @@ mod tests {
     /// that cannot be provisioned).
     struct InProcess {
         registry: Option<Registry>,
-        capacity: u32,
     }
 
     impl InProcess {
-        fn serving(double: bool, capacity: u32) -> Self {
+        fn serving(double: bool) -> Self {
             let registry = double.then(|| Registry::new().with_fn(self::double));
-            Self { registry, capacity }
+            Self { registry }
         }
     }
 
@@ -296,7 +295,7 @@ mod tests {
                 return Err(std::io::Error::other("simulated launch failure"));
             };
             let (client, server) = connection_pair(256);
-            let task = tokio::spawn(serve(server, registry.clone(), self.capacity));
+            let task = tokio::spawn(serve(server, registry.clone()));
             Ok((client, task))
         }
     }
@@ -307,7 +306,7 @@ mod tests {
 
     #[tokio::test]
     async fn netmap_runs_a_function_across_the_fleet() {
-        let launchers = (0..3).map(|_| InProcess::serving(true, 2)).collect();
+        let launchers = (0..3).map(|_| InProcess::serving(true)).collect();
         let fleet = Fleet::new(launchers);
 
         let out: Vec<Result<u32, String>> =
@@ -324,7 +323,7 @@ mod tests {
         use std::sync::Arc;
 
         let sink = Arc::new(EventRecorder::default());
-        let launchers = (0..2).map(|_| InProcess::serving(true, 2)).collect();
+        let launchers = (0..2).map(|_| InProcess::serving(true)).collect();
         let fleet = Fleet::observed(launchers, sink.clone());
 
         let out: Vec<Result<u32, String>> =
@@ -345,9 +344,9 @@ mod tests {
         // One healthy host, two that fail to launch: the job still completes,
         // the survivor absorbing every task.
         let launchers = vec![
-            InProcess::serving(false, 1),
-            InProcess::serving(true, 2),
-            InProcess::serving(false, 1),
+            InProcess::serving(false),
+            InProcess::serving(true),
+            InProcess::serving(false),
         ];
         let fleet = Fleet::new(launchers);
 
@@ -359,7 +358,7 @@ mod tests {
 
     #[tokio::test]
     async fn netmap_errors_when_every_host_fails_to_launch() {
-        let launchers = vec![InProcess::serving(false, 1), InProcess::serving(false, 1)];
+        let launchers = vec![InProcess::serving(false), InProcess::serving(false)];
         let fleet = Fleet::new(launchers);
 
         let error = fleet.netmap(double, (0..5u32).collect()).await.unwrap_err();
@@ -372,7 +371,7 @@ mod tests {
         use super::NetmapExt;
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-        let launchers = (0..2).map(|_| InProcess::serving(true, 2)).collect();
+        let launchers = (0..2).map(|_| InProcess::serving(true)).collect();
         let fleet = Fleet::new(launchers);
 
         // rayon before -> distributed netmap -> rayon after.

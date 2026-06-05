@@ -3,8 +3,8 @@
 //!
 //! A task fails only by panicking: each task runs
 //! under `catch_unwind` so a panic becomes a `Failed` message rather than
-//! tearing down the agent or losing its in-flight siblings. Phase 3 will
-//! generate the registry from the consumer's source; here it is built by hand.
+//! tearing down the agent. The registry is generated from the consumer's
+//! source (see `rayonet_build`); in tests it is built by hand.
 
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -12,10 +12,9 @@ use std::sync::Arc;
 
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
 
 use crate::framing::Connection;
-use crate::protocol::{FromAgent, TaskId, ToAgent, PROTOCOL_VERSION};
+use crate::protocol::{FromAgent, ToAgent, PROTOCOL_VERSION};
 
 /// A type-erased task: a postcard-encoded input in, a postcard-encoded output
 /// out, or an error string (a decode failure or a captured panic message).
@@ -103,17 +102,21 @@ impl Registry {
     }
 }
 
-/// Serve a connection: handshake, then run assigned tasks until `Shutdown` or
-/// end-of-stream, draining any still-running tasks before returning.
+/// Serve a connection: handshake, then run each assigned task to completion and
+/// report it, until `Shutdown` or end-of-stream.
 ///
-/// Concurrency is bounded by the coordinator, which keeps at most `capacity`
-/// tasks in flight per agent; the agent advertises `capacity` in `Ready` and
-/// runs each assignment on the blocking pool.
+/// One task runs at a time (the coordinator hands an agent its next task only
+/// once the current one finishes), each on the blocking pool so a long-running
+/// task does not stall the reactor.
 ///
 /// # Errors
 /// Returns an error on a protocol violation (a missing or unexpected handshake,
 /// an unknown `fn_key`) or an underlying transport failure.
-pub async fn serve<S>(conn: Connection<S>, registry: Registry, capacity: u32) -> std::io::Result<()>
+///
+/// # Panics
+/// Panics only if joining a task's blocking thread fails, which cannot happen:
+/// the handler catches its own panics, so the blocking closure never unwinds.
+pub async fn serve<S>(conn: Connection<S>, registry: Registry) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -149,52 +152,31 @@ where
         )
     })?;
 
-    tx.send(&FromAgent::Ready { capacity }).await?;
+    tx.send(&FromAgent::Ready).await?;
 
-    // Completed tasks report through a channel rather than a JoinSet, so there
-    // is no JoinError to handle (a panic is already caught inside the handler).
-    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(TaskId, Result<Vec<u8>, String>)>();
-    let mut inflight = 0usize;
-    let mut draining = false;
-
-    loop {
-        tokio::select! {
-            // The completions branch has no guard, so a branch is always enabled
-            // and the select never needs an `else`.
-            Some((task_id, outcome)) = done_rx.recv() => {
-                inflight -= 1;
+    // One task at a time: read an assignment, run it on the blocking pool, and
+    // report its outcome before reading the next message.
+    while let Some(message) = rx.recv::<ToAgent>().await? {
+        match message {
+            ToAgent::Assign { task_id, payload } => {
+                tx.send(&FromAgent::Started { task_id }).await?;
+                let handler = handler.clone();
+                // The handler catches panics internally, so the blocking task
+                // never panics and its join cannot fail.
+                let outcome = tokio::task::spawn_blocking(move || handler(payload))
+                    .await
+                    .expect("task handler cannot panic");
                 match outcome {
                     Ok(output) => tx.send(&FromAgent::Completed { task_id, output }).await?,
                     Err(error) => tx.send(&FromAgent::Failed { task_id, error }).await?,
                 }
-                if draining && inflight == 0 {
-                    break;
-                }
             }
-            msg = rx.recv::<ToAgent>(), if !draining => {
-                match msg? {
-                    Some(ToAgent::Assign { task_id, payload }) => {
-                        tx.send(&FromAgent::Started { task_id }).await?;
-                        let handler = handler.clone();
-                        let done = done_tx.clone();
-                        inflight += 1;
-                        tokio::task::spawn_blocking(move || {
-                            let _ = done.send((task_id, handler(payload)));
-                        });
-                    }
-                    Some(ToAgent::Shutdown) | None => {
-                        draining = true;
-                        if inflight == 0 {
-                            break;
-                        }
-                    }
-                    Some(other) => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("unexpected message: {other:?}"),
-                        ));
-                    }
-                }
+            ToAgent::Shutdown => break,
+            other @ ToAgent::Hello { .. } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unexpected message: {other:?}"),
+                ));
             }
         }
     }
@@ -213,7 +195,7 @@ mod tests {
         let (client, server) = connection_pair(256);
         let registry = Registry::new().with("doubler", handler(|x: u32| x * 2));
 
-        let agent = serve(server, registry, 1);
+        let agent = serve(server, registry);
         let driver = async {
             let (mut tx, mut rx) = client.split();
             tx.send(&ToAgent::Hello {
@@ -224,7 +206,7 @@ mod tests {
             .unwrap();
 
             let ready: FromAgent = rx.recv().await.unwrap().unwrap();
-            assert_eq!(ready, FromAgent::Ready { capacity: 1 });
+            assert_eq!(ready, FromAgent::Ready);
 
             let payload = postcard::to_allocvec(&21u32).unwrap();
             tx.send(&ToAgent::Assign {
@@ -264,7 +246,7 @@ mod tests {
             }),
         );
 
-        let agent = serve(server, registry, 2);
+        let agent = serve(server, registry);
         let driver = async {
             let (mut tx, mut rx) = client.split();
             tx.send(&ToAgent::Hello {
@@ -322,7 +304,7 @@ mod tests {
             }),
         );
 
-        let agent = serve(server, registry, 4);
+        let agent = serve(server, registry);
         let driver = async {
             let (mut tx, mut rx) = client.split();
             tx.send(&ToAgent::Hello {
@@ -364,7 +346,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_protocol_mismatch() {
         let (client, server) = connection_pair(64);
-        let agent = serve(server, Registry::new().with("k", handler(|x: u32| x)), 1);
+        let agent = serve(server, Registry::new().with("k", handler(|x: u32| x)));
         let driver = async {
             let (mut tx, _rx) = client.split();
             tx.send(&ToAgent::Hello {
@@ -381,7 +363,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_non_hello_handshake() {
         let (client, server) = connection_pair(64);
-        let agent = serve(server, Registry::new(), 1);
+        let agent = serve(server, Registry::new());
         let driver = async {
             let (mut tx, _rx) = client.split();
             tx.send(&ToAgent::Shutdown).await.unwrap();
@@ -393,11 +375,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_unknown_fn_key() {
         let (client, server) = connection_pair(64);
-        let agent = serve(
-            server,
-            Registry::new().with("known", handler(|x: u32| x)),
-            1,
-        );
+        let agent = serve(server, Registry::new().with("known", handler(|x: u32| x)));
         let driver = async {
             let (mut tx, _rx) = client.split();
             tx.send(&ToAgent::Hello {
@@ -414,7 +392,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_unexpected_message_after_handshake() {
         let (client, server) = connection_pair(64);
-        let agent = serve(server, Registry::new().with("k", handler(|x: u32| x)), 1);
+        let agent = serve(server, Registry::new().with("k", handler(|x: u32| x)));
         let driver = async {
             let (mut tx, mut rx) = client.split();
             tx.send(&ToAgent::Hello {

@@ -22,7 +22,7 @@ async fn main() {
             }),
         );
 
-    if let Err(e) = serve(process::agent_connection(), registry, 2).await {
+    if let Err(e) = serve(process::agent_connection(), registry).await {
         eprintln!("rayonet-test-agent: serve error: {e}");
         std::process::exit(1);
     }

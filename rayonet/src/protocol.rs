@@ -27,18 +27,16 @@ pub enum ToAgent {
         /// Postcard-encoded task input.
         payload: Vec<u8>,
     },
-    /// Drain in-flight work and exit.
+    /// Stop serving and exit cleanly (sent once every result is in).
     Shutdown,
 }
 
 /// Agent to coordinator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FromAgent {
-    /// Handshake reply advertising concurrency.
-    Ready {
-        /// How many tasks this agent will run at once.
-        capacity: u32,
-    },
+    /// Handshake reply: the agent is built, connected, and ready for work. One
+    /// task runs per agent at a time, so it carries no payload.
+    Ready,
     /// A task has begun executing (lets a view show it in flight).
     Started {
         /// The task now running.
@@ -97,7 +95,7 @@ mod tests {
     #[test]
     fn from_agent_variants_roundtrip() {
         for msg in [
-            FromAgent::Ready { capacity: 4 },
+            FromAgent::Ready,
             FromAgent::Started { task_id: 9 },
             FromAgent::Completed {
                 task_id: 9,
@@ -128,7 +126,7 @@ mod tests {
 
     fn from_agent_strategy() -> impl Strategy<Value = FromAgent> {
         prop_oneof![
-            any::<u32>().prop_map(|capacity| FromAgent::Ready { capacity }),
+            Just(FromAgent::Ready),
             any::<u64>().prop_map(|task_id| FromAgent::Started { task_id }),
             (any::<u64>(), any::<Vec<u8>>())
                 .prop_map(|(task_id, output)| FromAgent::Completed { task_id, output }),

@@ -37,7 +37,7 @@ pub fn agent_connection() -> Connection<Join<Stdin, Stdout>> {
 /// # Errors
 /// Returns an error on a protocol violation or transport failure.
 pub async fn run_agent(registry: crate::agent::Registry) -> std::io::Result<()> {
-    crate::agent::serve(agent_connection(), registry, 1).await
+    crate::agent::serve(agent_connection(), registry).await
 }
 
 /// A spawned agent subprocess: its handle and captured stderr.
