@@ -49,6 +49,7 @@ impl EventSink for Progress {
                 host,
                 profile,
                 role,
+                ..
             } => println!(
                 "  {}{}: {role:?} ({:?}, {} cores, {} MB RAM, {} GPUs)",
                 "  ".repeat(depth(&host)),

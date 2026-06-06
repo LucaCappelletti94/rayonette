@@ -203,6 +203,32 @@ pub async fn probe<R: Remote>(remote: &R) -> io::Result<NodeProfile> {
     })
 }
 
+/// A shell command printing a stable machine id: the OS id source (Linux
+/// `/etc/machine-id`, macOS `IOPlatformUUID`), falling back to a generated id
+/// persisted under the cache so the same node yields the same id across paths and
+/// runs. The id is the first non-empty line of its output.
+const NODE_ID_COMMAND: &str = "\
+    { cat /etc/machine-id 2>/dev/null \
+      || ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null \
+         | sed -n 's/.*\"IOPlatformUUID\" = \"\\(.*\\)\"/\\1/p'; } \
+    | grep -m1 . \
+    || { d=\"$HOME/.cache/rayonet\"; mkdir -p \"$d\"; f=\"$d/node-id\"; \
+         cat \"$f\" 2>/dev/null \
+         || { id=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \\n'); echo \"$id\" >\"$f\"; echo \"$id\"; }; }";
+
+/// Read a host's stable node id over `remote` (see [`NODE_ID_COMMAND`]).
+///
+/// Best-effort and infallible: a transport failure or an empty result yields
+/// `"unknown"`, so a node always has some id rather than dropping out.
+pub async fn node_id<R: Remote>(remote: &R) -> String {
+    let out = run_or_empty(remote, NODE_ID_COMMAND).await;
+    out.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
 /// Run `command` and return its stdout (a non-zero exit still yields its
 /// stdout); a transport failure propagates.
 async fn run_stdout<R: Remote>(remote: &R, command: &str) -> io::Result<String> {
@@ -448,6 +474,25 @@ mod tests {
         async fn upload(&self, _bytes: &[u8], _dest: &str) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn node_id_reads_the_machine_id() {
+        // The id command's output is parsed as its first non-empty line.
+        let host = ProbeHost {
+            os: "Linux",
+            replies: vec![("machine-id", "  abcdef0123456789\n")],
+        };
+        assert_eq!(super::node_id(&host).await, "abcdef0123456789");
+    }
+
+    #[tokio::test]
+    async fn node_id_falls_back_to_unknown_when_empty() {
+        let host = ProbeHost {
+            os: "Linux",
+            replies: Vec::new(),
+        };
+        assert_eq!(super::node_id(&host).await, "unknown");
     }
 
     #[tokio::test]

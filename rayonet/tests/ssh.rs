@@ -68,6 +68,11 @@ async fn ssh_launch_runs_a_task_end_to_end() {
     assert_eq!(profile.os, Os::Linux);
     assert!(profile.cores >= 1, "{profile:?}");
 
+    // The real machine id is read over ssh and is stable (non-empty, repeatable).
+    let id = ssh.node_id(&session).await;
+    assert!(!id.is_empty(), "node id should be non-empty");
+    assert_eq!(id, ssh.node_id(&session).await, "node id is stable");
+
     let (connection, guard) = ssh.activate(session, &NoopSink).await.unwrap();
     let out: Vec<Result<u32, String>> = run_job(
         vec![("localhost".to_string(), connection)],

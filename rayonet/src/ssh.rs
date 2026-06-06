@@ -18,7 +18,7 @@ use crate::fleet::Launch;
 use crate::framing::Connection;
 use crate::observability::EventSink;
 use crate::process::AGENT_ENV;
-use crate::provisioning::{probe, provision, CommandOutput, Remote};
+use crate::provisioning::{node_id, probe, provision, CommandOutput, Remote};
 
 /// Map an openssh error into the crate's uniform `io::Error` result type.
 fn to_io(error: openssh::Error) -> io::Error {
@@ -272,6 +272,13 @@ impl Launch for Ssh {
             session: Arc::clone(session),
         };
         probe(&remote).await
+    }
+
+    async fn node_id(&self, session: &Arc<Session>) -> String {
+        let remote = SshRemote {
+            session: Arc::clone(session),
+        };
+        node_id(&remote).await
     }
 
     async fn activate(

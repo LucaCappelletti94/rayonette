@@ -56,8 +56,11 @@ pub enum Event {
     },
     /// A host was probed for its capabilities and assigned a scheduling role.
     Profiled {
-        /// The host that was probed.
+        /// The host that was probed (its path id from the root).
         host: String,
+        /// A stable id for the physical node, so the same node reached by two
+        /// paths is recognized as one (the basis for redundant-path dedup).
+        id: String,
         /// The capabilities the probe found.
         profile: NodeProfile,
         /// The role the fleet filter assigned from that profile.
@@ -91,11 +94,12 @@ impl Event {
         }
     }
 
-    /// Build a capability-and-role event for `host`.
+    /// Build a capability-and-role event for `host` (a node with stable `id`).
     #[must_use]
-    pub fn profiled(host: &str, profile: NodeProfile, role: Role) -> Self {
+    pub fn profiled(host: &str, id: &str, profile: NodeProfile, role: Role) -> Self {
         Self::Profiled {
             host: host.to_string(),
+            id: id.to_string(),
             profile,
             role,
         }
@@ -207,6 +211,9 @@ pub struct NodeView {
     pub profile: Option<NodeProfile>,
     /// The role the fleet filter assigned, once it has been profiled.
     pub role: Option<Role>,
+    /// The physical node's stable id, once profiled (two paths sharing an id are
+    /// the same node, reachable redundantly).
+    pub id: Option<String>,
 }
 
 impl RunState {
@@ -219,12 +226,14 @@ impl RunState {
             }
             Event::Profiled {
                 host,
+                id,
                 profile,
                 role,
             } => {
                 let view = self.node(host);
                 view.profile = Some(profile.clone());
                 view.role = Some(*role);
+                view.id = Some(id.clone());
             }
             Event::TaskStarted { host, .. } => {
                 self.node(host);
@@ -260,6 +269,19 @@ impl RunState {
             .collect()
     }
 
+    /// Path ids grouped by their physical node id, in id order. A group with more
+    /// than one path is a node reachable redundantly through several relays.
+    #[must_use]
+    pub fn paths_by_id(&self) -> BTreeMap<String, Vec<&str>> {
+        let mut by_id: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+        for (path, view) in &self.nodes {
+            if let Some(id) = &view.id {
+                by_id.entry(id.clone()).or_default().push(path);
+            }
+        }
+        by_id
+    }
+
     /// The view for `host`, created (defaulting to [`NodeState::Working`]) on
     /// first sighting if a task event arrives before any node-state event.
     fn node(&mut self, host: &str) -> &mut NodeView {
@@ -268,6 +290,7 @@ impl RunState {
             completed: 0,
             profile: None,
             role: None,
+            id: None,
         })
     }
 }
@@ -300,6 +323,7 @@ impl PlainRenderer {
                 host,
                 profile,
                 role,
+                ..
             } => Some(format!(
                 "{}{}: {role:?} ({:?}, {} cores, {} MB RAM, {} GPUs)",
                 "  ".repeat(depth(host)),
@@ -379,11 +403,46 @@ mod tests {
             gpus: Vec::new(),
         };
         let mut state = RunState::default();
-        state.apply(&Event::profiled("host-a", profile.clone(), Role::Compute));
+        state.apply(&Event::profiled(
+            "host-a",
+            "node-1",
+            profile.clone(),
+            Role::Compute,
+        ));
 
         let view = &state.nodes["host-a"];
         assert_eq!(view.profile, Some(profile));
         assert_eq!(view.role, Some(Role::Compute));
+        assert_eq!(view.id.as_deref(), Some("node-1"));
+    }
+
+    #[test]
+    fn paths_by_id_groups_a_redundantly_reachable_node() {
+        let profile = NodeProfile {
+            os: Os::Linux,
+            cores: 8,
+            ram_mb: 16_000,
+            gpus: Vec::new(),
+        };
+        let mut state = RunState::default();
+        // The same physical node ("shared") is reached via two relays.
+        state.apply(&Event::profiled(
+            "a/shared",
+            "shared",
+            profile.clone(),
+            Role::Compute,
+        ));
+        state.apply(&Event::profiled(
+            "b/shared",
+            "shared",
+            profile.clone(),
+            Role::Compute,
+        ));
+        state.apply(&Event::profiled("a/solo", "solo", profile, Role::Compute));
+
+        let by_id = state.paths_by_id();
+        assert_eq!(by_id["shared"], vec!["a/shared", "b/shared"]);
+        assert_eq!(by_id["solo"], vec!["a/solo"]);
     }
 
     #[test]
@@ -396,7 +455,7 @@ mod tests {
         };
         let mut renderer = super::PlainRenderer::new();
         let line = renderer
-            .render(&Event::profiled("host-a", profile, Role::Compute))
+            .render(&Event::profiled("host-a", "node-1", profile, Role::Compute))
             .expect("profiled events print a line");
         assert!(line.contains("host-a"), "{line}");
         assert!(line.contains("Compute"), "{line}");

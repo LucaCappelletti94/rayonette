@@ -57,6 +57,14 @@ pub trait Launch {
         std::future::ready(Ok(NodeProfile::unknown()))
     }
 
+    /// A stable id for the physical node behind this launcher, so the same node
+    /// reached by two paths is recognized as one (redundant-path dedup). Probed
+    /// over the session, best-effort: it defaults to the [`Launch::label`], which
+    /// the real ssh launcher overrides with the host's machine id.
+    fn node_id(&self, _session: &Self::Session) -> impl Future<Output = String> + Send {
+        std::future::ready(self.label())
+    }
+
     /// Phase 3: provision and spawn the agent over the session, emitting any
     /// progress to `events`.
     ///
@@ -171,7 +179,8 @@ pub(crate) async fn launch_all<L: Launch + Send + Sync>(
         // runs tasks on, but whose capabilities this job does not need, is
         // skipped for this run only.
         let meets_requirement = requires.is_none_or(|predicate| predicate.eval(&profile));
-        events.emit(Event::profiled(&label, profile, role));
+        let id = launcher.node_id(&session).await;
+        events.emit(Event::profiled(&label, &id, profile, role));
         if role != Role::Compute || !meets_requirement {
             continue;
         }
@@ -937,6 +946,9 @@ mod tests {
         assert_eq!(state.nodes["mac"].completed, 0);
         assert_eq!(state.nodes["linux"].role, Some(Role::Compute));
         assert_eq!(state.nodes["linux"].state, NodeState::Done);
+        // The node id (the label, for an in-process launcher) flows into the
+        // profile event and is recorded per node.
+        assert_eq!(state.nodes["linux"].id.as_deref(), Some("linux"));
     }
 
     #[tokio::test]

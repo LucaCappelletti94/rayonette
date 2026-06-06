@@ -130,7 +130,7 @@ mod tests {
             gpus: Vec::new(),
         };
         state.apply(&Event::RunStarted { tasks: 1 });
-        state.apply(&Event::profiled("leaf-a", profile, Role::Compute));
+        state.apply(&Event::profiled("leaf-a", "id-a", profile, Role::Compute));
         state.apply(&Event::node("leaf-a", NodeState::Working));
 
         let mut terminal = Terminal::new(TestBackend::new(40, 2)).unwrap();
