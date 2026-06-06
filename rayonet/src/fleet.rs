@@ -8,13 +8,14 @@
 //! API back onto in-process pipes (tests), spawned subprocesses, or ssh.
 
 use std::future::Future;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, RwLock};
 
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::agent::fn_key;
-use crate::coordinator::run_job;
+use crate::coordinator::{decode_output, run_job_raw, serialize_inputs};
 use crate::framing::Connection;
 use crate::observability::{EventSink, NoopSink};
 
@@ -69,65 +70,111 @@ impl<L: Launch> Fleet<L> {
     pub fn observed(launchers: Vec<L>, events: Arc<dyn EventSink>) -> Self {
         Self { launchers, events }
     }
+}
 
-    /// Launch one agent per launcher, run `f` over `inputs`, and gather the
-    /// per-task results in input order. The shared engine behind the `net_map`
-    /// terminals; the function is used only for its `type_name` key (the agents
-    /// already hold the matching handler).
-    async fn run_map<F, I, O>(
-        &self,
-        f: F,
-        inputs: Vec<I>,
-    ) -> std::io::Result<Vec<Result<O, String>>>
-    where
-        F: Fn(I) -> O,
-        I: Serialize,
-        O: DeserializeOwned,
-    {
-        let key = fn_key(&f);
-        let events = self.events.as_ref();
-        let mut agents = Vec::with_capacity(self.launchers.len());
-        let mut guards = Vec::with_capacity(self.launchers.len());
-        let mut failures = Vec::new();
-        // A host that fails to launch (for example a cold host that cannot
-        // install the toolchain) is dropped; its tasks are simply scheduled
-        // onto the survivors by the pull scheduler.
-        for launcher in &self.launchers {
-            match launcher.launch(events).await {
-                Ok((connection, guard)) => {
-                    agents.push((launcher.label(), connection));
-                    guards.push(guard);
+/// The raw, byte-level result of running a job: each task's output bytes or its
+/// error message, in input order.
+type RawResults = std::io::Result<Vec<Result<Vec<u8>, String>>>;
+
+/// A fleet behind a type-erased, byte-level interface.
+///
+/// A process-global (the implicit fleet behind [`NetMapExt::net_map`]) cannot
+/// name a launcher type `L`, so it stores `Arc<dyn ErasedFleet>` instead. The
+/// erasure boundary is bytes (the `type_name` key plus serialized inputs in, raw
+/// outputs out), which is exactly what already crosses the wire.
+trait ErasedFleet: Send + Sync {
+    /// Launch the fleet, run `fn_key` over `payloads`, and return each task's raw
+    /// output bytes or error, in input order.
+    fn run_erased<'a>(
+        &'a self,
+        fn_key: &'a str,
+        payloads: Vec<Vec<u8>>,
+    ) -> Pin<Box<dyn Future<Output = RawResults> + Send + 'a>>;
+}
+
+impl<L: Launch + Send + Sync> ErasedFleet for Fleet<L> {
+    fn run_erased<'a>(
+        &'a self,
+        fn_key: &'a str,
+        payloads: Vec<Vec<u8>>,
+    ) -> Pin<Box<dyn Future<Output = RawResults> + Send + 'a>> {
+        Box::pin(async move {
+            let events = self.events.as_ref();
+            let mut agents = Vec::with_capacity(self.launchers.len());
+            let mut guards = Vec::with_capacity(self.launchers.len());
+            let mut failures = Vec::new();
+            // A host that fails to launch (for example a cold host that cannot
+            // install the toolchain) is dropped; its tasks are simply scheduled
+            // onto the survivors by the pull scheduler.
+            for launcher in &self.launchers {
+                match launcher.launch(events).await {
+                    Ok((connection, guard)) => {
+                        agents.push((launcher.label(), connection));
+                        guards.push(guard);
+                    }
+                    Err(failure) => failures.push(failure),
                 }
-                Err(failure) => failures.push(failure),
             }
-        }
-        if agents.is_empty() {
-            let detail = failures
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(std::io::Error::other(format!(
-                "rayonet: every host failed to launch: {detail}"
-            )));
-        }
-        let result = run_job(agents, key, inputs, events).await;
-        drop(guards); // agents already shut down via the job's `Shutdown`
-        result
+            if agents.is_empty() {
+                let detail = failures
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(std::io::Error::other(format!(
+                    "rayonet: every host failed to launch: {detail}"
+                )));
+            }
+            let result = run_job_raw(agents, fn_key, payloads, events).await;
+            drop(guards); // agents already shut down via the job's `Shutdown`
+            result
+        })
     }
 }
 
-/// A pending distributed map over a fleet, built by
-/// [`NetMapExt::net_map_with_fleet`]. Nothing runs until a terminal:
-/// [`NetMap::collect`] gathers every result, [`NetMap::net_reduce`] folds them.
-#[must_use = "a NetMap runs nothing until `.collect()` or `.net_reduce()`"]
-pub struct NetMap<'fleet, L, F, I> {
-    fleet: &'fleet Fleet<L>,
+/// The process-global fleet that [`NetMapExt::net_map`] runs against. Installed
+/// once with [`install_fleet`]; replaceable.
+static GLOBAL_FLEET: RwLock<Option<Arc<dyn ErasedFleet>>> = RwLock::new(None);
+
+/// Install (or replace) the process-global fleet that bare `net_map(map)` runs
+/// against, so the common case can drop the explicit `&fleet`.
+///
+/// Without this, `inputs.net_map(map)` errors when run; use
+/// [`NetMapExt::net_map_with_fleet`] to pass a fleet explicitly instead.
+pub fn install_fleet<L: Launch + Send + Sync + 'static>(fleet: Fleet<L>) {
+    *GLOBAL_FLEET
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(fleet));
+}
+
+/// The currently installed global fleet, if any.
+fn global_fleet() -> Option<Arc<dyn ErasedFleet>> {
+    GLOBAL_FLEET
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Which fleet a [`NetMap`] runs against: one borrowed explicitly, or the
+/// process-global installed with [`install_fleet`].
+enum RunnerRef<'a> {
+    Borrowed(&'a dyn ErasedFleet),
+    Global,
+}
+
+/// A pending distributed map over a fleet.
+///
+/// Built by [`NetMapExt::net_map`] or [`NetMapExt::net_map_with_fleet`]. Nothing
+/// runs until a terminal: [`NetMap::collect`] gathers every result,
+/// [`NetMap::net_reduce`] / [`NetMap::net_fold`] fold them.
+#[must_use = "a NetMap runs nothing until `.collect()`, `.net_reduce()`, or `.net_fold()`"]
+pub struct NetMap<'a, F, I> {
+    runner: RunnerRef<'a>,
     map: F,
     inputs: Vec<I>,
 }
 
-impl<L, F, I> std::fmt::Debug for NetMap<'_, L, F, I> {
+impl<F, I> std::fmt::Debug for NetMap<'_, F, I> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NetMap")
             .field("tasks", &self.inputs.len())
@@ -135,10 +182,33 @@ impl<L, F, I> std::fmt::Debug for NetMap<'_, L, F, I> {
     }
 }
 
-impl<L: Launch, F, I> NetMap<'_, L, F, I>
+impl<F, I> NetMap<'_, F, I>
 where
     I: Serialize,
 {
+    /// Serialize the inputs, run the job against the chosen fleet, and decode
+    /// each output. The shared engine behind every terminal.
+    async fn run<O>(self) -> std::io::Result<Vec<Result<O, String>>>
+    where
+        F: Fn(I) -> O,
+        O: DeserializeOwned,
+    {
+        let key = fn_key(&self.map);
+        let payloads = serialize_inputs(&self.inputs)?;
+        let raw = match self.runner {
+            RunnerRef::Borrowed(fleet) => fleet.run_erased(key, payloads).await?,
+            RunnerRef::Global => {
+                let fleet = global_fleet().ok_or_else(|| {
+                    std::io::Error::other(
+                        "rayonet: no global fleet installed; call rayonet::install_fleet(fleet) or use net_map_with_fleet",
+                    )
+                })?;
+                fleet.run_erased(key, payloads).await?
+            }
+        };
+        Ok(raw.into_iter().map(decode_output::<O>).collect())
+    }
+
     /// Gather every task's result, in input order: `Ok(output)` for a task that
     /// returned, `Err(message)` for one that panicked.
     ///
@@ -149,7 +219,7 @@ where
         F: Fn(I) -> O,
         O: DeserializeOwned,
     {
-        self.fleet.run_map(self.map, self.inputs).await
+        self.run().await
     }
 
     /// Fold the task outputs into one value on the coordinator with `op`, like
@@ -167,7 +237,7 @@ where
         F: Fn(I) -> O,
         O: DeserializeOwned,
     {
-        let mut outputs = self.fleet.run_map(self.map, self.inputs).await?.into_iter();
+        let mut outputs = self.run::<O>().await?.into_iter();
         let Some(first) = outputs.next() else {
             return Ok(None);
         };
@@ -196,7 +266,7 @@ where
         O: DeserializeOwned,
     {
         let mut acc = init;
-        for output in self.fleet.run_map(self.map, self.inputs).await? {
+        for output in self.run::<O>().await? {
             acc = op(acc, output.map_err(std::io::Error::other)?);
         }
         Ok(acc)
@@ -205,33 +275,30 @@ where
 
 /// Distributed map as an iterator adapter.
 ///
-/// `inputs.net_map_with_fleet(map, &fleet)` runs `map` over the items across
-/// `fleet`. Implemented for every [`IntoIterator`], so a `Vec`, a range, or any
-/// iterator of task inputs works.
+/// `inputs.net_map(map)` runs `map` over the items across the global fleet (see
+/// [`install_fleet`]); `inputs.net_map_with_fleet(map, &fleet)` runs against an
+/// explicit one. Implemented for every [`IntoIterator`], so a `Vec`, a range, or
+/// any iterator of task inputs works.
 pub trait NetMapExt: IntoIterator + Sized {
-    /// Map `map` over these items, distributed across `fleet`. Terminate with
-    /// [`NetMap::collect`] or [`NetMap::net_reduce`].
+    /// Map `map` over these items across the process-global fleet (installed
+    /// with [`install_fleet`]). Terminate with [`NetMap::collect`],
+    /// [`NetMap::net_reduce`], or [`NetMap::net_fold`].
     ///
     /// `map` is the task shipped to the agents, keyed by its `type_name`, so it
     /// must be a named function or a non-capturing closure (enforced at compile
-    /// time). A future `net_map(map)` will target a global fleet implicitly.
+    /// time). Running this with no global fleet installed errors at the terminal.
     ///
     /// # Examples
     /// A capturing closure is rejected at compile time:
     /// ```compile_fail
-    /// use rayonet::fleet::{Fleet, NetMapExt, Subprocess};
-    /// let fleet: Fleet<Subprocess> = Fleet::new(vec![]);
+    /// use rayonet::fleet::NetMapExt;
     /// let captured = 10u32;
-    /// let _ = std::iter::once(1u32).net_map_with_fleet(move |x: u32| x + captured, &fleet);
+    /// let _ = std::iter::once(1u32).net_map(move |x: u32| x + captured);
     /// ```
-    fn net_map_with_fleet<F, L, O>(self, map: F, fleet: &Fleet<L>) -> NetMap<'_, L, F, Self::Item>
+    fn net_map<F, O>(self, map: F) -> NetMap<'static, F, Self::Item>
     where
         F: Fn(Self::Item) -> O,
-        L: Launch,
     {
-        // Reject capturing closures at compile time: a named function or
-        // non-capturing closure is zero-sized; captured state is not. This keeps
-        // the unique fn-item type that the `type_name` key relies on.
         const {
             assert!(
                 size_of::<F>() == 0,
@@ -239,7 +306,27 @@ pub trait NetMapExt: IntoIterator + Sized {
             );
         }
         NetMap {
-            fleet,
+            runner: RunnerRef::Global,
+            map,
+            inputs: self.into_iter().collect(),
+        }
+    }
+
+    /// Map `map` over these items, distributed across an explicit `fleet`.
+    /// Otherwise identical to [`NetMapExt::net_map`].
+    fn net_map_with_fleet<F, L, O>(self, map: F, fleet: &Fleet<L>) -> NetMap<'_, F, Self::Item>
+    where
+        F: Fn(Self::Item) -> O,
+        L: Launch + Send + Sync,
+    {
+        const {
+            assert!(
+                size_of::<F>() == 0,
+                "a `.net_map` task function must not capture; use a named function or a non-capturing closure"
+            );
+        }
+        NetMap {
+            runner: RunnerRef::Borrowed(fleet),
             map,
             inputs: self.into_iter().collect(),
         }
@@ -352,7 +439,10 @@ mod rayon_bridge {
         ///
         /// # Errors
         /// Returns an error if the runtime cannot start or the run fails.
-        pub fn run<L: Launch>(self, fleet: &Fleet<L>) -> std::io::Result<Vec<Result<O, String>>> {
+        pub fn run<L: Launch + Send + Sync>(
+            self,
+            fleet: &Fleet<L>,
+        ) -> std::io::Result<Vec<Result<O, String>>> {
             let inputs: Vec<P::Item> = self.upstream.collect();
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -527,6 +617,30 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("too big"), "{err}");
+    }
+
+    // This is the only test that touches the process-global fleet, so its state
+    // is deterministic: unset at the start, installed partway through.
+    #[tokio::test]
+    async fn net_map_uses_the_installed_global_fleet() {
+        // With no global installed, a bare `net_map` errors at the terminal.
+        let err = (0..4u32)
+            .net_map(double)
+            .collect::<u32>()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no global fleet"), "{err}");
+
+        // Install one, and the same bare call now runs against it.
+        let launchers = (0..2).map(|_| InProcess::serving(true)).collect();
+        super::install_fleet(Fleet::new(launchers));
+
+        let out: Vec<Result<u32, String>> = (0..4u32).net_map(double).collect().await.unwrap();
+        assert_eq!(out, (0..4u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+
+        // Terminals other than collect work over the global fleet too.
+        let sum = (0..4u32).net_map(double).net_reduce(add).await.unwrap();
+        assert_eq!(sum, Some((0..4u32).map(|x| x * 2).sum()));
     }
 
     #[tokio::test]

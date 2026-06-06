@@ -17,6 +17,9 @@ pub mod testing;
 #[cfg(feature = "tui")]
 pub mod tui;
 
+/// Install the process-global fleet that bare `net_map(map)` runs against.
+pub use fleet::install_fleet;
+
 /// Pull in what `rayonet_build::extract()` generated.
 ///
 /// Invoke once at the consumer's crate root, after its `build.rs` has called

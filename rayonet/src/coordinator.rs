@@ -94,7 +94,7 @@ where
 }
 
 /// Mutable scheduling state for one run.
-struct Job<S, O> {
+struct Job<S> {
     senders: Vec<Sender<S>>,
     /// Whether each agent is currently running a task (one at a time).
     busy: Vec<bool>,
@@ -103,15 +103,14 @@ struct Job<S, O> {
     pending: VecDeque<usize>,
     /// `task_id` -> (agent, input index), for reassignment and dedup on completion.
     assigned: HashMap<TaskId, (usize, usize)>,
-    results: Vec<Option<Result<O, String>>>,
+    results: Vec<Option<Result<Vec<u8>, String>>>,
     remaining: usize,
     payloads: Vec<Vec<u8>>,
 }
 
-impl<S, O> Job<S, O>
+impl<S> Job<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    O: DeserializeOwned,
 {
     /// Assign the next pending task to an agent if it is idle and alive. A lost
     /// or busy agent takes nothing.
@@ -136,7 +135,7 @@ where
 
     /// Record a terminal outcome. Returns the freed agent, or `None` if the
     /// `task_id` was unknown or already resolved (dedup of a re-run task).
-    fn record(&mut self, task_id: TaskId, result: Result<O, String>) -> Option<usize> {
+    fn record(&mut self, task_id: TaskId, result: Result<Vec<u8>, String>) -> Option<usize> {
         // `assigned` holds each task_id at most once (removed on first record),
         // so a duplicate returns `None` here and this runs exactly once per task.
         let (agent, idx) = self.assigned.remove(&task_id)?;
@@ -176,7 +175,7 @@ where
     async fn finish(
         &mut self,
         task_id: TaskId,
-        result: Result<O, String>,
+        result: Result<Vec<u8>, String>,
         ok: bool,
         labels: &[String],
         events: &dyn EventSink,
@@ -196,33 +195,49 @@ where
     }
 }
 
-/// Run one job to completion, returning the outputs in input order.
-///
-/// Ships `inputs` to `agents` (all running the function named by `fn_key`); each
-/// result is either the decoded output or a failure message (a panic or a decode
-/// error).
+/// Serialize each task input to its wire payload.
 ///
 /// # Errors
-/// Returns an error on a handshake failure or transport error, or (in v1) if an
-/// agent disconnects before the job completes (requeue/reconnect is Phase 6).
-pub async fn run_job<S, I, O>(
-    agents: Vec<(String, Connection<S>)>,
-    fn_key: &str,
-    inputs: Vec<I>,
-    events: &dyn EventSink,
-) -> std::io::Result<Vec<Result<O, String>>>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    I: Serialize,
-    O: DeserializeOwned,
-{
-    let payloads: Vec<Vec<u8>> = inputs
+/// Returns an error if an input cannot be serialized.
+pub(crate) fn serialize_inputs<I: Serialize>(inputs: &[I]) -> std::io::Result<Vec<Vec<u8>>> {
+    inputs
         .iter()
         .map(|i| {
             postcard::to_allocvec(i)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         })
-        .collect::<Result<_, _>>()?;
+        .collect()
+}
+
+/// Decode one raw task result into `O`, turning a decode failure into the task's
+/// error string (the agent and coordinator share a compile, so this is only a
+/// guard against a corrupt frame).
+pub(crate) fn decode_output<O: DeserializeOwned>(
+    raw: Result<Vec<u8>, String>,
+) -> Result<O, String> {
+    raw.and_then(|bytes| {
+        postcard::from_bytes::<O>(&bytes).map_err(|e| format!("decode output: {e}"))
+    })
+}
+
+/// Run one job to completion over already-serialized payloads, returning each
+/// task's raw output bytes or its failure message, in input order.
+///
+/// The byte-level core: agnostic to the input and output types, so a type-erased
+/// fleet (see [`crate::fleet`]) can drive it. [`run_job`] is the typed wrapper.
+///
+/// # Errors
+/// Returns an error on a handshake or transport failure, or if every agent is
+/// lost before the job completes.
+pub(crate) async fn run_job_raw<S>(
+    agents: Vec<(String, Connection<S>)>,
+    fn_key: &str,
+    payloads: Vec<Vec<u8>>,
+    events: &dyn EventSink,
+) -> std::io::Result<Vec<Result<Vec<u8>, String>>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let num_tasks = payloads.len();
 
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
@@ -234,7 +249,7 @@ where
     drop(events_tx); // the channel ends when every reader does
 
     let agent_count = senders.len();
-    let mut job: Job<S, O> = Job {
+    let mut job: Job<S> = Job {
         senders,
         busy: vec![false; agent_count],
         alive: vec![true; agent_count],
@@ -272,10 +287,10 @@ where
                 }
             }
             Some(Event::Message(FromAgent::Completed { task_id, output })) => {
-                let result =
-                    postcard::from_bytes::<O>(&output).map_err(|e| format!("decode output: {e}"));
-                let ok = result.is_ok();
-                job.finish(task_id, result, ok, &labels, events).await?;
+                // The raw bytes are kept as-is; decoding happens in the typed
+                // layer, so a `Completed` is `ok` at the protocol level here.
+                job.finish(task_id, Ok(output), true, &labels, events)
+                    .await?;
             }
             Some(Event::Message(FromAgent::Failed { task_id, error })) => {
                 job.finish(task_id, Err(error), false, &labels, events)
@@ -323,6 +338,28 @@ where
 
     // Every slot is `Some` because the loop only exits at `remaining == 0`.
     Ok(job.results.into_iter().flatten().collect())
+}
+
+/// Typed wrapper over [`run_job_raw`]: serialize `inputs`, run, then decode each
+/// successful output into `O` (a decode failure becomes that task's error).
+///
+/// # Errors
+/// Returns an error on a handshake or transport failure, or if every agent is
+/// lost before the job completes.
+pub async fn run_job<S, I, O>(
+    agents: Vec<(String, Connection<S>)>,
+    fn_key: &str,
+    inputs: Vec<I>,
+    events: &dyn EventSink,
+) -> std::io::Result<Vec<Result<O, String>>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    I: Serialize,
+    O: DeserializeOwned,
+{
+    let payloads = serialize_inputs(&inputs)?;
+    let raw = run_job_raw(agents, fn_key, payloads, events).await?;
+    Ok(raw.into_iter().map(decode_output::<O>).collect())
 }
 
 #[cfg(test)]
