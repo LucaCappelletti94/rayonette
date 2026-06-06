@@ -452,6 +452,10 @@ mod tests {
         assert_eq!(p.ram_mb, 131_923_148 / 1024);
         assert_eq!(p.gpus.len(), 1);
         assert_eq!(p.gpus[0].runtime, Some(GpuRuntime::Cuda));
+
+        // Probing is read-only; the scripted host still satisfies the full
+        // `Remote` contract, whose upload is a no-op here.
+        host.upload(b"", "/dev/null").await.unwrap();
     }
 
     #[tokio::test]

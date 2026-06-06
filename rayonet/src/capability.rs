@@ -78,6 +78,18 @@ pub struct NodeProfile {
 }
 
 impl NodeProfile {
+    /// A placeholder profile for a launcher with no real host to probe (a local
+    /// subprocess or an in-process test agent): no known capabilities.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self {
+            os: Os::Other("unknown".to_string()),
+            cores: 0,
+            ram_mb: 0,
+            gpus: Vec::new(),
+        }
+    }
+
     /// Whether the node has any GPU at all.
     #[must_use]
     pub const fn has_gpu(&self) -> bool {
@@ -112,6 +124,75 @@ pub enum Role {
     RelayOnly,
     /// Used for nothing.
     Excluded,
+}
+
+/// A first-match-wins rule list mapping a [`NodeProfile`] to a [`Role`], built
+/// from [`pred::Predicate`]s.
+///
+/// Rules are tried in order, the first whose predicate matches wins, and an
+/// unmatched profile takes the default (`Excluded` unless changed with
+/// [`Filter::otherwise`]). Example:
+/// `Filter::new().relay_only(os_is(MacOs)).compute(rocm().and(ram_at_least_gb(16)))`.
+#[derive(Debug, Clone)]
+pub struct Filter {
+    rules: Vec<(pred::Predicate, Role)>,
+    default: Role,
+}
+
+impl Default for Filter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Filter {
+    /// An empty filter whose default is [`Role::Excluded`].
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            rules: Vec::new(),
+            default: Role::Excluded,
+        }
+    }
+
+    /// Append a rule assigning [`Role::Compute`] to profiles matching `predicate`.
+    #[must_use]
+    pub fn compute(mut self, predicate: pred::Predicate) -> Self {
+        self.rules.push((predicate, Role::Compute));
+        self
+    }
+
+    /// Append a rule assigning [`Role::RelayOnly`] to profiles matching `predicate`.
+    #[must_use]
+    pub fn relay_only(mut self, predicate: pred::Predicate) -> Self {
+        self.rules.push((predicate, Role::RelayOnly));
+        self
+    }
+
+    /// Append a rule assigning [`Role::Excluded`] to profiles matching `predicate`.
+    #[must_use]
+    pub fn exclude(mut self, predicate: pred::Predicate) -> Self {
+        self.rules.push((predicate, Role::Excluded));
+        self
+    }
+
+    /// Set the role for a profile that matches no rule (defaults to `Excluded`).
+    #[must_use]
+    pub const fn otherwise(mut self, role: Role) -> Self {
+        self.default = role;
+        self
+    }
+
+    /// The role for `profile`: the first matching rule, or the default.
+    #[must_use]
+    pub fn role_of(&self, profile: &NodeProfile) -> Role {
+        for (predicate, role) in &self.rules {
+            if predicate.eval(profile) {
+                return *role;
+            }
+        }
+        self.default
+    }
 }
 
 /// Parse `uname -s` output into an [`Os`].
@@ -501,6 +582,88 @@ Agent 3
         assert_eq!(gpus[0].runtime, Some(GpuRuntime::Rocm));
         assert_eq!(gpus[0].model, "AMD Radeon RX 7900 XTX");
         assert_eq!(gpus[1].model, "AMD Radeon RX 7800 XT");
+    }
+
+    #[test]
+    fn node_profile_unknown_is_empty() {
+        use super::{NodeProfile, Os};
+        let u = NodeProfile::unknown();
+        assert_eq!(u.cores, 0);
+        assert_eq!(u.ram_mb, 0);
+        assert!(u.gpus.is_empty());
+        assert!(matches!(u.os, Os::Other(_)));
+    }
+
+    #[test]
+    fn filter_first_match_wins() {
+        use super::pred::{os_is, ram_at_least_gb, rocm};
+        use super::{Filter, Gpu, GpuRuntime, GpuVendor, NodeProfile, Os, Role};
+
+        let filter = Filter::new()
+            .relay_only(os_is(Os::MacOs))
+            .compute(rocm().and(ram_at_least_gb(16)))
+            .otherwise(Role::Excluded);
+
+        let mac = NodeProfile {
+            os: Os::MacOs,
+            cores: 8,
+            ram_mb: 16_384,
+            gpus: vec![],
+        };
+        assert_eq!(filter.role_of(&mac), Role::RelayOnly);
+
+        let rocm_box = NodeProfile {
+            os: Os::Linux,
+            cores: 64,
+            ram_mb: 131_072,
+            gpus: vec![Gpu {
+                vendor: GpuVendor::Amd,
+                runtime: Some(GpuRuntime::Rocm),
+                model: "RX 7900 XTX".to_string(),
+                vram_mb: Some(24_576),
+            }],
+        };
+        assert_eq!(filter.role_of(&rocm_box), Role::Compute);
+
+        let plain = NodeProfile {
+            os: Os::Linux,
+            cores: 4,
+            ram_mb: 8_000,
+            gpus: vec![],
+        };
+        assert_eq!(filter.role_of(&plain), Role::Excluded);
+    }
+
+    #[test]
+    fn filter_exclude_rule_beats_default() {
+        use super::pred::cuda;
+        use super::{Filter, Gpu, GpuRuntime, GpuVendor, NodeProfile, Os, Role};
+
+        // CUDA boxes are barred even though the default is Compute.
+        let filter = Filter::new().exclude(cuda()).otherwise(Role::Compute);
+        let cuda_box = NodeProfile {
+            os: Os::Linux,
+            cores: 32,
+            ram_mb: 65_536,
+            gpus: vec![Gpu {
+                vendor: GpuVendor::Nvidia,
+                runtime: Some(GpuRuntime::Cuda),
+                model: "RTX 4090".to_string(),
+                vram_mb: Some(24_564),
+            }],
+        };
+        assert_eq!(filter.role_of(&cuda_box), Role::Excluded);
+
+        let cpu_only = NodeProfile {
+            os: Os::Linux,
+            cores: 32,
+            ram_mb: 65_536,
+            gpus: vec![],
+        };
+        assert_eq!(filter.role_of(&cpu_only), Role::Compute);
+
+        // The empty default filter excludes everything.
+        assert_eq!(Filter::default().role_of(&cpu_only), Role::Excluded);
     }
 
     #[test]

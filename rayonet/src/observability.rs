@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
+use crate::capability::{NodeProfile, Role};
 use crate::protocol::TaskId;
 
 /// A node's place in its lifecycle, grown per phase.
@@ -53,6 +54,15 @@ pub enum Event {
         /// The state the host just entered.
         state: NodeState,
     },
+    /// A host was probed for its capabilities and assigned a scheduling role.
+    Profiled {
+        /// The host that was probed.
+        host: String,
+        /// The capabilities the probe found.
+        profile: NodeProfile,
+        /// The role the fleet filter assigned from that profile.
+        role: Role,
+    },
     /// A task began running on a host.
     TaskStarted {
         /// The host running the task.
@@ -78,6 +88,16 @@ impl Event {
         Self::Node {
             host: host.to_string(),
             state,
+        }
+    }
+
+    /// Build a capability-and-role event for `host`.
+    #[must_use]
+    pub fn profiled(host: &str, profile: NodeProfile, role: Role) -> Self {
+        Self::Profiled {
+            host: host.to_string(),
+            profile,
+            role,
         }
     }
 }
@@ -149,6 +169,10 @@ pub struct NodeView {
     pub state: NodeState,
     /// Tasks this host has finished (ok or err).
     pub completed: usize,
+    /// The host's probed capabilities, once it has been profiled.
+    pub profile: Option<NodeProfile>,
+    /// The role the fleet filter assigned, once it has been profiled.
+    pub role: Option<Role>,
 }
 
 impl RunState {
@@ -158,6 +182,15 @@ impl RunState {
             Event::RunStarted { tasks } => self.total_tasks = *tasks,
             Event::Node { host, state } => {
                 self.node(host).state = *state;
+            }
+            Event::Profiled {
+                host,
+                profile,
+                role,
+            } => {
+                let view = self.node(host);
+                view.profile = Some(profile.clone());
+                view.role = Some(*role);
             }
             Event::TaskStarted { host, .. } => {
                 self.node(host);
@@ -179,6 +212,8 @@ impl RunState {
         self.nodes.entry(host.to_string()).or_insert(NodeView {
             state: NodeState::Working,
             completed: 0,
+            profile: None,
+            role: None,
         })
     }
 }
@@ -203,6 +238,17 @@ impl PlainRenderer {
         match event {
             Event::RunStarted { tasks } => Some(format!("run started: {tasks} tasks")),
             Event::Node { host, state } => Some(format!("{host}: {state:?}")),
+            Event::Profiled {
+                host,
+                profile,
+                role,
+            } => Some(format!(
+                "{host}: {role:?} ({:?}, {} cores, {} MB RAM, {} GPUs)",
+                profile.os,
+                profile.cores,
+                profile.ram_mb,
+                profile.gpus.len()
+            )),
             Event::TaskStarted { .. } => None,
             Event::TaskFinished { .. } => Some(format!(
                 "progress: {}/{}",
@@ -216,6 +262,7 @@ impl PlainRenderer {
 #[cfg(test)]
 mod tests {
     use super::{Event, EventBus, EventSink, NodeState, NodeView, RunState};
+    use crate::capability::{NodeProfile, Os, Role};
 
     fn finished(host: &str, task: u64, ok: bool) -> Event {
         Event::TaskFinished {
@@ -239,6 +286,38 @@ mod tests {
         let mut live = bus.subscribe();
         bus.emit(Event::RunStarted { tasks: 7 });
         assert_eq!(live.recv().await.unwrap(), Event::RunStarted { tasks: 7 });
+    }
+
+    #[test]
+    fn run_state_records_a_profile_and_role() {
+        let profile = NodeProfile {
+            os: Os::Linux,
+            cores: 8,
+            ram_mb: 16_000,
+            gpus: Vec::new(),
+        };
+        let mut state = RunState::default();
+        state.apply(&Event::profiled("host-a", profile.clone(), Role::Compute));
+
+        let view = &state.nodes["host-a"];
+        assert_eq!(view.profile, Some(profile));
+        assert_eq!(view.role, Some(Role::Compute));
+    }
+
+    #[test]
+    fn plain_renderer_summarizes_a_profile() {
+        let profile = NodeProfile {
+            os: Os::Linux,
+            cores: 8,
+            ram_mb: 16_000,
+            gpus: Vec::new(),
+        };
+        let mut renderer = super::PlainRenderer::new();
+        let line = renderer
+            .render(&Event::profiled("host-a", profile, Role::Compute))
+            .expect("profiled events print a line");
+        assert!(line.contains("host-a"), "{line}");
+        assert!(line.contains("Compute"), "{line}");
     }
 
     #[test]

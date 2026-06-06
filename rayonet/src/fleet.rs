@@ -15,60 +15,114 @@ use serde::{de::DeserializeOwned, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::agent::fn_key;
+use crate::capability::{pred::Predicate, Filter, NodeProfile, Role};
 use crate::coordinator::{decode_output, run_job_raw, serialize_inputs};
 use crate::framing::Connection;
-use crate::observability::{EventSink, NoopSink};
+use crate::observability::{Event, EventSink, NoopSink};
 
-/// Launches one agent and yields a connection to it plus a lifecycle guard kept
-/// alive for the duration of a run.
+/// Launches one agent in three phases so a host's capabilities can be probed and
+/// filtered before the expensive provisioning step: connect, then probe, then
+/// activate.
 pub trait Launch {
     /// The byte stream the connection runs over.
     type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
     /// A handle held for the run's duration (a process or task lifecycle).
     type Guard: Send;
+    /// The live transport to a host, established by [`Launch::connect`] and
+    /// consumed by [`Launch::activate`] (an ssh session, or a trivial handle for
+    /// a local launcher).
+    type Session: Send;
 
     /// A stable name for the host this launcher targets, used to attribute
     /// observability events.
     fn label(&self) -> String;
 
-    /// Launch one agent, emitting any provisioning progress to `events`.
+    /// Phase 1: establish the transport to the host. Cheap, so it runs before
+    /// any capability filtering.
     ///
     /// # Errors
-    /// Returns an error if the agent cannot be launched.
-    fn launch(
+    /// Returns an error if the host cannot be reached.
+    fn connect(&self) -> impl Future<Output = std::io::Result<Self::Session>> + Send;
+
+    /// Phase 2: probe the host's [`NodeProfile`] over an established session.
+    /// Defaults to an unknown profile, for launchers with no real host to probe
+    /// (a local subprocess or an in-process test agent).
+    ///
+    /// # Errors
+    /// Returns an error if the probe cannot run.
+    fn probe(
         &self,
+        _session: &Self::Session,
+    ) -> impl Future<Output = std::io::Result<NodeProfile>> + Send {
+        std::future::ready(Ok(NodeProfile::unknown()))
+    }
+
+    /// Phase 3: provision and spawn the agent over the session, emitting any
+    /// progress to `events`.
+    ///
+    /// # Errors
+    /// Returns an error if the agent cannot be provisioned or spawned.
+    fn activate(
+        &self,
+        session: Self::Session,
         events: &dyn EventSink,
     ) -> impl Future<Output = std::io::Result<(Connection<Self::Stream>, Self::Guard)>> + Send;
 }
 
-/// A homogeneous set of agent launchers, with an optional observer for the run.
+/// A homogeneous set of agent launchers, with an optional observer for the run
+/// and an optional capability filter assigning each host a [`Role`].
 pub struct Fleet<L> {
     launchers: Vec<L>,
     events: Arc<dyn EventSink>,
+    filter: Option<Filter>,
 }
 
 impl<L> std::fmt::Debug for Fleet<L> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Fleet")
             .field("agents", &self.launchers.len())
+            .field("filtered", &self.filter.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl<L: Launch> Fleet<L> {
-    /// Build a fleet from a set of launchers, with the run unobserved.
+    /// Build a fleet from a set of launchers, with the run unobserved and every
+    /// host treated as [`Role::Compute`].
     #[must_use]
     pub fn new(launchers: Vec<L>) -> Self {
         Self {
             launchers,
             events: Arc::new(NoopSink),
+            filter: None,
         }
     }
 
     /// Build a fleet whose run emits its event stream to `events`.
     #[must_use]
     pub fn observed(launchers: Vec<L>, events: Arc<dyn EventSink>) -> Self {
-        Self { launchers, events }
+        Self {
+            launchers,
+            events,
+            filter: None,
+        }
+    }
+
+    /// Map each host to a [`Role`] from its probed capabilities: only hosts the
+    /// `filter` assigns [`Role::Compute`] run tasks; the rest are dropped before
+    /// they are provisioned. Without a filter every host is `Compute`.
+    #[must_use]
+    pub fn with_filter(mut self, filter: Filter) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+
+    /// The role for `profile` under this fleet's filter, defaulting to
+    /// [`Role::Compute`] when no filter is set.
+    fn role_of(&self, profile: &NodeProfile) -> Role {
+        self.filter
+            .as_ref()
+            .map_or(Role::Compute, |filter| filter.role_of(profile))
     }
 }
 
@@ -89,6 +143,7 @@ trait ErasedFleet: Send + Sync {
         &'a self,
         fn_key: &'a str,
         payloads: Vec<Vec<u8>>,
+        requires: Option<&'a Predicate>,
     ) -> Pin<Box<dyn Future<Output = RawResults> + Send + 'a>>;
 }
 
@@ -97,6 +152,7 @@ impl<L: Launch + Send + Sync> ErasedFleet for Fleet<L> {
         &'a self,
         fn_key: &'a str,
         payloads: Vec<Vec<u8>>,
+        requires: Option<&'a Predicate>,
     ) -> Pin<Box<dyn Future<Output = RawResults> + Send + 'a>> {
         Box::pin(async move {
             let events = self.events.as_ref();
@@ -105,11 +161,36 @@ impl<L: Launch + Send + Sync> ErasedFleet for Fleet<L> {
             let mut failures = Vec::new();
             // A host that fails to launch (for example a cold host that cannot
             // install the toolchain) is dropped; its tasks are simply scheduled
-            // onto the survivors by the pull scheduler.
+            // onto the survivors by the pull scheduler. A host the filter does
+            // not assign `Compute` is likewise dropped, before it is provisioned.
             for launcher in &self.launchers {
-                match launcher.launch(events).await {
+                let label = launcher.label();
+                let session = match launcher.connect().await {
+                    Ok(session) => session,
+                    Err(failure) => {
+                        failures.push(failure);
+                        continue;
+                    }
+                };
+                let profile = match launcher.probe(&session).await {
+                    Ok(profile) => profile,
+                    Err(failure) => {
+                        failures.push(failure);
+                        continue;
+                    }
+                };
+                let role = self.role_of(&profile);
+                // A job requirement narrows the compute hosts further: a host
+                // that the fleet runs tasks on, but whose capabilities this job
+                // does not need, is skipped for this run only.
+                let meets_requirement = requires.is_none_or(|predicate| predicate.eval(&profile));
+                events.emit(Event::profiled(&label, profile, role));
+                if role != Role::Compute || !meets_requirement {
+                    continue;
+                }
+                match launcher.activate(session, events).await {
                     Ok((connection, guard)) => {
-                        agents.push((launcher.label(), connection));
+                        agents.push((label, connection));
                         guards.push(guard);
                     }
                     Err(failure) => failures.push(failure),
@@ -122,7 +203,7 @@ impl<L: Launch + Send + Sync> ErasedFleet for Fleet<L> {
                     .collect::<Vec<_>>()
                     .join("; ");
                 return Err(std::io::Error::other(format!(
-                    "rayonet: every host failed to launch: {detail}"
+                    "rayonet: no eligible host (every host failed to launch or was filtered out): {detail}"
                 )));
             }
             let result = run_job_raw(agents, fn_key, payloads, events).await;
@@ -172,6 +253,7 @@ pub struct NetMap<'a, F, I> {
     runner: RunnerRef<'a>,
     map: F,
     inputs: Vec<I>,
+    requires: Option<Predicate>,
 }
 
 impl<F, I> std::fmt::Debug for NetMap<'_, F, I> {
@@ -179,6 +261,19 @@ impl<F, I> std::fmt::Debug for NetMap<'_, F, I> {
         f.debug_struct("NetMap")
             .field("tasks", &self.inputs.len())
             .finish_non_exhaustive()
+    }
+}
+
+impl<F, I> NetMap<'_, F, I> {
+    /// Run this job only on hosts whose [`NodeProfile`] satisfies `predicate`
+    /// (for example `requires(pred::rocm())` for a job that needs `ROCm`).
+    ///
+    /// This narrows within the fleet's compute hosts for this run only: it is the
+    /// per-job counterpart to the fleet-wide [`Fleet::with_filter`]. A job no host
+    /// can satisfy fails with the no-eligible-host error.
+    pub fn requires(mut self, predicate: Predicate) -> Self {
+        self.requires = Some(predicate);
+        self
     }
 }
 
@@ -195,15 +290,18 @@ where
     {
         let key = fn_key(&self.map);
         let payloads = serialize_inputs(&self.inputs)?;
+        let requires = self.requires;
         let raw = match self.runner {
-            RunnerRef::Borrowed(fleet) => fleet.run_erased(key, payloads).await?,
+            RunnerRef::Borrowed(fleet) => {
+                fleet.run_erased(key, payloads, requires.as_ref()).await?
+            }
             RunnerRef::Global => {
                 let fleet = global_fleet().ok_or_else(|| {
                     std::io::Error::other(
                         "rayonet: no global fleet installed; call rayonet::install_fleet(fleet) or use net_map_with_fleet",
                     )
                 })?;
-                fleet.run_erased(key, payloads).await?
+                fleet.run_erased(key, payloads, requires.as_ref()).await?
             }
         };
         Ok(raw.into_iter().map(decode_output::<O>).collect())
@@ -309,6 +407,7 @@ pub trait NetMapExt: IntoIterator + Sized {
             runner: RunnerRef::Global,
             map,
             inputs: self.into_iter().collect(),
+            requires: None,
         }
     }
 
@@ -329,6 +428,7 @@ pub trait NetMapExt: IntoIterator + Sized {
             runner: RunnerRef::Borrowed(fleet),
             map,
             inputs: self.into_iter().collect(),
+            requires: None,
         }
     }
 }
@@ -372,14 +472,21 @@ impl Subprocess {
 impl Launch for Subprocess {
     type Stream = tokio::io::Join<tokio::process::ChildStdout, tokio::process::ChildStdin>;
     type Guard = crate::process::AgentProcess;
+    type Session = ();
 
     fn label(&self) -> String {
         self.program.to_string_lossy().into_owned()
     }
 
-    // A local subprocess does not provision, so there is no progress to emit.
-    async fn launch(
+    // A local subprocess has no transport to establish and uses the default
+    // (unknown) profile; it spawns directly in `activate`.
+    async fn connect(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn activate(
         &self,
+        _session: (),
         _events: &dyn EventSink,
     ) -> std::io::Result<(Connection<Self::Stream>, Self::Guard)> {
         crate::process::spawn(tokio::process::Command::new(&self.program))
@@ -457,7 +564,7 @@ pub use rayon_bridge::{NetMapJob, RayonNetMapExt};
 
 #[cfg(test)]
 mod tests {
-    use super::{EventSink, Fleet, Launch, NetMapExt};
+    use super::{EventSink, Fleet, Launch, NetMapExt, NodeProfile};
     use crate::agent::{serve, Registry};
     use crate::framing::Connection;
     use crate::testing::connection_pair;
@@ -466,41 +573,86 @@ mod tests {
 
     /// A launcher that runs an agent in-process over a duplex pipe. A `None`
     /// registry simulates a host that fails to launch (for example a cold host
-    /// that cannot be provisioned).
+    /// that cannot be provisioned). An optional `profile` overrides the default
+    /// (unknown) probe result so the role filter can be exercised.
     struct InProcess {
         registry: Option<Registry>,
+        label: String,
+        profile: Option<NodeProfile>,
+        probe_fails: bool,
     }
 
     impl InProcess {
         fn serving(double: bool) -> Self {
             let registry = double.then(|| Registry::new().with_fn(self::double));
-            Self { registry }
+            Self {
+                registry,
+                label: "in-process".to_string(),
+                profile: None,
+                probe_fails: false,
+            }
         }
 
         fn serving_registry(registry: Registry) -> Self {
             Self {
                 registry: Some(registry),
+                label: "in-process".to_string(),
+                profile: None,
+                probe_fails: false,
             }
+        }
+
+        /// Override the host label, so a multi-host fleet has distinct nodes.
+        fn named(mut self, label: &str) -> Self {
+            self.label = label.to_string();
+            self
+        }
+
+        /// Override the probed profile, so the role filter has something to act on.
+        fn with_profile(mut self, profile: NodeProfile) -> Self {
+            self.profile = Some(profile);
+            self
+        }
+
+        /// Make the probe fail, simulating a host that connects but cannot be
+        /// inspected, so it is dropped before activation.
+        fn probe_failing(mut self) -> Self {
+            self.probe_fails = true;
+            self
         }
     }
 
     impl Launch for InProcess {
         type Stream = DuplexStream;
         type Guard = JoinHandle<std::io::Result<()>>;
+        // The session carries the registry to serve; a `None` registry fails the
+        // connect, simulating a host that cannot be launched.
+        type Session = Registry;
 
         fn label(&self) -> String {
-            "in-process".to_string()
+            self.label.clone()
         }
 
-        async fn launch(
+        async fn connect(&self) -> std::io::Result<Registry> {
+            self.registry
+                .clone()
+                .ok_or_else(|| std::io::Error::other("simulated launch failure"))
+        }
+
+        async fn probe(&self, _session: &Registry) -> std::io::Result<NodeProfile> {
+            if self.probe_fails {
+                return Err(std::io::Error::other("simulated probe failure"));
+            }
+            Ok(self.profile.clone().unwrap_or_else(NodeProfile::unknown))
+        }
+
+        async fn activate(
             &self,
+            registry: Registry,
             _events: &dyn EventSink,
         ) -> std::io::Result<(Connection<DuplexStream>, Self::Guard)> {
-            let Some(registry) = &self.registry else {
-                return Err(std::io::Error::other("simulated launch failure"));
-            };
             let (client, server) = connection_pair(256);
-            let task = tokio::spawn(serve(server, registry.clone()));
+            let task = tokio::spawn(serve(server, registry));
             Ok((client, task))
         }
     }
@@ -702,6 +854,148 @@ mod tests {
             .unwrap();
 
         assert_eq!(out, (0..15u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn with_filter_keeps_only_compute_hosts() {
+        use crate::capability::{pred, Filter, NodeProfile, Os, Role};
+        use crate::observability::{NodeState, RunState};
+        use crate::testing::EventRecorder;
+        use std::sync::Arc;
+
+        let linux = NodeProfile {
+            os: Os::Linux,
+            cores: 8,
+            ram_mb: 16_000,
+            gpus: Vec::new(),
+        };
+        let mac = NodeProfile {
+            os: Os::MacOs,
+            cores: 8,
+            ram_mb: 16_000,
+            gpus: Vec::new(),
+        };
+
+        // A filter that keeps Linux as Compute and excludes everything else, so
+        // the macOS host is dropped before it is ever activated.
+        let filter = Filter::new().compute(pred::os_is(Os::Linux));
+        let sink = Arc::new(EventRecorder::default());
+        let launchers = vec![
+            InProcess::serving(true)
+                .named("linux")
+                .with_profile(linux.clone()),
+            InProcess::serving(true)
+                .named("mac")
+                .with_profile(mac.clone()),
+        ];
+        let fleet = Fleet::observed(launchers, sink.clone()).with_filter(filter);
+
+        let out: Vec<Result<u32, String>> = (0..8u32)
+            .net_map_with_fleet(double, &fleet)
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(out, (0..8u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+
+        let mut state = RunState::default();
+        for event in &sink.events() {
+            state.apply(event);
+        }
+        // The macOS host was profiled and excluded, never ran a task; the Linux
+        // host ran every task to completion.
+        assert_eq!(state.nodes["mac"].role, Some(Role::Excluded));
+        assert_eq!(state.nodes["mac"].completed, 0);
+        assert_eq!(state.nodes["linux"].role, Some(Role::Compute));
+        assert_eq!(state.nodes["linux"].state, NodeState::Done);
+    }
+
+    #[tokio::test]
+    async fn requires_narrows_a_run_to_matching_hosts() {
+        use crate::capability::{pred, Gpu, GpuRuntime, GpuVendor, NodeProfile, Os};
+        use crate::observability::{NodeState, RunState};
+        use crate::testing::EventRecorder;
+        use std::sync::Arc;
+
+        let rocm_box = NodeProfile {
+            os: Os::Linux,
+            cores: 32,
+            ram_mb: 128_000,
+            gpus: vec![Gpu {
+                vendor: GpuVendor::Amd,
+                runtime: Some(GpuRuntime::Rocm),
+                model: "Instinct".to_string(),
+                vram_mb: Some(65_536),
+            }],
+        };
+        let cpu_box = NodeProfile {
+            os: Os::Linux,
+            cores: 8,
+            ram_mb: 16_000,
+            gpus: Vec::new(),
+        };
+
+        let sink = Arc::new(EventRecorder::default());
+        let launchers = vec![
+            InProcess::serving(true)
+                .named("rocm")
+                .with_profile(rocm_box),
+            InProcess::serving(true).named("cpu").with_profile(cpu_box),
+        ];
+        let fleet = Fleet::observed(launchers, sink.clone());
+
+        // The job needs ROCm; only the ROCm host runs it, the CPU host is dropped.
+        let out: Vec<Result<u32, String>> = (0..6u32)
+            .net_map_with_fleet(double, &fleet)
+            .requires(pred::rocm())
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(out, (0..6u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+
+        let mut state = RunState::default();
+        for event in &sink.events() {
+            state.apply(event);
+        }
+        // The CPU host was profiled but, failing the requirement, ran nothing.
+        assert_eq!(state.nodes["cpu"].completed, 0);
+        assert_eq!(state.nodes["rocm"].state, NodeState::Done);
+    }
+
+    #[tokio::test]
+    async fn requires_errors_when_no_host_satisfies_it() {
+        use crate::capability::pred;
+
+        // The only host has no GPU, so a ROCm requirement leaves no eligible host.
+        let fleet = Fleet::new(vec![InProcess::serving(true)]);
+
+        let err = (0..4u32)
+            .net_map_with_fleet(double, &fleet)
+            .requires(pred::rocm())
+            .collect::<u32>()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no eligible host"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn netmap_drops_a_host_whose_probe_fails() {
+        // One host's probe errors (it connects but cannot be inspected); it is
+        // dropped and the survivor runs every task.
+        let launchers = vec![
+            InProcess::serving(true).named("healthy"),
+            InProcess::serving(true)
+                .named("unprobeable")
+                .probe_failing(),
+        ];
+        let fleet = Fleet::new(launchers);
+
+        let out: Vec<Result<u32, String>> = (0..6u32)
+            .net_map_with_fleet(double, &fleet)
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(out, (0..6u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
     }
 
     #[tokio::test]

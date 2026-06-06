@@ -17,8 +17,11 @@ pub fn draw(frame: &mut Frame<'_>, state: &RunState) {
         state.completed, state.total_tasks, state.failed
     ))];
     for (host, view) in &state.nodes {
+        let role = view
+            .role
+            .map_or_else(String::new, |role| format!("  {role:?}"));
         lines.push(Line::from(format!(
-            "{host}  {:?}  {}",
+            "{host}  {:?}{role}  {}",
             view.state, view.completed
         )));
     }
@@ -82,6 +85,30 @@ mod tests {
                 "leaf-a  Done  2",
                 "leaf-b  Working  1",
             ]
+        );
+    }
+
+    #[test]
+    fn tui_shows_the_role_for_a_profiled_node() {
+        use crate::capability::{NodeProfile, Os, Role};
+
+        let mut state = RunState::default();
+        let profile = NodeProfile {
+            os: Os::Linux,
+            cores: 8,
+            ram_mb: 16_000,
+            gpus: Vec::new(),
+        };
+        state.apply(&Event::RunStarted { tasks: 1 });
+        state.apply(&Event::profiled("leaf-a", profile, Role::Compute));
+        state.apply(&Event::node("leaf-a", NodeState::Working));
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 2)).unwrap();
+        terminal.draw(|frame| super::draw(frame, &state)).unwrap();
+
+        assert_eq!(
+            rows(terminal.backend().buffer()),
+            vec!["rayonet  0/1 done  0 failed", "leaf-a  Working  Compute  0"],
         );
     }
 }

@@ -10,9 +10,14 @@
 //! ```text
 //! RAYONET_HOSTS="mac localhost=~/.ssh/rayonet_localhost_ed25519" cargo run -p ssh-run
 //! ```
+//!
+//! Set `RAYONET_FILTER=no-macos` to apply a fleet role filter that excludes
+//! macOS hosts (they are profiled, then dropped before provisioning); any other
+//! value, or unset, keeps every host as compute.
 
 use std::sync::Arc;
 
+use rayonet::capability::{pred, Filter, Os, Role};
 use rayonet::fleet::{Fleet, NetMapExt};
 use rayonet::observability::{Event, EventSink};
 use rayonet::process;
@@ -25,14 +30,38 @@ fn double(x: u32) -> u32 {
 
 rayonet::embed_microcrates!();
 
-/// Prints each node's provisioning ladder so the run is visible.
+/// Prints each node's provisioning ladder and capability/role so the run is visible.
 struct Progress;
 
 impl EventSink for Progress {
     fn emit(&self, event: Event) {
-        if let Event::Node { host, state } = event {
-            println!("  {host}: {state:?}");
+        match event {
+            Event::Node { host, state } => println!("  {host}: {state:?}"),
+            Event::Profiled {
+                host,
+                profile,
+                role,
+            } => println!(
+                "  {host}: {role:?} ({:?}, {} cores, {} MB RAM, {} GPUs)",
+                profile.os,
+                profile.cores,
+                profile.ram_mb,
+                profile.gpus.len()
+            ),
+            _ => {}
         }
+    }
+}
+
+/// The fleet role filter selected by `RAYONET_FILTER`, if any.
+fn filter_from_env() -> Option<Filter> {
+    match std::env::var("RAYONET_FILTER").ok()?.as_str() {
+        "no-macos" => Some(
+            Filter::new()
+                .exclude(pred::os_is(Os::MacOs))
+                .otherwise(Role::Compute),
+        ),
+        _ => None,
     }
 }
 
@@ -75,16 +104,20 @@ async fn main() {
     assert!(!launchers.is_empty(), "RAYONET_HOSTS named no hosts");
     let hosts = launchers.len();
 
-    rayonet::install_fleet(Fleet::observed(launchers, Arc::new(Progress)));
+    let mut fleet = Fleet::observed(launchers, Arc::new(Progress));
+    if let Some(filter) = filter_from_env() {
+        println!("applying RAYONET_FILTER role policy");
+        fleet = fleet.with_filter(filter);
+    }
+    rayonet::install_fleet(fleet);
 
     println!("running across up to {hosts} host(s)...");
-    let out: Vec<Result<u32, String>> = (0..8u32)
-        .net_map(double)
-        .collect()
-        .await
-        .expect("every host failed to launch");
-
-    println!("results: {out:?}");
-    let ok = out.iter().filter(|result| result.is_ok()).count();
-    println!("{ok}/{} tasks succeeded", out.len());
+    match (0..8u32).net_map(double).collect::<u32>().await {
+        Ok(out) => {
+            println!("results: {out:?}");
+            let ok = out.iter().filter(|result| result.is_ok()).count();
+            println!("{ok}/{} tasks succeeded", out.len());
+        }
+        Err(error) => println!("run produced no results: {error}"),
+    }
 }

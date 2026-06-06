@@ -13,11 +13,12 @@ use std::sync::Arc;
 use openssh::{ChildStdin, ChildStdout, KnownHosts, Session, SessionBuilder, Stdio};
 use tokio::io::{join, AsyncWriteExt, Join};
 
+use crate::capability::NodeProfile;
 use crate::fleet::Launch;
 use crate::framing::Connection;
 use crate::observability::EventSink;
 use crate::process::AGENT_ENV;
-use crate::provisioning::{provision, CommandOutput, Remote};
+use crate::provisioning::{probe, provision, CommandOutput, Remote};
 
 /// Map an openssh error into the crate's uniform `io::Error` result type.
 fn to_io(error: openssh::Error) -> io::Error {
@@ -213,6 +214,7 @@ impl Ssh {
 impl Launch for Ssh {
     type Stream = Join<ChildStdout, ChildStdin>;
     type Guard = openssh::Child<Arc<Session>>;
+    type Session = Arc<Session>;
 
     fn label(&self) -> String {
         self.config.port.map_or_else(
@@ -221,11 +223,22 @@ impl Launch for Ssh {
         )
     }
 
-    async fn launch(
+    async fn connect(&self) -> io::Result<Arc<Session>> {
+        Ok(Arc::new(self.config.connect().await?))
+    }
+
+    async fn probe(&self, session: &Arc<Session>) -> io::Result<NodeProfile> {
+        let remote = SshRemote {
+            session: Arc::clone(session),
+        };
+        probe(&remote).await
+    }
+
+    async fn activate(
         &self,
+        session: Arc<Session>,
         events: &dyn EventSink,
     ) -> io::Result<(Connection<Self::Stream>, Self::Guard)> {
-        let session = Arc::new(self.config.connect().await?);
         let binary_path = match &self.source {
             AgentSource::Prebuilt(path) => path.clone(),
             AgentSource::Build {

@@ -5,6 +5,7 @@
 //! `cargo test -- --include-ignored` on a host where this user can ssh into
 //! itself with the `rayonet_localhost_ed25519` key (CI sets that up).
 
+use rayonet::capability::Os;
 use rayonet::coordinator::run_job;
 use rayonet::fleet::Launch;
 use rayonet::observability::{NodeState, NoopSink};
@@ -59,7 +60,15 @@ async fn ssh_launch_runs_a_task_end_to_end() {
         "localhost:2222"
     );
 
-    let (connection, guard) = ssh.launch(&NoopSink).await.unwrap();
+    let session = ssh.connect().await.unwrap();
+
+    // Probing the real localhost reports a usable profile (this host runs the
+    // CI, so it is Linux with at least one core).
+    let profile = ssh.probe(&session).await.unwrap();
+    assert_eq!(profile.os, Os::Linux);
+    assert!(profile.cores >= 1, "{profile:?}");
+
+    let (connection, guard) = ssh.activate(session, &NoopSink).await.unwrap();
     let out: Vec<Result<u32, String>> = run_job(
         vec![("localhost".to_string(), connection)],
         "double",
@@ -125,7 +134,8 @@ async fn ssh_build_with_warm_cache_provisions_and_runs() {
     let events = Recorder::default();
     let ssh = Ssh::build(config, tar, "stable", "rayonet-test-agent");
 
-    let (connection, guard) = ssh.launch(&events).await.unwrap();
+    let session = ssh.connect().await.unwrap();
+    let (connection, guard) = ssh.activate(session, &events).await.unwrap();
     let out: Vec<Result<u32, String>> = run_job(
         vec![("rayonet-local".to_string(), connection)],
         "double",

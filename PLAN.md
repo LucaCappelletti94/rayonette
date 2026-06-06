@@ -164,14 +164,17 @@ Builds the relay tree of `DECISIONS.md` 32-43. The cross-phase criteria above st
 
 **Deliverables:**
 - A `NodeProfile` with a stable core (OS, cores, RAM) plus extensible capability lists, notably `gpus: Vec<Gpu>` carrying vendor + runtime (`Cuda` / `Rocm` / `Metal`) + model + VRAM. Probed cross-platform (`uname`, core count, total RAM, GPU via `nvidia-smi` / `rocminfo` / `system_profiler`).
-- A `Role` enum (`Compute` / `RelayOnly` / `Excluded`), a consumer filter `Fn(&NodeProfile) -> Role` (plain Rust, fully chainable), and a starter library of composable capability predicates.
-- The plain renderer and TUI show each host's profile and role.
-- `Excluded` hosts get no tasks.
+- A first-class composable `Predicate` (an `Arc`-boxed `Fn(&NodeProfile) -> bool` with `and` / `or` / `negate` and constructors `cuda()`, `rocm()`, `metal()`, `os_is`, `ram_at_least_gb`, `vram_at_least_gb`, `cores_at_least`).
+- A `Role` enum (`Compute` / `RelayOnly` / `Excluded`) and a `Filter` rule-builder over the predicates (`Filter::new().relay_only(..).compute(..).otherwise(Role)`, first-match-wins, default `Excluded`), applied to a fleet with `Fleet::with_filter`.
+- A per-run `net_map(task).requires(predicate)` that narrows a run to the compute hosts whose profile satisfies the predicate, sharing the same vocabulary as the fleet filter.
+- The `Launch` trait split into connect / probe / activate, so a host is probed and filtered before the expensive provisioning step.
+- An `Event::Profiled { host, profile, role }`, surfaced by the plain renderer and the TUI alongside each host's state.
+- `Excluded` (and `RelayOnly`) hosts get no tasks in the flat star; a job requirement no host meets fails with a no-eligible-host error.
 
 **Tests**
 - Profile parsing for linux and macOS fixture command outputs.
-- The filter assigns roles, an `Excluded` host receives no work, and a compute-only fleet still completes.
-- A capability predicate (RAM/GPU threshold) keeps and drops the expected hosts.
+- `with_filter` assigns roles, a non-`Compute` host receives no work, and a compute-only fleet still completes.
+- A capability predicate (RAM/GPU threshold) keeps and drops the expected hosts, both as a fleet `Filter` and as a per-run `requires`.
 
 **Done when:** a run across named hosts keeps or drops each by a capability predicate, still over the flat star.
 

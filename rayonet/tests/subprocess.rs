@@ -59,7 +59,8 @@ async fn subprocess_launcher_connects_and_runs() {
     let launcher = Subprocess::command(env!("CARGO_BIN_EXE_rayonet-test-agent"));
     assert!(format!("{launcher:?}").contains("Subprocess"));
 
-    let (connection, _guard) = launcher.launch(&NoopSink).await.expect("launch");
+    let () = launcher.connect().await.expect("connect");
+    let (connection, _guard) = launcher.activate((), &NoopSink).await.expect("activate");
     let out: Vec<Result<u32, String>> =
         run_job(solo(connection), "double", (0..5u32).collect(), &NoopSink)
             .await
