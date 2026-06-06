@@ -151,3 +151,128 @@ CI runs all four (decision 29).
 - Every phase is TDD: failing tests first, shown failing, then implemented to green.
 - No phase is "done" with a red suite, a clippy warning, or unformatted code.
 - Deferred items (`DECISIONS.md` "Open and deferred") are out of scope for v1 phases and must not be smuggled in mid-phase; note them and move on.
+
+---
+
+## Relay tree (v2): phases R1-R7
+
+Builds the relay tree of `DECISIONS.md` 32-43. The cross-phase criteria above still hold. v1 (Phases 0-7) is the degenerate depth-1 case and stays working throughout, and each phase below keeps the flat-star path green.
+
+### R1 - Capability profiles and the role filter (still flat)
+
+**Goal:** the coordinator picks workers by capability, no tree yet.
+
+**Deliverables:**
+- A `NodeProfile` with a stable core (OS, cores, RAM) plus extensible capability lists, notably `gpus: Vec<Gpu>` carrying vendor + runtime (`Cuda` / `Rocm` / `Metal`) + model + VRAM. Probed cross-platform (`uname`, core count, total RAM, GPU via `nvidia-smi` / `rocminfo` / `system_profiler`).
+- A `Role` enum (`Compute` / `RelayOnly` / `Excluded`), a consumer filter `Fn(&NodeProfile) -> Role` (plain Rust, fully chainable), and a starter library of composable capability predicates.
+- The plain renderer and TUI show each host's profile and role.
+- `Excluded` hosts get no tasks.
+
+**Tests**
+- Profile parsing for linux and macOS fixture command outputs.
+- The filter assigns roles, an `Excluded` host receives no work, and a compute-only fleet still completes.
+- A capability predicate (RAM/GPU threshold) keeps and drops the expected hosts.
+
+**Done when:** a run across named hosts keeps or drops each by a capability predicate, still over the flat star.
+
+### R2 - Single relay level (depth-2)
+
+**Goal:** one tier of relays, decentralized children, central DAG.
+
+**Deliverables:**
+- The relay role: a node serves its parent and runs a sub-fleet read from its local children file.
+- The discovery pass: node identity (host-key fingerprint, with a visited-set so the walk cannot loop), profiles, and link latency flow up, and the coordinator builds a depth-2 `geometric-traits` CSR DAG. Each node has a single path here, so no path metric applies yet.
+- Demand-pull flow control at the relay boundary.
+- `RelayOnly` honored (relays forward, they do not compute).
+- The provisioning cascade: a relay ships the source it holds to its compute children and builds them.
+- No redundancy yet, so a relay's death fails its subtree (until R5).
+
+**Tests**
+- In-process recursive transport: coordinator -> one relay -> two leaves returns correct ordered results.
+- A `RelayOnly` relay runs zero tasks, and its leaves run them all.
+- Demand-pull keeps a relay's subtree busy (more than one task in flight beneath it).
+- Cascaded provisioning ships and builds on the leaf, not just the relay.
+
+**Done when:** a job runs coordinator -> relay -> leaves with the relay's children defined only on the relay.
+
+### R3 - Arbitrary depth
+
+**Goal:** recursion to any depth.
+
+**Deliverables:**
+- A relay's child may itself be a relay.
+- DAG assembly and `Kahn` ordering generalize to N levels (still one path per node, so no metric yet).
+- Nothing in R2 assumes depth 2.
+
+**Tests**
+- An in-process three-level tree returns correct ordered results.
+- Topological order is respected in provisioning.
+- A mid-tree `RelayOnly` node forwards through to deeper compute.
+
+**Done when:** depth is unbounded and proven at three levels in-process.
+
+### R4 - Observability and the TUI tree
+
+**Goal:** the coordinator's view and the TUI show the whole graph.
+
+**Deliverables:**
+- Events carry node id and parent link, propagating up the tree into the coordinator's `RunState`, now a graph.
+- The TUI renders the DAG (roots/sinks for layout) with each node's role, profile, and live state.
+- The plain renderer prints an indented tree.
+
+**Tests**
+- Events from a deep node reach the coordinator's state with correct attribution.
+- `RunState` reduces a multi-level event stream into the correct graph.
+- A structure test of the rendered tree (roles, parent links, states).
+
+**Done when:** a multi-level run shows its full topology and live state in the TUI.
+
+### R5 - Redundant paths and reroute
+
+**Goal:** the strong fault guarantee back, via alternate paths.
+
+**Deliverables:**
+- Multi-parent topology (a node listed under two relays) with identity-based dedup.
+- Primary and standby path selection by the per-run metric (widest-path bandwidth by default, or shortest-path latency), with the bandwidth probe run during discovery only when that metric is selected.
+- Articulation-point / bridge analysis flagging single points of failure, and an optional filter that requires redundancy for compute.
+- On a relay's death, reroute its orphaned-but-reachable subtree onto standbys (`ConnectedComponents` + path recompute), exactly-once preserved by dedup.
+- Tasks stranded behind a dead articulation relay fail clearly.
+
+**Tests**
+- Proptest over random DAGs: every task completes exactly once, in input order, despite an induced relay kill, as long as a path survives.
+- A stranded subtree (articulation relay killed) reports its tasks failed, never lost or duplicated.
+- Dedup: a node reached by two paths is provisioned and assigned exactly once.
+
+**Done when:** any node a survivor can still reach keeps working through any single relay's death.
+
+### R6 - Elastic membership (join mid-run)
+
+**Goal:** a long run absorbs machines that come online after it started, the mirror of R5's leave path.
+
+**Deliverables:**
+- Re-entrant discovery: the coordinator retries unreachable candidates and re-reads children files on a backoff, not only once up front.
+- A newly-answering node is probed, role-assigned, provisioned (cache hit if previously built), spliced into the live DAG (CSR rebuilt), and begins pulling pending tasks.
+- Speculative re-execution, opt-in per run and off by default: when no tasks are pending but some straggle, an idle or fresh node may race a straggler, first result wins via dedup.
+- The TUI shows nodes appearing live.
+
+**Tests**
+- In-process: a node unavailable at start, made available mid-run, picks up pending tasks and the run completes correctly.
+- A join neither duplicates nor loses results (dedup holds).
+- Speculative re-run: a straggler raced by a faster node yields exactly one recorded result.
+
+**Done when:** a run started with N nodes finishes having used N+k after k machines joined mid-run, with correct dedup.
+
+### R7 - Real-world validation
+
+**Goal:** prove it on segmented, multi-level, redundant, elastic hardware.
+
+**Deliverables:**
+- A docker (and a real-host) scenario: coordinator -> a `RelayOnly` gateway -> compute leaves on the gateway's private network defined only on the gateway, with a redundant second gateway path.
+- The TUI showing the live DAG.
+- An induced gateway kill mid-run that reroutes, and a machine joining mid-run that is picked up, both completing with correct deduplicated results.
+
+**Tests**
+- The docker segmented-network scenario runs in CI and asserts correct results through a gateway kill and a mid-run join.
+- A documented real run: coordinator -> Mac (`RelayOnly`) -> Mac-LAN leaves (`Compute`), with a node brought online mid-run.
+
+**Done when:** a segmented, multi-level, redundant, elastic fleet completes a job correctly through a relay failure and a mid-run join, end to end.
