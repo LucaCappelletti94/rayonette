@@ -225,17 +225,21 @@ Builds the relay tree of `DECISIONS.md` 32-43. The cross-phase criteria above st
 
 **Goal:** the coordinator's view and the TUI show the whole graph.
 
-**Deliverables:**
-- Events carry node id and parent link, propagating up the tree into the coordinator's `RunState`, now a graph.
-- The TUI renders the DAG (roots/sinks for layout) with each node's role, profile, and live state.
-- The plain renderer prints an indented tree.
+**Deliverables (delivered):**
+- A `FromAgent::Observe(Event)` uplink: a relay reports each child's `Profiled` and `Node` lifecycle up, and a grandchild's event is prefixed by the child's label at each hop, so node ids are paths from the root (`relay/leaf`) and the parent is the path prefix. No node-id handshake.
+- `RunState` keyed by path id is a tree: `parent_of` / `depth` / `leaf_of` free functions and `RunState::roots` / `children_of` read the structure off the ids. The coordinator drains trailing subtree observability on teardown so the final view is complete.
+- The TUI and the plain renderer indent each node by its depth, showing the leaf label, role, and live state.
+
+**Scoped out (deferred):**
+- Per-task attribution to the exact deep leaf (the flat-star tally stays at the coordinator's direct children); a later refinement.
+- The `geometric-traits` CSR graph and roots/sinks layout: the path-id tree renders directly, and the CSR graph lands in R5 where redundancy/articulation analysis consume it.
 
 **Tests**
-- Events from a deep node reach the coordinator's state with correct attribution.
-- `RunState` reduces a multi-level event stream into the correct graph.
-- A structure test of the rendered tree (roles, parent links, states).
+- A scripted relay-like agent's `Observe` is re-emitted at the coordinator with a prefixed host; an in-process coordinator -> relay -> leaves run leaves the deep leaves in `RunState` with role and a terminal state.
+- Path ids form a tree (`parent_of` / `roots` / `children_of`).
+- A structure test of the rendered tree (plain and TUI), indented by depth with roles and states.
 
-**Done when:** a multi-level run shows its full topology and live state in the TUI.
+**Done when:** a multi-level run shows its full topology and live state in the TUI. (Met: the in-process tree tests, plus a real coordinator -> relay -> leaf run printing the indented tree.)
 
 ### R5 - Redundant paths and reroute
 

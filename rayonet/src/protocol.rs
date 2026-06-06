@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped when the wire protocol changes. Because the agent is compiled from the
 /// same source as the coordinator (whole-crate compile), this is a sanity
 /// assertion rather than a true negotiation.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Identifies a task within a run.
 pub type TaskId = u64;
@@ -61,11 +61,18 @@ pub enum FromAgent {
         /// Captured panic message.
         error: String,
     },
+    /// An observability event about this agent's subtree, forwarded up so the
+    /// top coordinator can see the whole tree. A relay sends these for its
+    /// children (and passes its grandchildren's up); a leaf never sends one. The
+    /// receiver prefixes the event's host with the sending child's label, so the
+    /// host becomes a path from the root (the parent is the path prefix).
+    Observe(crate::observability::Event),
 }
 
 #[cfg(test)]
 mod tests {
     use super::{FromAgent, ToAgent, PROTOCOL_VERSION};
+    use crate::observability::{Event, NodeState};
     use proptest::prelude::*;
 
     fn roundtrip_to_agent(msg: &ToAgent) {
@@ -110,6 +117,7 @@ mod tests {
                 task_id: 9,
                 error: "panicked at 'boom'".to_string(),
             },
+            FromAgent::Observe(Event::node("relay/leaf", NodeState::Working)),
         ] {
             roundtrip_from_agent(&msg);
         }
@@ -137,6 +145,7 @@ mod tests {
                 .prop_map(|(task_id, output)| FromAgent::Completed { task_id, output }),
             (any::<u64>(), any::<String>())
                 .prop_map(|(task_id, error)| FromAgent::Failed { task_id, error }),
+            any::<usize>().prop_map(|tasks| FromAgent::Observe(Event::RunStarted { tasks })),
         ]
     }
 

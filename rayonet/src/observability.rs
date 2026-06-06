@@ -100,6 +100,20 @@ impl Event {
             role,
         }
     }
+
+    /// Prepend `prefix/` to this event's host, turning a relay's local child
+    /// label into a path from the root as the event is forwarded up one hop.
+    /// [`Event::RunStarted`] has no host and is left unchanged.
+    pub fn prefix_host(&mut self, prefix: &str) {
+        let host = match self {
+            Self::Node { host, .. }
+            | Self::Profiled { host, .. }
+            | Self::TaskStarted { host, .. }
+            | Self::TaskFinished { host, .. } => host,
+            Self::RunStarted { .. } => return,
+        };
+        *host = format!("{prefix}/{host}");
+    }
 }
 
 /// A consumer of the observability event stream.
@@ -147,6 +161,26 @@ impl EventSink for EventBus {
         // receivers, which is fine; lagging receivers drop on their own end.
         let _ = self.sender.send(event);
     }
+}
+
+/// The parent of a path id (everything before the last `/`), or `None` for a
+/// top-level node. Node ids are `/`-joined paths from the root, so the tree
+/// structure is read straight off the id.
+#[must_use]
+pub fn parent_of(id: &str) -> Option<&str> {
+    id.rsplit_once('/').map(|(parent, _)| parent)
+}
+
+/// A path id's depth: the number of `/` separators (0 for a top-level node).
+#[must_use]
+pub fn depth(id: &str) -> usize {
+    id.bytes().filter(|&b| b == b'/').count()
+}
+
+/// The last segment of a path id (the node's own label), for display.
+#[must_use]
+pub fn leaf_of(id: &str) -> &str {
+    id.rsplit_once('/').map_or(id, |(_, leaf)| leaf)
 }
 
 /// The live, reduced picture of a run: per-node state and task tallies.
@@ -206,6 +240,26 @@ impl RunState {
         }
     }
 
+    /// The top-level nodes (the coordinator's direct children), in id order.
+    #[must_use]
+    pub fn roots(&self) -> Vec<&str> {
+        self.nodes
+            .keys()
+            .filter(|id| parent_of(id).is_none())
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// The direct children of `id`, in id order.
+    #[must_use]
+    pub fn children_of(&self, id: &str) -> Vec<&str> {
+        self.nodes
+            .keys()
+            .filter(|child| parent_of(child) == Some(id))
+            .map(String::as_str)
+            .collect()
+    }
+
     /// The view for `host`, created (defaulting to [`NodeState::Working`]) on
     /// first sighting if a task event arrives before any node-state event.
     fn node(&mut self, host: &str) -> &mut NodeView {
@@ -237,13 +291,19 @@ impl PlainRenderer {
         self.state.apply(event);
         match event {
             Event::RunStarted { tasks } => Some(format!("run started: {tasks} tasks")),
-            Event::Node { host, state } => Some(format!("{host}: {state:?}")),
+            Event::Node { host, state } => Some(format!(
+                "{}{}: {state:?}",
+                "  ".repeat(depth(host)),
+                leaf_of(host)
+            )),
             Event::Profiled {
                 host,
                 profile,
                 role,
             } => Some(format!(
-                "{host}: {role:?} ({:?}, {} cores, {} MB RAM, {} GPUs)",
+                "{}{}: {role:?} ({:?}, {} cores, {} MB RAM, {} GPUs)",
+                "  ".repeat(depth(host)),
+                leaf_of(host),
                 profile.os,
                 profile.cores,
                 profile.ram_mb,
@@ -286,6 +346,28 @@ mod tests {
         let mut live = bus.subscribe();
         bus.emit(Event::RunStarted { tasks: 7 });
         assert_eq!(live.recv().await.unwrap(), Event::RunStarted { tasks: 7 });
+    }
+
+    #[test]
+    fn path_ids_form_a_tree() {
+        use super::{depth, parent_of};
+        assert_eq!(parent_of("a"), None);
+        assert_eq!(parent_of("a/b"), Some("a"));
+        assert_eq!(parent_of("a/b/c"), Some("a/b"));
+        assert_eq!(depth("a"), 0);
+        assert_eq!(depth("a/b/c"), 2);
+    }
+
+    #[test]
+    fn run_state_exposes_roots_and_children() {
+        let mut state = RunState::default();
+        for id in ["a", "a/b", "a/c", "a/b/d", "e"] {
+            state.apply(&Event::node(id, NodeState::Working));
+        }
+        assert_eq!(state.roots(), vec!["a", "e"]);
+        assert_eq!(state.children_of("a"), vec!["a/b", "a/c"]);
+        assert_eq!(state.children_of("a/b"), vec!["a/b/d"]);
+        assert!(state.children_of("e").is_empty());
     }
 
     #[test]
@@ -373,6 +455,21 @@ mod tests {
                 "progress: 2/3",
                 "leaf-a: Done",
             ]
+        );
+    }
+
+    #[test]
+    fn plain_renderer_indents_a_multi_level_tree() {
+        let mut renderer = super::PlainRenderer::new();
+        let script = [
+            Event::node("relay", NodeState::Ready),
+            Event::node("relay/leaf-a", NodeState::Working),
+            Event::node("relay/leaf-a", NodeState::Done),
+        ];
+        let lines: Vec<String> = script.iter().filter_map(|e| renderer.render(e)).collect();
+        assert_eq!(
+            lines,
+            vec!["relay: Ready", "  leaf-a: Working", "  leaf-a: Done"]
         );
     }
 

@@ -25,7 +25,7 @@ use crate::protocol::{FromAgent, TaskId, ToAgent, PROTOCOL_VERSION};
 /// relay (`crate::relay`), which reuses [`connect_agents`] and the same reader
 /// channel to multiplex its children.
 pub(crate) enum Event {
-    Message(FromAgent),
+    Message(usize, FromAgent),
     Lost(usize),
 }
 
@@ -45,7 +45,7 @@ where
                 let _ = events.send(Event::Lost(agent));
                 break;
             };
-            let _ = events.send(Event::Message(msg));
+            let _ = events.send(Event::Message(agent, msg));
         }
     })
 }
@@ -285,14 +285,14 @@ where
     while job.remaining > 0 {
         let event = events_rx.recv().await;
         match event {
-            Some(Event::Message(FromAgent::Ready { .. })) => {
+            Some(Event::Message(_, FromAgent::Ready { .. })) => {
                 // Ready is a handshake message; a second one is a protocol error.
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "agent sent Ready more than once",
                 ));
             }
-            Some(Event::Message(FromAgent::Started { task_id })) => {
+            Some(Event::Message(_, FromAgent::Started { task_id })) => {
                 if let Some((agent, _)) = job.assigned.get(&task_id) {
                     events.emit(Obs::TaskStarted {
                         host: labels[*agent].clone(),
@@ -300,15 +300,22 @@ where
                     });
                 }
             }
-            Some(Event::Message(FromAgent::Completed { task_id, output })) => {
+            Some(Event::Message(_, FromAgent::Completed { task_id, output })) => {
                 // The raw bytes are kept as-is; decoding happens in the typed
                 // layer, so a `Completed` is `ok` at the protocol level here.
                 job.finish(task_id, Ok(output), true, &labels, events)
                     .await?;
             }
-            Some(Event::Message(FromAgent::Failed { task_id, error })) => {
+            Some(Event::Message(_, FromAgent::Failed { task_id, error })) => {
                 job.finish(task_id, Err(error), false, &labels, events)
                     .await?;
+            }
+            // A subtree event from a relay child: prefix its host with that
+            // child's label so it carries a full path from the root, then
+            // re-emit it so the whole tree surfaces in the run's event stream.
+            Some(Event::Message(agent, FromAgent::Observe(mut event))) => {
+                event.prefix_host(&labels[agent]);
+                events.emit(event);
             }
             // A dropped or erroring agent is abandoned: mark it lost, requeue
             // its in-flight tasks, and let the survivors absorb them. The run
@@ -344,6 +351,15 @@ where
     for agent in 0..job.senders.len() {
         if job.alive[agent] {
             let _ = job.senders[agent].send(&ToAgent::Shutdown).await;
+        }
+    }
+    // Drain trailing subtree observability before the readers end: a relay
+    // flushes its children's final states (their `Done`) as it shuts down, so
+    // re-emitting these completes the tree view. Other late messages are ignored.
+    while let Some(event) = events_rx.recv().await {
+        if let Event::Message(agent, FromAgent::Observe(mut observed)) = event {
+            observed.prefix_host(&labels[agent]);
+            events.emit(observed);
         }
     }
     for reader in readers {
@@ -666,6 +682,56 @@ mod tests {
                 Ok(())
             })?;
         }
+    }
+
+    #[tokio::test]
+    async fn a_subtree_observe_is_reemitted_with_a_prefixed_host() {
+        use crate::observability::{Event as Obs, NodeState, RunState};
+        use crate::protocol::FromAgent;
+        use crate::testing::EventRecorder;
+
+        // A relay-like agent reports a subtree node via Observe; the coordinator
+        // re-emits it with the host prefixed by the agent's label, so the deep
+        // node appears in the run state at its full path.
+        let (client, server) = connection_pair(256);
+        let fake = tokio::spawn(async move {
+            let (mut tx, mut rx) = server.split();
+            let _hello: ToAgent = rx.recv().await.unwrap().unwrap();
+            tx.send(&FromAgent::Ready { slots: 1 }).await.unwrap();
+            tx.send(&FromAgent::Observe(Obs::node("leaf", NodeState::Working)))
+                .await
+                .unwrap();
+            tx.send(&FromAgent::Observe(Obs::node("leaf", NodeState::Done)))
+                .await
+                .unwrap();
+            let _assign: ToAgent = rx.recv().await.unwrap().unwrap();
+            tx.send(&FromAgent::Completed {
+                task_id: 0,
+                output: postcard::to_allocvec(&0u32).unwrap(),
+            })
+            .await
+            .unwrap();
+            let _shutdown: ToAgent = rx.recv().await.unwrap().unwrap();
+        });
+
+        let recorder = EventRecorder::default();
+        let out: Vec<Result<u32, String>> = run_job(
+            vec![("relay".to_string(), client)],
+            "k",
+            vec![7u32],
+            &recorder,
+        )
+        .await
+        .unwrap();
+        fake.await.unwrap();
+        assert_eq!(out.len(), 1);
+
+        let mut state = RunState::default();
+        for event in &recorder.events() {
+            state.apply(event);
+        }
+        // The subtree node surfaces at its full path with its last reported state.
+        assert_eq!(state.nodes["relay/leaf"].state, NodeState::Done);
     }
 
     #[tokio::test]

@@ -8,9 +8,10 @@ use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::observability::RunState;
+use crate::observability::{depth, leaf_of, RunState};
 
-/// Draw the current run state into `frame`: a summary header and a row per node.
+/// Draw the current run state into `frame`: a summary header and one row per
+/// node, indented by its depth so the tree's shape is visible.
 pub fn draw(frame: &mut Frame<'_>, state: &RunState) {
     let mut lines = vec![Line::from(format!(
         "rayonet  {}/{} done  {} failed",
@@ -21,8 +22,11 @@ pub fn draw(frame: &mut Frame<'_>, state: &RunState) {
             .role
             .map_or_else(String::new, |role| format!("  {role:?}"));
         lines.push(Line::from(format!(
-            "{host}  {:?}{role}  {}",
-            view.state, view.completed
+            "{}{}  {:?}{role}  {}",
+            "  ".repeat(depth(host)),
+            leaf_of(host),
+            view.state,
+            view.completed
         )));
     }
     frame.render_widget(Paragraph::new(lines), frame.area());
@@ -85,6 +89,32 @@ mod tests {
                 "leaf-a  Done  2",
                 "leaf-b  Working  1",
             ]
+        );
+    }
+
+    #[test]
+    fn tui_indents_a_multi_level_tree() {
+        let mut state = RunState::default();
+        for event in [
+            Event::RunStarted { tasks: 4 },
+            Event::node("relay", NodeState::Working),
+            Event::node("relay/leaf-a", NodeState::Working),
+            Event::node("relay/leaf-b", NodeState::Done),
+        ] {
+            state.apply(&event);
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 4)).unwrap();
+        terminal.draw(|frame| super::draw(frame, &state)).unwrap();
+
+        assert_eq!(
+            rows(terminal.backend().buffer()),
+            vec![
+                "rayonet  0/4 done  0 failed",
+                "relay  Working  0",
+                "  leaf-a  Working  0",
+                "  leaf-b  Done  0",
+            ],
         );
     }
 

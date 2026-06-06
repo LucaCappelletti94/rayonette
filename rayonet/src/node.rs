@@ -13,7 +13,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::agent::{serve, Registry};
 use crate::framing::Connection;
-use crate::observability::{EventSink, NoopSink};
 use crate::process::agent_connection;
 use crate::relay::relay;
 use crate::ssh::{parse_host_list, Ssh, SshConfig};
@@ -77,7 +76,6 @@ async fn dispatch<P>(
     parent: Connection<P>,
     children: Vec<SshConfig>,
     config: NodeConfig,
-    events: &dyn EventSink,
 ) -> io::Result<()>
 where
     P: AsyncRead + AsyncWrite + Unpin + Send,
@@ -85,25 +83,26 @@ where
     if children.is_empty() {
         serve(parent, config.registry).await
     } else {
-        relay(parent, child_launchers(children, &config), events).await
+        relay(parent, child_launchers(children, &config)).await
     }
 }
 
-/// Run this node in agent mode over its stdio: a leaf if it has no children file,
-/// else a relay over the children it names. Call from the consumer's `main` when
-/// [`crate::process::is_agent`] is true.
+/// Run this node in agent mode over its stdio.
+///
+/// A leaf if it has no children file, else a relay over the children it names
+/// (which reports its subtree's state up to its parent). Call from the
+/// consumer's `main` when [`crate::process::is_agent`] is true.
 ///
 /// # Errors
 /// Returns an error on a protocol violation or a transport failure.
 pub async fn run_node(config: NodeConfig) -> io::Result<()> {
-    dispatch(agent_connection(), load_children(), config, &NoopSink).await
+    dispatch(agent_connection(), load_children(), config).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::{child_launchers, children_path, dispatch, load_children, NodeConfig};
     use crate::agent::{handler, Registry};
-    use crate::observability::NoopSink;
     use crate::protocol::{FromAgent, ToAgent, PROTOCOL_VERSION};
     use crate::ssh::{parse_host_list, SshConfig};
     use crate::testing::connection_pair;
@@ -160,7 +159,7 @@ mod tests {
         // With no children, dispatch serves the registry directly over `parent`.
         let registry = Registry::new().with("double", handler(|x: u32| x * 2));
         let (coord, node_side) = connection_pair(256);
-        let node = dispatch(node_side, Vec::new(), config(registry), &NoopSink);
+        let node = dispatch(node_side, Vec::new(), config(registry));
         let driver = async {
             let (mut tx, mut rx) = coord.split();
             tx.send(&ToAgent::Hello {
@@ -201,7 +200,7 @@ mod tests {
         // usable child and errors: this drives the relay branch of dispatch.
         let children = vec![SshConfig::new("rayonet-child.invalid")];
         let (coord, node_side) = connection_pair(256);
-        let node = dispatch(node_side, children, config(Registry::new()), &NoopSink);
+        let node = dispatch(node_side, children, config(Registry::new()));
         let driver = async {
             let (mut tx, _rx) = coord.split();
             tx.send(&ToAgent::Hello {

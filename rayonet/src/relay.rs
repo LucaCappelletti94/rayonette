@@ -19,13 +19,28 @@ use crate::agent::recv_hello;
 use crate::coordinator::{connect_agents, Agents, Event as ChildEvent};
 use crate::fleet::{launch_all, Launch, Launched};
 use crate::framing::{Connection, Sender};
-use crate::observability::EventSink;
+use crate::observability::{Event, EventSink, NodeState};
 use crate::protocol::{FromAgent, TaskId, ToAgent};
+
+/// An [`EventSink`] that forwards each event onto the relay's uplink channel, so
+/// a child's observability (its `Profiled` and provisioning ladder) can be sent
+/// up to the parent from the relay's async loop (the sink's `emit` is sync).
+struct UplinkSink {
+    tx: mpsc::UnboundedSender<Event>,
+}
+
+impl EventSink for UplinkSink {
+    fn emit(&self, event: Event) {
+        let _ = self.tx.send(event);
+    }
+}
 
 /// The relay's child-side scheduling state: which child holds each in-flight
 /// task, how loaded each child is against its capacity, and the pending backlog.
 struct Relay<S> {
     senders: Vec<Sender<S>>,
+    /// Each child's local label, used to attribute its observability events.
+    labels: Vec<String>,
     /// Each child's advertised capacity (slots it can hold in flight).
     capacity: Vec<usize>,
     /// Whether each child is still up; a lost one takes no more tasks.
@@ -36,26 +51,41 @@ struct Relay<S> {
     pending: VecDeque<(TaskId, Vec<u8>)>,
     /// `task_id` -> (child, payload), kept so a lost child's work can be requeued.
     inflight: HashMap<TaskId, (usize, Vec<u8>)>,
+    /// Subtree observability events queued for the parent (drained by the loop).
+    uplink: mpsc::UnboundedSender<Event>,
 }
 
 impl<S> Relay<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    fn new(senders: Vec<Sender<S>>, capacity: Vec<usize>) -> Self {
+    fn new(
+        senders: Vec<Sender<S>>,
+        labels: Vec<String>,
+        capacity: Vec<usize>,
+        uplink: mpsc::UnboundedSender<Event>,
+    ) -> Self {
         let n = senders.len();
         Self {
             senders,
+            labels,
             capacity,
             alive: vec![true; n],
             load: vec![0; n],
             pending: VecDeque::new(),
             inflight: HashMap::new(),
+            uplink,
         }
     }
 
+    /// Queue a node-state event for `child` to be reported up to the parent.
+    fn report(&self, child: usize, state: NodeState) {
+        let _ = self.uplink.send(Event::node(&self.labels[child], state));
+    }
+
     /// Hand pending tasks to children with a free slot, first free child first,
-    /// until no task or no free slot is left.
+    /// until no task or no free slot is left. A child going from idle to busy is
+    /// reported as `Working`.
     async fn dispatch(&mut self) -> io::Result<()> {
         while !self.pending.is_empty() {
             let Some(child) =
@@ -64,6 +94,7 @@ where
                 return Ok(());
             };
             let (task_id, payload) = self.pending.pop_front().expect("pending is non-empty");
+            let was_idle = self.load[child] == 0;
             self.senders[child]
                 .send(&ToAgent::Assign {
                     task_id,
@@ -72,18 +103,20 @@ where
                 .await?;
             self.load[child] += 1;
             self.inflight.insert(task_id, (child, payload));
+            if was_idle {
+                self.report(child, NodeState::Working);
+            }
         }
         Ok(())
     }
 
-    /// Record a child's terminal outcome, freeing its slot. Returns `false` for
-    /// an unknown `task_id` (a duplicate already resolved), so it is not forwarded.
-    fn on_terminal(&mut self, task_id: TaskId) -> bool {
-        let Some((child, _)) = self.inflight.remove(&task_id) else {
-            return false;
-        };
+    /// Record a child's terminal outcome, freeing its slot. Returns the freed
+    /// child, or `None` for an unknown `task_id` (a duplicate already resolved),
+    /// which is not forwarded.
+    fn on_terminal(&mut self, task_id: TaskId) -> Option<usize> {
+        let (child, _) = self.inflight.remove(&task_id)?;
         self.load[child] -= 1;
-        true
+        Some(child)
     }
 
     /// Mark a child lost and requeue its in-flight tasks onto the front of the
@@ -102,13 +135,15 @@ where
             }
         }
         self.load[child] = 0;
+        self.report(child, NodeState::Lost);
     }
 
-    /// Shut the live children down cleanly.
+    /// Shut the live children down cleanly, reporting each `Done`.
     async fn shutdown(&mut self) {
-        for (child, sender) in self.senders.iter_mut().enumerate() {
+        for child in 0..self.senders.len() {
             if self.alive[child] {
-                let _ = sender.send(&ToAgent::Shutdown).await;
+                self.report(child, NodeState::Done);
+                let _ = self.senders[child].send(&ToAgent::Shutdown).await;
             }
         }
     }
@@ -125,13 +160,14 @@ where
 /// the relay tears down so the parent requeues the whole subtree (no redundancy
 /// in R2).
 ///
+/// Subtree observability flows up too: the relay reports each child's role,
+/// profile, and lifecycle state to the parent as `Observe` events (prefixing a
+/// grandchild's path with the child's label), so the top coordinator sees the
+/// whole tree.
+///
 /// # Errors
 /// Returns an error on a protocol violation or a transport failure on either side.
-pub async fn relay<P, L>(
-    parent: Connection<P>,
-    children: Vec<L>,
-    events: &dyn EventSink,
-) -> io::Result<()>
+pub async fn relay<P, L>(parent: Connection<P>, children: Vec<L>) -> io::Result<()>
 where
     P: AsyncRead + AsyncWrite + Unpin + Send,
     L: Launch + Send + Sync,
@@ -142,19 +178,27 @@ where
     // `agent::serve`, sharing `recv_hello`).
     let fn_key = recv_hello(&mut parent_rx).await?;
 
+    // The uplink carries this subtree's observability up to the parent: the
+    // children's `Profiled` and provisioning ladder are emitted to it during
+    // launch, and the relay reports its children's task lifecycle to it too.
+    let (uplink_tx, mut uplink_rx) = mpsc::unbounded_channel::<Event>();
+    let uplink_sink = UplinkSink {
+        tx: uplink_tx.clone(),
+    };
+
     // Launch the children (the provisioning cascade in the real path), then
     // handshake them and spawn one reader per child feeding a central channel.
     let Launched {
         agents,
         guards,
         failures,
-    } = launch_all(&children, None, None, events).await;
+    } = launch_all(&children, None, None, &uplink_sink).await;
     let (child_events_tx, mut child_events_rx) = mpsc::unbounded_channel();
     let Agents {
         senders,
+        labels,
         capacity,
         readers,
-        ..
     } = connect_agents(agents, &fn_key, &child_events_tx).await?;
     drop(child_events_tx); // the channel ends when every child reader does
 
@@ -164,21 +208,14 @@ where
     // stall the parent; the parent then treats the dead subtree as a lost host.
     let total_slots: usize = capacity.iter().sum();
     if total_slots == 0 {
-        let detail = failures
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(io::Error::other(format!(
-            "rayonet: relay has no usable children: {detail}"
-        )));
+        return Err(no_usable_children(&failures));
     }
     parent_tx
         .send(&FromAgent::Ready { slots: total_slots })
         .await?;
 
     // Splice the two sides until the parent is done or the subtree dies.
-    let mut sched = Relay::new(senders, capacity);
+    let mut sched = Relay::new(senders, labels, capacity, uplink_tx);
     loop {
         tokio::select! {
             from_parent = parent_rx.recv::<ToAgent>() => match from_parent? {
@@ -196,23 +233,35 @@ where
                 }
             },
             from_child = child_events_rx.recv() => match from_child {
-                Some(ChildEvent::Message(FromAgent::Started { task_id })) => {
+                Some(ChildEvent::Message(_, FromAgent::Started { task_id })) => {
                     parent_tx.send(&FromAgent::Started { task_id }).await?;
                 }
-                Some(ChildEvent::Message(FromAgent::Completed { task_id, output })) => {
-                    if sched.on_terminal(task_id) {
+                Some(ChildEvent::Message(_, FromAgent::Completed { task_id, output })) => {
+                    if let Some(child) = sched.on_terminal(task_id) {
                         parent_tx.send(&FromAgent::Completed { task_id, output }).await?;
                         sched.dispatch().await?;
+                        if sched.load[child] == 0 {
+                            sched.report(child, NodeState::Idle);
+                        }
                     }
                 }
-                Some(ChildEvent::Message(FromAgent::Failed { task_id, error })) => {
-                    if sched.on_terminal(task_id) {
+                Some(ChildEvent::Message(_, FromAgent::Failed { task_id, error })) => {
+                    if let Some(child) = sched.on_terminal(task_id) {
                         parent_tx.send(&FromAgent::Failed { task_id, error }).await?;
                         sched.dispatch().await?;
+                        if sched.load[child] == 0 {
+                            sched.report(child, NodeState::Idle);
+                        }
                     }
                 }
+                // A grandchild's observability event: prefix its host with this
+                // child's label so it carries a path, then pass it further up.
+                Some(ChildEvent::Message(child, FromAgent::Observe(mut event))) => {
+                    event.prefix_host(&sched.labels[child]);
+                    parent_tx.send(&FromAgent::Observe(event)).await?;
+                }
                 // A child should ready only once, during `connect_agents`.
-                Some(ChildEvent::Message(FromAgent::Ready { .. })) => {
+                Some(ChildEvent::Message(_, FromAgent::Ready { .. })) => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "a child sent Ready more than once",
@@ -227,15 +276,42 @@ where
                 // the subtree is gone: tear down and let the parent requeue.
                 None => break,
             },
+            // Forward this subtree's own observability up to the parent.
+            Some(event) = uplink_rx.recv() => {
+                parent_tx.send(&FromAgent::Observe(event)).await?;
+            }
         }
     }
 
     sched.shutdown().await;
+    flush_uplink(&mut uplink_rx, &mut parent_tx).await;
     for reader in readers {
         let _ = reader.await;
     }
     drop(guards);
     Ok(())
+}
+
+/// The error a relay returns when every child failed to launch, naming why each
+/// dropped, so the parent treats the dead subtree as a lost host.
+fn no_usable_children(failures: &[io::Error]) -> io::Error {
+    let detail = failures
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    io::Error::other(format!("rayonet: relay has no usable children: {detail}"))
+}
+
+/// Send any queued subtree events (the `Done` reports `shutdown` just emitted) up
+/// to the parent before the relay returns, so the final tree view is complete.
+async fn flush_uplink<P>(uplink_rx: &mut mpsc::UnboundedReceiver<Event>, parent_tx: &mut Sender<P>)
+where
+    P: AsyncRead + AsyncWrite + Unpin,
+{
+    while let Ok(event) = uplink_rx.try_recv() {
+        let _ = parent_tx.send(&FromAgent::Observe(event)).await;
+    }
 }
 
 #[cfg(test)]
@@ -355,7 +431,7 @@ mod tests {
                 .iter()
                 .map(|(label, registry)| LocalAgent::new(label, registry.clone()))
                 .collect();
-            let task = tokio::spawn(async move { relay(server, leaves, &NoopSink).await });
+            let task = tokio::spawn(async move { relay(server, leaves).await });
             Ok((client, task))
         }
     }
@@ -368,7 +444,7 @@ mod tests {
         inputs: Vec<u32>,
     ) -> std::io::Result<Vec<Result<u32, String>>> {
         let (coord_side, relay_side) = connection_pair(4096);
-        let relay_fut = relay(relay_side, children, &NoopSink);
+        let relay_fut = relay(relay_side, children);
         let coord_fut = run_job(
             vec![("relay".to_string(), coord_side)],
             key,
@@ -390,6 +466,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, (0..20u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn the_coordinator_sees_the_whole_subtree() {
+        use crate::capability::Role;
+        use crate::observability::{NodeState, RunState};
+        use crate::testing::EventRecorder;
+
+        // A relay reports its children's role and lifecycle up, so the top
+        // coordinator's run state contains the deep leaves at their full paths.
+        let children = vec![
+            LocalAgent::new("leaf-a", Registry::new().with("double", handler(double))),
+            LocalAgent::new("leaf-b", Registry::new().with("double", handler(double))),
+        ];
+        let (coord_side, relay_side) = connection_pair(4096);
+        let relay_fut = relay(relay_side, children);
+        let recorder = EventRecorder::default();
+        let coord_fut = run_job::<_, u32, u32>(
+            vec![("relay".to_string(), coord_side)],
+            "double",
+            (0..12u32).collect(),
+            &recorder,
+        );
+        let (relay_res, out) = tokio::join!(relay_fut, coord_fut);
+        relay_res.unwrap();
+        assert_eq!(out.unwrap().len(), 12);
+
+        let mut state = RunState::default();
+        for event in &recorder.events() {
+            state.apply(event);
+        }
+        // The relay is the coordinator's direct child; its two leaves appear one
+        // level deeper, profiled as Compute and finished.
+        assert!(state.nodes.contains_key("relay"));
+        for leaf in ["relay/leaf-a", "relay/leaf-b"] {
+            assert_eq!(state.nodes[leaf].role, Some(Role::Compute), "{leaf}");
+            assert_eq!(state.nodes[leaf].state, NodeState::Done, "{leaf}");
+        }
     }
 
     #[tokio::test]
@@ -548,7 +662,7 @@ mod tests {
     #[tokio::test]
     async fn a_relay_with_no_usable_children_errors() {
         let (coord_side, relay_side) = connection_pair(256);
-        let relay_fut = relay::<_, LocalAgent>(relay_side, vec![], &NoopSink);
+        let relay_fut = relay::<_, LocalAgent>(relay_side, vec![]);
         let driver = async {
             let (mut tx, _rx) = coord_side.split();
             tx.send(&ToAgent::Hello {
@@ -569,7 +683,7 @@ mod tests {
             Registry::new().with("id", handler(|x: u32| x)),
         )];
         let (coord_side, relay_side) = connection_pair(256);
-        let relay_fut = relay(relay_side, children, &NoopSink);
+        let relay_fut = relay(relay_side, children);
         let driver = async {
             let (mut tx, mut rx) = coord_side.split();
             tx.send(&ToAgent::Hello {
@@ -587,7 +701,9 @@ mod tests {
             })
             .await
             .unwrap();
-            let _ = rx.recv::<FromAgent>().await;
+            // Drain until the relay rejects the second Hello and closes, keeping
+            // the parent alive so it does not end the relay cleanly first.
+            while let Ok(Some(_)) = rx.recv::<FromAgent>().await {}
         };
         let (res, ()) = tokio::join!(relay_fut, driver);
         assert!(res.is_err());
@@ -599,18 +715,19 @@ mod tests {
         // duplicate completion cannot double-count (mirrors the coordinator).
         let (client, _server) = connection_pair(64);
         let (tx, _rx) = client.split();
-        let mut sched = super::Relay::new(vec![tx], vec![1]);
+        let (uplink_tx, _uplink_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut sched = super::Relay::new(vec![tx], vec!["leaf".to_string()], vec![1], uplink_tx);
         sched.load[0] = 1;
         sched.inflight.insert(7, (0, vec![1, 2, 3]));
-        assert!(sched.on_terminal(7), "first terminal is known");
-        assert!(!sched.on_terminal(7), "the duplicate is unknown");
+        assert!(sched.on_terminal(7).is_some(), "first terminal is known");
+        assert!(sched.on_terminal(7).is_none(), "the duplicate is unknown");
         assert_eq!(sched.load[0], 0);
     }
 
     #[tokio::test]
     async fn a_child_that_readies_twice_is_rejected() {
         let (coord_side, relay_side) = connection_pair(256);
-        let relay_fut = relay(relay_side, vec![DoubleReadyChild], &NoopSink);
+        let relay_fut = relay(relay_side, vec![DoubleReadyChild]);
         let driver = async {
             let (mut tx, mut rx) = coord_side.split();
             tx.send(&ToAgent::Hello {
@@ -619,9 +736,10 @@ mod tests {
             })
             .await
             .unwrap();
-            // The relay advertises, then the child's second Ready trips the guard.
-            let _ready: FromAgent = rx.recv().await.unwrap().unwrap();
-            let _ = rx.recv::<FromAgent>().await;
+            // Keep the parent alive and drain (Ready, Observe, ...) until the
+            // relay errors on the child's second Ready and closes, so the parent
+            // does not drop first and end the relay cleanly.
+            while let Ok(Some(_)) = rx.recv::<FromAgent>().await {}
         };
         let (res, ()) = tokio::join!(relay_fut, driver);
         assert!(res.is_err());

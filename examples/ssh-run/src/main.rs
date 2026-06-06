@@ -20,7 +20,7 @@ use std::sync::Arc;
 use rayonet::capability::{pred, Filter, Os, Role};
 use rayonet::fleet::{Fleet, NetMapExt};
 use rayonet::node::{run_node, NodeConfig};
-use rayonet::observability::{Event, EventSink};
+use rayonet::observability::{depth, leaf_of, Event, EventSink};
 use rayonet::process;
 use rayonet::ssh::{parse_host_spec, Ssh};
 
@@ -31,19 +31,28 @@ fn double(x: u32) -> u32 {
 
 rayonet::embed_microcrates!();
 
-/// Prints each node's provisioning ladder and capability/role so the run is visible.
+/// Prints each node's provisioning ladder and capability/role so the run is
+/// visible, indented by tree depth so a relay's subtree is shown beneath it.
 struct Progress;
 
 impl EventSink for Progress {
     fn emit(&self, event: Event) {
         match event {
-            Event::Node { host, state } => println!("  {host}: {state:?}"),
+            Event::Node { host, state } => {
+                println!(
+                    "  {}{}: {state:?}",
+                    "  ".repeat(depth(&host)),
+                    leaf_of(&host)
+                );
+            }
             Event::Profiled {
                 host,
                 profile,
                 role,
             } => println!(
-                "  {host}: {role:?} ({:?}, {} cores, {} MB RAM, {} GPUs)",
+                "  {}{}: {role:?} ({:?}, {} cores, {} MB RAM, {} GPUs)",
+                "  ".repeat(depth(&host)),
+                leaf_of(&host),
                 profile.os,
                 profile.cores,
                 profile.ram_mb,
