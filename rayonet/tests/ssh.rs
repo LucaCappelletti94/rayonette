@@ -9,7 +9,7 @@ use rayonet::capability::Os;
 use rayonet::coordinator::run_job;
 use rayonet::fleet::Launch;
 use rayonet::observability::{NodeState, NoopSink};
-use rayonet::provisioning::{remote_binary_path, Remote};
+use rayonet::provisioning::{remote_agent_path, Remote};
 use rayonet::ssh::{Ssh, SshConfig, SshRemote};
 use rayonet::testing::EventRecorder as Recorder;
 
@@ -129,8 +129,11 @@ async fn ssh_build_with_warm_cache_provisions_and_runs() {
     let config = SshConfig::new("rayonet-local").config_file(&config_path);
 
     // Seed the content-addressed cache with the test agent so provision hits it.
+    // The cache path is keyed by this host's architecture, so resolve it by
+    // probing the host the same way the provisioner does.
     let tar = b"warm-cache-seed".to_vec();
-    let remote_path = remote_binary_path(&tar, "rayonet-test-agent");
+    let probe = SshRemote::connect(&config).await.unwrap();
+    let remote_path = remote_agent_path(&probe, &tar, "rayonet-test-agent").await;
     let local_path = remote_path.replace("$HOME", &home);
     let dir = std::path::Path::new(&local_path).parent().unwrap();
     std::fs::create_dir_all(dir).unwrap();

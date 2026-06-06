@@ -1097,12 +1097,14 @@ mod tests {
 
         let linux = NodeProfile {
             os: Os::Linux,
+            arch: crate::capability::CpuArch::unknown(),
             cores: 8,
             ram_mb: 16_000,
             gpus: Vec::new(),
         };
         let mac = NodeProfile {
             os: Os::MacOs,
+            arch: crate::capability::CpuArch::unknown(),
             cores: 8,
             ram_mb: 16_000,
             gpus: Vec::new(),
@@ -1153,6 +1155,7 @@ mod tests {
 
         let rocm_box = NodeProfile {
             os: Os::Linux,
+            arch: crate::capability::CpuArch::unknown(),
             cores: 32,
             ram_mb: 128_000,
             gpus: vec![Gpu {
@@ -1164,6 +1167,7 @@ mod tests {
         };
         let cpu_box = NodeProfile {
             os: Os::Linux,
+            arch: crate::capability::CpuArch::unknown(),
             cores: 8,
             ram_mb: 16_000,
             gpus: Vec::new(),

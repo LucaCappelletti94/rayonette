@@ -415,6 +415,7 @@ mod tests {
     fn run_state_records_a_profile_and_role() {
         let profile = NodeProfile {
             os: Os::Linux,
+            arch: crate::capability::CpuArch::unknown(),
             cores: 8,
             ram_mb: 16_000,
             gpus: Vec::new(),
@@ -439,6 +440,7 @@ mod tests {
     fn paths_by_id_groups_a_redundantly_reachable_node() {
         let profile = NodeProfile {
             os: Os::Linux,
+            arch: crate::capability::CpuArch::unknown(),
             cores: 8,
             ram_mb: 16_000,
             gpus: Vec::new(),
@@ -476,6 +478,7 @@ mod tests {
     fn plain_renderer_summarizes_a_profile() {
         let profile = NodeProfile {
             os: Os::Linux,
+            arch: crate::capability::CpuArch::unknown(),
             cores: 8,
             ram_mb: 16_000,
             gpus: Vec::new(),

@@ -63,12 +63,39 @@ pub struct Gpu {
     pub vram_mb: Option<u64>,
 }
 
+/// A node's CPU architecture: the instruction set plus the enabled feature flags.
+///
+/// Two nodes are interchangeable for a `-C target-cpu=native` binary iff these are
+/// equal (same instruction set and the same instruction-set extensions), so this
+/// is both the "same architecture" test and what keeps a native build cached per
+/// microarchitecture rather than reused on a CPU that would fault on it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CpuArch {
+    /// The instruction set from `uname -m`, for example `x86_64` or `aarch64`.
+    pub isa: String,
+    /// The CPU instruction-set feature flags, sorted and deduplicated.
+    pub features: Vec<String>,
+}
+
+impl CpuArch {
+    /// An unknown architecture, for a host that has not been probed.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self {
+            isa: "unknown".to_string(),
+            features: Vec::new(),
+        }
+    }
+}
+
 /// A node's probed capabilities. Extensible: new capabilities are new fields,
 /// added without breaking existing filters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeProfile {
     /// The operating system.
     pub os: Os,
+    /// The CPU architecture (instruction set and feature flags).
+    pub arch: CpuArch,
     /// Logical CPU count (0 if it could not be determined).
     pub cores: u32,
     /// Total RAM in MB (0 if it could not be determined).
@@ -84,10 +111,18 @@ impl NodeProfile {
     pub fn unknown() -> Self {
         Self {
             os: Os::Other("unknown".to_string()),
+            arch: CpuArch::unknown(),
             cores: 0,
             ram_mb: 0,
             gpus: Vec::new(),
         }
+    }
+
+    /// Whether this node and `other` have the same CPU architecture, so a
+    /// `-C target-cpu=native` binary built on one runs correctly on the other.
+    #[must_use]
+    pub fn same_arch(&self, other: &Self) -> bool {
+        self.arch == other.arch
     }
 
     /// Whether the node has any GPU at all.
@@ -210,6 +245,29 @@ pub fn parse_os(uname_s: &str) -> Os {
 #[must_use]
 pub fn parse_cores(s: &str) -> u32 {
     s.trim().parse().unwrap_or(0)
+}
+
+/// Build a [`CpuArch`] from the instruction set (`uname -m`) and raw feature text.
+///
+/// The text is whitespace- or colon-separated tokens: the Linux `/proc/cpuinfo`
+/// `flags`/`Features` line, or macOS `sysctl` feature output. Tokens are
+/// lowercased, sorted, and deduplicated so the same CPU always yields the same
+/// architecture regardless of probe ordering.
+#[must_use]
+pub fn parse_cpu_arch(uname_m: &str, features_raw: &str) -> CpuArch {
+    // A `flags : a b c` cpuinfo line keeps only the part after the colon; sysctl
+    // output has no colon and is taken whole.
+    let after_colon = features_raw.rsplit(':').next().unwrap_or(features_raw);
+    let mut features: Vec<String> = after_colon
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect();
+    features.sort();
+    features.dedup();
+    CpuArch {
+        isa: uname_m.trim().to_string(),
+        features,
+    }
 }
 
 /// Parse total RAM in MB from Linux `/proc/meminfo` (`MemTotal: N kB`).
@@ -450,6 +508,7 @@ pub mod pred {
         fn rocm_box() -> NodeProfile {
             NodeProfile {
                 os: Os::Linux,
+                arch: crate::capability::CpuArch::unknown(),
                 cores: 64,
                 ram_mb: 131_072,
                 gpus: vec![Gpu {
@@ -464,6 +523,7 @@ pub mod pred {
         fn mac() -> NodeProfile {
             NodeProfile {
                 os: Os::MacOs,
+                arch: crate::capability::CpuArch::unknown(),
                 cores: 8,
                 ram_mb: 16_384,
                 gpus: vec![],
@@ -592,6 +652,45 @@ Agent 3
         assert_eq!(u.ram_mb, 0);
         assert!(u.gpus.is_empty());
         assert!(matches!(u.os, Os::Other(_)));
+        assert_eq!(u.arch.isa, "unknown");
+        assert!(u.arch.features.is_empty());
+    }
+
+    #[test]
+    fn parse_cpu_arch_normalizes_features() {
+        use super::parse_cpu_arch;
+        // A Linux cpuinfo `flags : ...` line: only the part after the colon is
+        // features, and they come out lowercased, sorted, and deduplicated.
+        let arch = parse_cpu_arch("x86_64\n", "flags\t\t: SSE2 avx2 sse2 AVX2 fma");
+        assert_eq!(arch.isa, "x86_64");
+        assert_eq!(arch.features, vec!["avx2", "fma", "sse2"]);
+
+        // No colon (a sysctl-style list) is taken whole.
+        let mac = parse_cpu_arch("arm64", "neon fp asimd");
+        assert_eq!(mac.isa, "arm64");
+        assert_eq!(mac.features, vec!["asimd", "fp", "neon"]);
+    }
+
+    #[test]
+    fn same_arch_compares_isa_and_features() {
+        use super::{parse_cpu_arch, NodeProfile};
+        let mut a = NodeProfile::unknown();
+        let mut b = NodeProfile::unknown();
+        a.arch = parse_cpu_arch("x86_64", "sse2 avx2");
+        b.arch = parse_cpu_arch("x86_64", "avx2 sse2"); // same set, different order
+        assert!(
+            a.same_arch(&b),
+            "same isa and feature set are the same arch"
+        );
+
+        b.arch = parse_cpu_arch("x86_64", "sse2 avx2 avx512f"); // extra feature
+        assert!(
+            !a.same_arch(&b),
+            "a different feature set is a different arch"
+        );
+
+        b.arch = parse_cpu_arch("aarch64", "sse2 avx2"); // different isa
+        assert!(!a.same_arch(&b), "a different isa is a different arch");
     }
 
     #[test]
@@ -606,6 +705,7 @@ Agent 3
 
         let mac = NodeProfile {
             os: Os::MacOs,
+            arch: crate::capability::CpuArch::unknown(),
             cores: 8,
             ram_mb: 16_384,
             gpus: vec![],
@@ -614,6 +714,7 @@ Agent 3
 
         let rocm_box = NodeProfile {
             os: Os::Linux,
+            arch: crate::capability::CpuArch::unknown(),
             cores: 64,
             ram_mb: 131_072,
             gpus: vec![Gpu {
@@ -627,6 +728,7 @@ Agent 3
 
         let plain = NodeProfile {
             os: Os::Linux,
+            arch: crate::capability::CpuArch::unknown(),
             cores: 4,
             ram_mb: 8_000,
             gpus: vec![],
@@ -643,6 +745,7 @@ Agent 3
         let filter = Filter::new().exclude(cuda()).otherwise(Role::Compute);
         let cuda_box = NodeProfile {
             os: Os::Linux,
+            arch: crate::capability::CpuArch::unknown(),
             cores: 32,
             ram_mb: 65_536,
             gpus: vec![Gpu {
@@ -656,6 +759,7 @@ Agent 3
 
         let cpu_only = NodeProfile {
             os: Os::Linux,
+            arch: crate::capability::CpuArch::unknown(),
             cores: 32,
             ram_mb: 65_536,
             gpus: vec![],
@@ -671,6 +775,7 @@ Agent 3
         use super::{Gpu, GpuRuntime, GpuVendor, NodeProfile, Os};
         let rocm = NodeProfile {
             os: Os::Linux,
+            arch: crate::capability::CpuArch::unknown(),
             cores: 64,
             ram_mb: 131_072,
             gpus: vec![Gpu {
@@ -687,6 +792,7 @@ Agent 3
 
         let bare = NodeProfile {
             os: Os::MacOs,
+            arch: crate::capability::CpuArch::unknown(),
             cores: 8,
             ram_mb: 16_384,
             gpus: vec![],

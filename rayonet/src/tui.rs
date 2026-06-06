@@ -135,6 +135,7 @@ mod tests {
         // single point of failure. Its leaf, reached only through it, is not one.
         let profile = NodeProfile {
             os: Os::Linux,
+            arch: crate::capability::CpuArch::unknown(),
             cores: 8,
             ram_mb: 16_000,
             gpus: Vec::new(),
@@ -180,6 +181,7 @@ mod tests {
         let mut state = RunState::default();
         let profile = NodeProfile {
             os: Os::Linux,
+            arch: crate::capability::CpuArch::unknown(),
             cores: 8,
             ram_mb: 16_000,
             gpus: Vec::new(),

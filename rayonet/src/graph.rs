@@ -486,6 +486,7 @@ mod tests {
     fn profile() -> NodeProfile {
         NodeProfile {
             os: Os::Linux,
+            arch: crate::capability::CpuArch::unknown(),
             cores: 4,
             ram_mb: 8_000,
             gpus: Vec::new(),

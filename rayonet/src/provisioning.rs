@@ -9,7 +9,7 @@
 use std::future::Future;
 use std::io;
 
-use crate::capability::{self, NodeProfile, Os};
+use crate::capability::{self, CpuArch, NodeProfile, Os};
 use crate::observability::{Event, EventSink, NodeState};
 
 /// The captured result of running a command to completion on a [`Remote`].
@@ -55,25 +55,70 @@ fn content_hash(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
-/// The content-addressed build directory for `source_tar` on a host.
+/// The content-addressed build directory for `source_tar` on a host, keyed also
+/// by `variant` (the architecture and target-cpu signature).
 ///
-/// Shell-unexpanded (`$HOME/...`) so it is valid in a remote command without
-/// the coordinator knowing the remote home.
-fn remote_cache_dir(source_tar: &[u8]) -> String {
-    format!("$HOME/.cache/rayonet/{}", content_hash(source_tar))
+/// Shell-unexpanded (`$HOME/...`) so it is valid in a remote command without the
+/// coordinator knowing the remote home. The `variant` keeps a `-C target-cpu`
+/// build cached per microarchitecture, so a native binary is never reused on a
+/// CPU that would fault on it (the build dir is otherwise identical on every host
+/// with the same source).
+fn remote_cache_dir(source_tar: &[u8], variant: &str) -> String {
+    format!(
+        "$HOME/.cache/rayonet/{}-{variant}",
+        content_hash(source_tar)
+    )
 }
 
-/// Where [`provision`] places (and a cache hit finds) the built agent binary.
-///
-/// The path is content-addressed on `source_tar`, so the same source maps to
-/// the same location on every host, which is what makes a repeat run a cache
-/// hit.
-#[must_use]
-pub fn remote_binary_path(source_tar: &[u8], binary_name: &str) -> String {
+/// Where [`provision`] places (and a cache hit finds) the built agent binary, for
+/// a given source and architecture `variant`.
+fn remote_binary_path(source_tar: &[u8], variant: &str, binary_name: &str) -> String {
     format!(
         "{}/target/release/{binary_name}",
-        remote_cache_dir(source_tar)
+        remote_cache_dir(source_tar, variant)
     )
+}
+
+/// A short signature of the build variant: the host's CPU architecture plus the
+/// `target_cpu` setting. Two builds share a cache entry only when both match, so
+/// a native build (whose code depends on the exact microarchitecture) is keyed to
+/// the CPU it was built for.
+fn build_variant(arch: &CpuArch, target_cpu: &str) -> String {
+    let signature = format!("{} {} {target_cpu}", arch.isa, arch.features.join(" "));
+    content_hash(signature.as_bytes())[..16].to_string()
+}
+
+/// The agent build's `-C target-cpu` value: `native` by default (squeeze every
+/// instruction the host offers), overridable with `RAYONET_TARGET_CPU` (for
+/// example `x86-64-v2` for a portable build).
+fn target_cpu() -> String {
+    std::env::var("RAYONET_TARGET_CPU").unwrap_or_else(|_| "native".to_string())
+}
+
+/// Probe a host and return its build target: the cache `variant` (architecture
+/// plus target-cpu signature) and the `target-cpu` value to compile with.
+async fn build_target<R: Remote>(remote: &R) -> (String, String) {
+    let os = capability::parse_os(&run_or_empty(remote, "uname -s").await);
+    let arch = cpu_arch(remote, &os).await;
+    let cpu = target_cpu();
+    (build_variant(&arch, &cpu), cpu)
+}
+
+/// Where [`provision`] will place (or find cached) the agent binary on a host.
+///
+/// Resolved for the current source and that host's architecture, so a caller can
+/// locate the same cache entry the provisioner uses (for example to seed or
+/// inspect it).
+///
+/// # Errors
+/// Never returns an error: an unreadable probe just yields a less specific path.
+pub async fn remote_agent_path<R: Remote>(
+    remote: &R,
+    source_tar: &[u8],
+    binary_name: &str,
+) -> String {
+    let (variant, _) = build_target(remote).await;
+    remote_binary_path(source_tar, &variant, binary_name)
 }
 
 /// Turn a non-zero exit into a host-named error so the caller can requeue.
@@ -107,14 +152,16 @@ pub async fn provision<R: Remote>(
     host: &str,
     events: &dyn EventSink,
 ) -> io::Result<Provisioned> {
-    let dir = remote_cache_dir(source_tar);
-    let binary_path = remote_binary_path(source_tar, binary_name);
-
-    // Probe: cheapest possible round-trip, confirms the host answers at all.
+    // Probe: confirm the host answers and learn its CPU architecture, which keys
+    // the build cache so a target-cpu=native binary is never reused on a CPU it
+    // would fault on.
     events.emit(Event::node(host, NodeState::Probing));
     require_success(host, "probe", &remote.run("uname -sm").await?)?;
+    let (variant, cpu) = build_target(remote).await;
+    let dir = remote_cache_dir(source_tar, &variant);
+    let binary_path = remote_binary_path(source_tar, &variant, binary_name);
 
-    // Cache hit: a prior run already built this exact source here.
+    // Cache hit: a prior run already built this exact source for this CPU here.
     if remote.run(&format!("test -x {binary_path}")).await?.status == 0 {
         events.emit(Event::node(host, NodeState::Ready));
         return Ok(Provisioned { binary_path });
@@ -149,10 +196,12 @@ pub async fn provision<R: Remote>(
     require_success(host, "extract", &remote.run(&extract).await?)?;
 
     // Build just the consumer's package (not every member of a shipped
-    // workspace) on the host.
+    // workspace) on the host, tuned to this host's CPU so a distributed task runs
+    // as fast as the hardware allows.
     events.emit(Event::node(host, NodeState::Building));
     let build = format!(
-        "cd {dir} && PATH=\"$HOME/.cargo/bin:$PATH\" cargo build --release -p {binary_name}"
+        "cd {dir} && PATH=\"$HOME/.cargo/bin:$PATH\" \
+         RUSTFLAGS=\"-C target-cpu={cpu}\" cargo build --release -p {binary_name}"
     );
     require_success(host, "build", &remote.run(&build).await?)?;
 
@@ -195,12 +244,38 @@ pub async fn probe<R: Remote>(remote: &R) -> io::Result<NodeProfile> {
         ));
         (cores, ram_mb, gpus)
     };
+    let arch = cpu_arch(remote, &os).await;
     Ok(NodeProfile {
         os,
+        arch,
         cores,
         ram_mb,
         gpus,
     })
+}
+
+/// Probe a host's CPU architecture over `remote`.
+///
+/// The instruction set comes from `uname -m` and the feature flags from
+/// `/proc/cpuinfo` on Linux or `sysctl` on macOS. Best-effort, like the other
+/// probes: a missing source just yields fewer features.
+pub async fn cpu_arch<R: Remote>(remote: &R, os: &Os) -> CpuArch {
+    let isa = run_or_empty(remote, "uname -m").await;
+    let features = if *os == Os::MacOs {
+        run_or_empty(
+            remote,
+            "sysctl -n machdep.cpu.features machdep.cpu.leaf7_features 2>/dev/null; \
+             sysctl -a 2>/dev/null | sed -n 's/^hw\\.optional\\.\\([A-Za-z0-9_]*\\): 1$/\\1/p'",
+        )
+        .await
+    } else {
+        run_or_empty(
+            remote,
+            "grep -m1 -E '^(flags|Features)[[:space:]]*:' /proc/cpuinfo",
+        )
+        .await
+    };
+    capability::parse_cpu_arch(&isa, &features)
 }
 
 /// A shell command printing a stable machine id: the OS id source (Linux
@@ -366,7 +441,49 @@ mod tests {
         );
         assert!(remote.calls().iter().any(|c| c.contains("rustup")));
         assert!(remote.calls().iter().any(|c| c.contains("cargo build")));
+        // The agent is built tuned to the host's CPU for maximum task throughput.
+        assert!(
+            remote
+                .calls()
+                .iter()
+                .any(|c| c.contains("target-cpu=native")),
+            "the build should tune to the native CPU"
+        );
         assert!(result.binary_path.ends_with("/target/release/agent"));
+    }
+
+    #[test]
+    fn build_variant_separates_architectures_and_target_cpus() {
+        use super::{build_variant, CpuArch};
+        let avx2 = CpuArch {
+            isa: "x86_64".to_string(),
+            features: vec!["avx2".to_string(), "sse2".to_string()],
+        };
+        let avx512 = CpuArch {
+            isa: "x86_64".to_string(),
+            features: vec![
+                "avx2".to_string(),
+                "avx512f".to_string(),
+                "sse2".to_string(),
+            ],
+        };
+        // A native binary's cache key changes with the microarchitecture, so it is
+        // never reused on a CPU missing a feature (which would fault), even when
+        // the source is identical.
+        assert_ne!(
+            build_variant(&avx2, "native"),
+            build_variant(&avx512, "native")
+        );
+        // The same arch with a different target-cpu is also a distinct entry.
+        assert_ne!(
+            build_variant(&avx2, "native"),
+            build_variant(&avx2, "x86-64-v2")
+        );
+        // The same arch and target-cpu reuse the same entry.
+        assert_eq!(
+            build_variant(&avx2, "native"),
+            build_variant(&avx2, "native")
+        );
     }
 
     #[tokio::test]
