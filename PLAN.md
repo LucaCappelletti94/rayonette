@@ -182,19 +182,24 @@ Builds the relay tree of `DECISIONS.md` 32-43. The cross-phase criteria above st
 
 **Goal:** one tier of relays, decentralized children, central DAG.
 
-**Deliverables:**
-- The relay role: a node serves its parent and runs a sub-fleet read from its local children file.
-- The discovery pass: node identity (host-key fingerprint, with a visited-set so the walk cannot loop), profiles, and link latency flow up, and the coordinator builds a depth-2 `geometric-traits` CSR DAG. Each node has a single path here, so no path metric applies yet.
-- Demand-pull flow control at the relay boundary.
-- `RelayOnly` honored (relays forward, they do not compute).
-- The provisioning cascade: a relay ships the source it holds to its compute children and builds them.
-- No redundancy yet, so a relay's death fails its subtree (until R5).
+**Deliverables (delivered):**
+- The relay role (`relay.rs`): a node is an agent to its parent and a coordinator to its own children, splicing work down and `Started`/`Completed`/`Failed` straight up (task ids pass through), with a child's loss requeued onto its surviving siblings.
+- Per-agent capacity in the protocol: `Ready { slots }` plus a capacity-filled coordinator scheduler, so a relay keeps its whole subtree fed (demand-pull at the relay boundary).
+- The children file (`~/.config/rayonet/children`, or `$RAYONET_CHILDREN`) and boot-time role dispatch (`node::run_node`): a node with no children serves as a leaf, one with children runs the relay.
+- The provisioning cascade: a relay re-ships the `__rayonet_source()` bundle it was built from to its children and builds them with `Ssh::build`.
+- `RelayOnly` honored: a relay forwards, it runs no tasks of its own.
+- No redundancy yet, so a relay whose subtree dies fails it (until R5).
+
+**Scoped out of R2 (deferred, agreed with the design):**
+- The coordinator-side `geometric-traits` CSR DAG and the rich discovery-reporting pass. In a depth-2 tree the coordinator sees each relay as one opaque agent, so the graph has nothing to validate, order, or reroute. The CSR DAG and Kahn ordering land in R3 (arbitrary depth), the tree view in R4, redundancy in R5.
+- A node that both relays and computes (decision 35). R2 relays are pure forwarders; relay+compute will be modeled later as a relay whose child fleet includes a local in-process worker.
+- A dynamic `Demand` message for capacity changing mid-run; advertised initial capacity suffices for a fixed child set (the dynamic case is the elastic-membership work).
 
 **Tests**
 - In-process recursive transport: coordinator -> one relay -> two leaves returns correct ordered results.
-- A `RelayOnly` relay runs zero tasks, and its leaves run them all.
+- A relay runs zero tasks itself, and its leaves run them all.
 - Demand-pull keeps a relay's subtree busy (more than one task in flight beneath it).
-- Cascaded provisioning ships and builds on the leaf, not just the relay.
+- A lost child has its work absorbed by a sibling; a relay whose whole subtree dies fails its subtree.
 
 **Done when:** a job runs coordinator -> relay -> leaves with the relay's children defined only on the relay.
 

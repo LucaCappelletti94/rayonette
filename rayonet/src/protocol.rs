@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped when the wire protocol changes. Because the agent is compiled from the
 /// same source as the coordinator (whole-crate compile), this is a sanity
 /// assertion rather than a true negotiation.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Identifies a task within a run.
 pub type TaskId = u64;
@@ -34,9 +34,14 @@ pub enum ToAgent {
 /// Agent to coordinator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FromAgent {
-    /// Handshake reply: the agent is built, connected, and ready for work. One
-    /// task runs per agent at a time, so it carries no payload.
-    Ready,
+    /// Handshake reply: the agent is built, connected, and ready for work. It
+    /// advertises how many tasks it can hold in flight at once: a leaf reports
+    /// 1 (one task at a time), a relay reports the number of ready compute slots
+    /// across its subtree, so the coordinator keeps that subtree fed.
+    Ready {
+        /// Concurrent tasks this agent can hold in flight.
+        slots: usize,
+    },
     /// A task has begun executing (lets a view show it in flight).
     Started {
         /// The task now running.
@@ -95,7 +100,7 @@ mod tests {
     #[test]
     fn from_agent_variants_roundtrip() {
         for msg in [
-            FromAgent::Ready,
+            FromAgent::Ready { slots: 1 },
             FromAgent::Started { task_id: 9 },
             FromAgent::Completed {
                 task_id: 9,
@@ -126,7 +131,7 @@ mod tests {
 
     fn from_agent_strategy() -> impl Strategy<Value = FromAgent> {
         prop_oneof![
-            Just(FromAgent::Ready),
+            any::<usize>().prop_map(|slots| FromAgent::Ready { slots }),
             any::<u64>().prop_map(|task_id| FromAgent::Started { task_id }),
             (any::<u64>(), any::<Vec<u8>>())
                 .prop_map(|(task_id, output)| FromAgent::Completed { task_id, output }),

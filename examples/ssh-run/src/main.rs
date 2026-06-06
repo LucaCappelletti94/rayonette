@@ -19,9 +19,10 @@ use std::sync::Arc;
 
 use rayonet::capability::{pred, Filter, Os, Role};
 use rayonet::fleet::{Fleet, NetMapExt};
+use rayonet::node::{run_node, NodeConfig};
 use rayonet::observability::{Event, EventSink};
 use rayonet::process;
-use rayonet::ssh::{Ssh, SshConfig};
+use rayonet::ssh::{parse_host_spec, Ssh};
 
 /// The distributed task: doubles its input.
 fn double(x: u32) -> u32 {
@@ -65,30 +66,18 @@ fn filter_from_env() -> Option<Filter> {
     }
 }
 
-/// Parse one `dest[=keyfile]` entry into an ssh config.
-fn parse_host(entry: &str) -> SshConfig {
-    match entry.split_once('=') {
-        Some((dest, keyfile)) => SshConfig::new(dest).keyfile(expand_tilde(keyfile)),
-        None => SshConfig::new(entry),
-    }
-}
-
-/// Expand a leading `~/` to `$HOME` (ssh config does this, a plain path does not).
-fn expand_tilde(path: &str) -> String {
-    match path.strip_prefix("~/") {
-        Some(rest) => {
-            std::env::var("HOME").map_or_else(|_| path.to_string(), |home| format!("{home}/{rest}"))
-        }
-        None => path.to_string(),
-    }
-}
-
 #[tokio::main]
 async fn main() {
     if process::is_agent() {
-        process::run_agent(__rayonet_registry())
-            .await
-            .expect("agent failed");
+        // As an agent: a leaf, or a relay if this host has a children file. A
+        // relay re-ships this same source bundle down to its own children.
+        let config = NodeConfig {
+            registry: __rayonet_registry(),
+            source: __rayonet_source(),
+            binary_name: "ssh-run".to_string(),
+            toolchain: "stable".to_string(),
+        };
+        run_node(config).await.expect("agent failed");
         return;
     }
 
@@ -99,7 +88,7 @@ async fn main() {
         .split([' ', ','])
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
-        .map(|entry| Ssh::build(parse_host(entry), source.clone(), "stable", "ssh-run"))
+        .map(|entry| Ssh::build(parse_host_spec(entry), source.clone(), "stable", "ssh-run"))
         .collect();
     assert!(!launchers.is_empty(), "RAYONET_HOSTS named no hosts");
     let hosts = launchers.len();

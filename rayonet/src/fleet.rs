@@ -116,19 +116,88 @@ impl<L: Launch> Fleet<L> {
         self.filter = Some(filter);
         self
     }
-
-    /// The role for `profile` under this fleet's filter, defaulting to
-    /// [`Role::Compute`] when no filter is set.
-    fn role_of(&self, profile: &NodeProfile) -> Role {
-        self.filter
-            .as_ref()
-            .map_or(Role::Compute, |filter| filter.role_of(profile))
-    }
 }
 
 /// The raw, byte-level result of running a job: each task's output bytes or its
 /// error message, in input order.
 type RawResults = std::io::Result<Vec<Result<Vec<u8>, String>>>;
+
+/// The agents a [`launch_all`] pass brought up, plus the guards that keep them
+/// alive and the failures of the hosts it dropped.
+pub(crate) struct Launched<L: Launch> {
+    /// Each ready agent's label and live connection, ready to hand to a
+    /// coordinator ([`run_job_raw`]) or a relay (`crate::relay`).
+    pub agents: Vec<(String, Connection<L::Stream>)>,
+    /// A guard per ready agent, held for the run's duration.
+    pub guards: Vec<L::Guard>,
+    /// Why each dropped host did not join (for the no-eligible-host message).
+    pub failures: Vec<std::io::Error>,
+}
+
+/// Bring up a set of launchers: connect, probe, drop any the `filter` does not
+/// assign [`Role::Compute`] or that fail the job `requires`, then activate the
+/// survivors. A host that fails any phase is dropped (its error kept), so a cold
+/// or filtered host never blocks the run. Shared by the fleet coordinator and
+/// the relay (which launches its own children the same way).
+pub(crate) async fn launch_all<L: Launch + Send + Sync>(
+    launchers: &[L],
+    filter: Option<&Filter>,
+    requires: Option<&Predicate>,
+    events: &dyn EventSink,
+) -> Launched<L> {
+    let mut out = Launched {
+        agents: Vec::with_capacity(launchers.len()),
+        guards: Vec::with_capacity(launchers.len()),
+        failures: Vec::new(),
+    };
+    for launcher in launchers {
+        let label = launcher.label();
+        let session = match launcher.connect().await {
+            Ok(session) => session,
+            Err(failure) => {
+                out.failures.push(failure);
+                continue;
+            }
+        };
+        let profile = match launcher.probe(&session).await {
+            Ok(profile) => profile,
+            Err(failure) => {
+                out.failures.push(failure);
+                continue;
+            }
+        };
+        let role = filter.map_or(Role::Compute, |filter| filter.role_of(&profile));
+        // A job requirement narrows the compute hosts further: a host the fleet
+        // runs tasks on, but whose capabilities this job does not need, is
+        // skipped for this run only.
+        let meets_requirement = requires.is_none_or(|predicate| predicate.eval(&profile));
+        events.emit(Event::profiled(&label, profile, role));
+        if role != Role::Compute || !meets_requirement {
+            continue;
+        }
+        match launcher.activate(session, events).await {
+            Ok((connection, guard)) => {
+                out.agents.push((label, connection));
+                out.guards.push(guard);
+            }
+            Err(failure) => out.failures.push(failure),
+        }
+    }
+    out
+}
+
+/// The no-eligible-host error message from a [`launch_all`] pass that left no
+/// agents, naming why each candidate dropped out.
+pub(crate) fn no_eligible_host(failures: &[std::io::Error]) -> std::io::Error {
+    let detail = failures
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    std::io::Error::other(format!(
+        "rayonet: no eligible host (every host failed to launch or was filtered out): {detail}"
+    ))
+}
 
 /// A fleet behind a type-erased, byte-level interface.
 ///
@@ -156,55 +225,16 @@ impl<L: Launch + Send + Sync> ErasedFleet for Fleet<L> {
     ) -> Pin<Box<dyn Future<Output = RawResults> + Send + 'a>> {
         Box::pin(async move {
             let events = self.events.as_ref();
-            let mut agents = Vec::with_capacity(self.launchers.len());
-            let mut guards = Vec::with_capacity(self.launchers.len());
-            let mut failures = Vec::new();
-            // A host that fails to launch (for example a cold host that cannot
-            // install the toolchain) is dropped; its tasks are simply scheduled
-            // onto the survivors by the pull scheduler. A host the filter does
-            // not assign `Compute` is likewise dropped, before it is provisioned.
-            for launcher in &self.launchers {
-                let label = launcher.label();
-                let session = match launcher.connect().await {
-                    Ok(session) => session,
-                    Err(failure) => {
-                        failures.push(failure);
-                        continue;
-                    }
-                };
-                let profile = match launcher.probe(&session).await {
-                    Ok(profile) => profile,
-                    Err(failure) => {
-                        failures.push(failure);
-                        continue;
-                    }
-                };
-                let role = self.role_of(&profile);
-                // A job requirement narrows the compute hosts further: a host
-                // that the fleet runs tasks on, but whose capabilities this job
-                // does not need, is skipped for this run only.
-                let meets_requirement = requires.is_none_or(|predicate| predicate.eval(&profile));
-                events.emit(Event::profiled(&label, profile, role));
-                if role != Role::Compute || !meets_requirement {
-                    continue;
-                }
-                match launcher.activate(session, events).await {
-                    Ok((connection, guard)) => {
-                        agents.push((label, connection));
-                        guards.push(guard);
-                    }
-                    Err(failure) => failures.push(failure),
-                }
-            }
+            // A host that fails to launch (a cold host that cannot install the
+            // toolchain) or that the filter/requirement excludes is dropped; its
+            // tasks are simply scheduled onto the survivors by the pull scheduler.
+            let Launched {
+                agents,
+                guards,
+                failures,
+            } = launch_all(&self.launchers, self.filter.as_ref(), requires, events).await;
             if agents.is_empty() {
-                let detail = failures
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                return Err(std::io::Error::other(format!(
-                    "rayonet: no eligible host (every host failed to launch or was filtered out): {detail}"
-                )));
+                return Err(no_eligible_host(&failures));
             }
             let result = run_job_raw(agents, fn_key, payloads, events).await;
             drop(guards); // agents already shut down via the job's `Shutdown`

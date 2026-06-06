@@ -2,7 +2,8 @@
 //! mode it serves a small registry over stdio; otherwise it exits with code 2.
 //! (Test scaffolding; Phase 7 will feature-gate or relocate it.)
 
-use rayonet::agent::{handler, serve, Registry};
+use rayonet::agent::{handler, Registry};
+use rayonet::node::{run_node, NodeConfig};
 use rayonet::process;
 
 #[tokio::main]
@@ -22,8 +23,16 @@ async fn main() {
             }),
         );
 
-    if let Err(e) = serve(process::agent_connection(), registry).await {
-        eprintln!("rayonet-test-agent: serve error: {e}");
+    // Runs as a leaf (no children file in the test environment); the relay path
+    // is exercised by the node/relay unit tests and the real R2 verification.
+    let config = NodeConfig {
+        registry,
+        source: Vec::new(),
+        binary_name: "rayonet-test-agent".to_string(),
+        toolchain: "stable".to_string(),
+    };
+    if let Err(e) = run_node(config).await {
+        eprintln!("rayonet-test-agent: node error: {e}");
         std::process::exit(1);
     }
 }

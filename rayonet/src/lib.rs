@@ -9,10 +9,12 @@ pub mod capability;
 pub mod coordinator;
 pub mod fleet;
 pub mod framing;
+pub mod node;
 pub mod observability;
 pub mod process;
 pub mod protocol;
 pub mod provisioning;
+pub mod relay;
 pub mod ssh;
 pub mod testing;
 #[cfg(feature = "tui")]

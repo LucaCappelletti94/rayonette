@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::framing::Connection;
+use crate::framing::{Connection, Receiver};
 use crate::protocol::{FromAgent, ToAgent, PROTOCOL_VERSION};
 
 /// A type-erased task: a postcard-encoded input in, a postcard-encoded output
@@ -46,6 +46,37 @@ where
 #[must_use]
 pub fn fn_key<F: ?Sized>(_f: &F) -> &'static str {
     std::any::type_name::<F>()
+}
+
+/// Read the opening `Hello` from a peer (a coordinator or a parent relay) and
+/// return the job's `fn_key`, checking the protocol version. Shared by the leaf
+/// [`serve`] and the relay (`crate::relay`), which begin a session identically.
+///
+/// # Errors
+/// Returns an error on a protocol-version mismatch or any message other than
+/// `Hello` (including a closed stream).
+pub(crate) async fn recv_hello<S>(rx: &mut Receiver<S>) -> std::io::Result<String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match rx.recv::<ToAgent>().await? {
+        Some(ToAgent::Hello {
+            protocol_version,
+            fn_key,
+        }) => {
+            if protocol_version != PROTOCOL_VERSION {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("protocol mismatch: local {PROTOCOL_VERSION}, peer {protocol_version}"),
+                ));
+            }
+            Ok(fn_key)
+        }
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("expected Hello, got {other:?}"),
+        )),
+    }
 }
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -122,28 +153,7 @@ where
 {
     let (mut tx, mut rx) = conn.split();
 
-    let fn_key = match rx.recv::<ToAgent>().await? {
-        Some(ToAgent::Hello {
-            protocol_version,
-            fn_key,
-        }) => {
-            if protocol_version != PROTOCOL_VERSION {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "protocol mismatch: agent {PROTOCOL_VERSION}, coordinator {protocol_version}"
-                    ),
-                ));
-            }
-            fn_key
-        }
-        other => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("expected Hello, got {other:?}"),
-            ));
-        }
-    };
+    let fn_key = recv_hello(&mut rx).await?;
 
     let handler = registry.get(&fn_key).cloned().ok_or_else(|| {
         std::io::Error::new(
@@ -152,7 +162,8 @@ where
         )
     })?;
 
-    tx.send(&FromAgent::Ready).await?;
+    // A leaf runs one task at a time, so it advertises a single slot.
+    tx.send(&FromAgent::Ready { slots: 1 }).await?;
 
     // One task at a time: read an assignment, run it on the blocking pool, and
     // report its outcome before reading the next message.
@@ -206,7 +217,7 @@ mod tests {
             .unwrap();
 
             let ready: FromAgent = rx.recv().await.unwrap().unwrap();
-            assert_eq!(ready, FromAgent::Ready);
+            assert_eq!(ready, FromAgent::Ready { slots: 1 });
 
             let payload = postcard::to_allocvec(&21u32).unwrap();
             tx.send(&ToAgent::Assign {

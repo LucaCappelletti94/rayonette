@@ -135,13 +135,17 @@ pub async fn provision<R: Remote>(
         require_success(host, "rustup install", &remote.run(&install).await?)?;
     }
 
-    // Ship and unpack the crate source.
+    // Ship and unpack the crate source. The tarball is kept beside the build
+    // dir, not inside it: the build dir is what gets re-tarred when a relay node
+    // is itself built here, so a tarball inside it would nest into the bundle
+    // that node re-ships to its own children (and macOS `tar` refuses to extract
+    // an archive over itself).
     events.emit(Event::node(host, NodeState::Syncing));
     let mkdir = format!("mkdir -p {dir}");
     require_success(host, "mkdir", &remote.run(&mkdir).await?)?;
-    let tarball = format!("{dir}/source.tar");
+    let tarball = format!("{dir}.tar");
     remote.upload(source_tar, &tarball).await?;
-    let extract = format!("tar -xf {dir}/source.tar -C {dir}");
+    let extract = format!("tar -xf {tarball} -C {dir}");
     require_success(host, "extract", &remote.run(&extract).await?)?;
 
     // Build just the consumer's package (not every member of a shipped
@@ -322,7 +326,18 @@ mod tests {
                 NodeState::Ready,
             ]
         );
-        assert_eq!(remote.uploads.lock().unwrap().len(), 1);
+        let upload_dest = {
+            let uploads = remote.uploads.lock().unwrap();
+            assert_eq!(uploads.len(), 1);
+            uploads[0].clone()
+        };
+        // The source tarball must live beside the build dir, never inside it, so
+        // re-tarring the build dir (the cascade) cannot nest the bundle.
+        let dir = result.binary_path.trim_end_matches("/target/release/agent");
+        assert!(
+            !upload_dest.starts_with(&format!("{dir}/")),
+            "tarball {upload_dest} must be outside the build dir {dir}"
+        );
         assert!(remote.calls().iter().any(|c| c.contains("rustup")));
         assert!(remote.calls().iter().any(|c| c.contains("cargo build")));
         assert!(result.binary_path.ends_with("/target/release/agent"));

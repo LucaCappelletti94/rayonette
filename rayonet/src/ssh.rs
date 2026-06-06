@@ -89,6 +89,46 @@ impl SshConfig {
     }
 }
 
+/// Expand a leading `~/` to `$HOME` (ssh config does this; a plain path does not).
+/// A path without the prefix, or one given when `$HOME` is unset, is returned
+/// unchanged.
+fn expand_tilde(path: &str) -> String {
+    match (path.strip_prefix("~/"), std::env::var("HOME")) {
+        (Some(rest), Ok(home)) => format!("{home}/{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+/// Parse one `dest[=keyfile]` host spec into an [`SshConfig`].
+///
+/// A bare entry is a destination on the ambient ssh configuration; `dest=keyfile`
+/// authenticates with an explicit private key (a leading `~/` is expanded). This
+/// is the form used by both `RAYONET_HOSTS` and the children file.
+#[must_use]
+pub fn parse_host_spec(entry: &str) -> SshConfig {
+    match entry.split_once('=') {
+        Some((dest, keyfile)) => SshConfig::new(dest.trim()).keyfile(expand_tilde(keyfile.trim())),
+        None => SshConfig::new(entry.trim()),
+    }
+}
+
+/// Parse a host list: `dest[=keyfile]` entries separated by newlines, spaces, or
+/// commas, with blank lines and `#` comments (whole-line or trailing) ignored.
+///
+/// Shared by the `RAYONET_HOSTS` env var and the children file (decentralized
+/// per-node child list).
+#[must_use]
+pub fn parse_host_list(content: &str) -> Vec<SshConfig> {
+    content
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or("")) // drop comments
+        .flat_map(|line| line.split([' ', ',']))
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(parse_host_spec)
+        .collect()
+}
+
 /// A live ssh session that provisioning commands run over (a [`Remote`]).
 #[derive(Debug)]
 pub struct SshRemote {
@@ -282,5 +322,46 @@ impl Launch for Ssh {
             .take()
             .expect("stdout was configured as a pipe");
         Ok((Connection::new(join(stdout, stdin)), child))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{expand_tilde, parse_host_list, parse_host_spec};
+
+    #[test]
+    fn expand_tilde_handles_home_and_plain_paths() {
+        std::env::set_var("HOME", "/home/test");
+        assert_eq!(expand_tilde("~/.ssh/key"), "/home/test/.ssh/key");
+        // A path without the `~/` prefix is returned unchanged.
+        assert_eq!(expand_tilde("/abs/key"), "/abs/key");
+        assert_eq!(expand_tilde("relative"), "relative");
+    }
+
+    #[test]
+    fn host_spec_parses_bare_and_keyed_destinations() {
+        std::env::set_var("HOME", "/home/test");
+        let bare = parse_host_spec("mac");
+        assert!(format!("{bare:?}").contains("\"mac\""));
+        assert!(format!("{bare:?}").contains("keyfile: None"));
+
+        let keyed = parse_host_spec("user@host = ~/.ssh/id");
+        assert!(format!("{keyed:?}").contains("\"user@host\""));
+        assert!(format!("{keyed:?}").contains("/home/test/.ssh/id"));
+    }
+
+    #[test]
+    fn host_list_ignores_comments_and_blanks_and_splits() {
+        let body = "\
+            # a comment\n\
+            \n\
+            mac\n\
+            box-a, box-b   box-c  # trailing comment\n";
+        let hosts = parse_host_list(body);
+        let rendered: Vec<String> = hosts.iter().map(|h| format!("{h:?}")).collect();
+        assert_eq!(hosts.len(), 4, "{rendered:?}");
+        assert!(rendered[0].contains("\"mac\""));
+        assert!(rendered[1].contains("\"box-a\""));
+        assert!(rendered[3].contains("\"box-c\""));
     }
 }

@@ -11,7 +11,10 @@ use std::sync::{Mutex, PoisonError};
 use std::task::{Context, Poll};
 
 use tokio::io::{duplex, AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+use tokio::task::JoinHandle;
 
+use crate::agent::{serve, Registry};
+use crate::fleet::Launch;
 use crate::framing::Connection;
 use crate::observability::{Event, EventSink, NodeState};
 
@@ -150,6 +153,51 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for FaultInjector<S> {
     }
 }
 
+/// An in-process [`Launch`] that serves a [`Registry`] over a duplex pipe.
+///
+/// Drives a fleet or a relay end-to-end in a test without real processes or ssh.
+/// Its session is trivial and its profile is the default unknown.
+#[derive(Debug)]
+pub struct LocalAgent {
+    label: String,
+    registry: Registry,
+}
+
+impl LocalAgent {
+    /// A launcher labeled `label` that serves `registry` when activated.
+    #[must_use]
+    pub fn new(label: impl Into<String>, registry: Registry) -> Self {
+        Self {
+            label: label.into(),
+            registry,
+        }
+    }
+}
+
+impl Launch for LocalAgent {
+    type Stream = DuplexStream;
+    type Guard = JoinHandle<std::io::Result<()>>;
+    type Session = ();
+
+    fn label(&self) -> String {
+        self.label.clone()
+    }
+
+    async fn connect(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn activate(
+        &self,
+        _session: (),
+        _events: &dyn EventSink,
+    ) -> std::io::Result<(Connection<DuplexStream>, Self::Guard)> {
+        let (client, server) = connection_pair(256);
+        let task = tokio::spawn(serve(server, self.registry.clone()));
+        Ok((client, task))
+    }
+}
+
 /// A value whose serialization always fails, for exercising encode-error paths.
 #[derive(Debug)]
 pub struct FailsToSerialize;
@@ -162,10 +210,17 @@ impl serde::Serialize for FailsToSerialize {
 
 #[cfg(test)]
 mod tests {
-    use super::{connection_pair, FaultInjector};
+    use super::{connection_pair, FaultInjector, LocalAgent};
+    use crate::agent::Registry;
     use crate::framing::Connection;
     use crate::protocol::ToAgent;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn local_agent_renders_debug() {
+        let agent = LocalAgent::new("leaf-x", Registry::new());
+        assert!(format!("{agent:?}").contains("LocalAgent"));
+    }
 
     #[tokio::test]
     async fn connection_pair_roundtrips() {

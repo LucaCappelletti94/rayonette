@@ -1,8 +1,9 @@
 //! The coordinator side of a run.
 //!
-//! Hands a job's inputs to a set of agents, schedules them by pull (an idle
-//! agent gets the next pending task, one at a time), and assembles the results
-//! in input order (PLAN.md Phase 1).
+//! Hands a job's inputs to a set of agents, schedules them by pull (each agent
+//! is kept filled to its advertised capacity from the pending pool, one slot for
+//! a leaf and more for a relay fronting a subtree), and assembles the results in
+//! input order (PLAN.md Phase 1).
 //!
 //! Each agent connection is split: the coordinator keeps the send half to issue
 //! `Assign`/`Shutdown`, and a per-agent reader task drains the receive half into
@@ -20,8 +21,10 @@ use crate::observability::{Event as Obs, EventSink, NodeState};
 use crate::protocol::{FromAgent, TaskId, ToAgent, PROTOCOL_VERSION};
 
 /// What a reader task forwards to the coordinator's central loop. A read error
-/// and a clean disconnect are treated alike: the agent is lost.
-enum Event {
+/// and a clean disconnect are treated alike: the agent is lost. Shared with the
+/// relay (`crate::relay`), which reuses [`connect_agents`] and the same reader
+/// channel to multiplex its children.
+pub(crate) enum Event {
     Message(FromAgent),
     Lost(usize),
 }
@@ -48,15 +51,19 @@ where
 }
 
 /// The per-agent state produced by the handshake.
-struct Agents<S> {
-    senders: Vec<Sender<S>>,
-    labels: Vec<String>,
-    readers: Vec<JoinHandle<()>>,
+pub(crate) struct Agents<S> {
+    pub(crate) senders: Vec<Sender<S>>,
+    pub(crate) labels: Vec<String>,
+    /// Each agent's advertised concurrency: how many tasks it can hold at once
+    /// (1 for a leaf, the ready-slot count for a relay).
+    pub(crate) capacity: Vec<usize>,
+    pub(crate) readers: Vec<JoinHandle<()>>,
 }
 
 /// Handshake with every agent (send `Hello`, receive `Ready`) and spawn each
-/// agent's reader task feeding the central channel.
-async fn connect_agents<S>(
+/// agent's reader task feeding the central channel. The agent's advertised
+/// `slots` become its scheduling capacity.
+pub(crate) async fn connect_agents<S>(
     agents: Vec<(String, Connection<S>)>,
     fn_key: &str,
     events_tx: &mpsc::UnboundedSender<Event>,
@@ -67,6 +74,7 @@ where
     let mut out = Agents {
         senders: Vec::with_capacity(agents.len()),
         labels: Vec::with_capacity(agents.len()),
+        capacity: Vec::with_capacity(agents.len()),
         readers: Vec::with_capacity(agents.len()),
     };
     for (agent_id, (label, conn)) in agents.into_iter().enumerate() {
@@ -77,7 +85,7 @@ where
         })
         .await?;
         match rx.recv::<FromAgent>().await? {
-            Some(FromAgent::Ready) => {}
+            Some(FromAgent::Ready { slots }) => out.capacity.push(slots),
             other => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -96,8 +104,11 @@ where
 /// Mutable scheduling state for one run.
 struct Job<S> {
     senders: Vec<Sender<S>>,
-    /// Whether each agent is currently running a task (one at a time).
-    busy: Vec<bool>,
+    /// How many tasks each agent is currently running (kept below `capacity`).
+    in_flight: Vec<usize>,
+    /// How many tasks each agent may hold in flight at once (its advertised
+    /// `slots`): 1 for a leaf, more for a relay fronting a subtree.
+    capacity: Vec<usize>,
     /// Whether each agent's connection is still up; a lost one takes no tasks.
     alive: Vec<bool>,
     pending: VecDeque<usize>,
@@ -112,24 +123,24 @@ impl<S> Job<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    /// Assign the next pending task to an agent if it is idle and alive. A lost
-    /// or busy agent takes nothing.
-    async fn assign_one(&mut self, agent: usize) -> std::io::Result<()> {
-        if !self.alive[agent] || self.busy[agent] {
-            return Ok(());
+    /// Fill an agent up to its capacity from the pending pool, so a relay
+    /// fronting many slots is kept fed while a leaf still holds one task. A lost
+    /// agent takes nothing.
+    async fn assign_up_to_capacity(&mut self, agent: usize) -> std::io::Result<()> {
+        while self.alive[agent] && self.in_flight[agent] < self.capacity[agent] {
+            let Some(idx) = self.pending.pop_front() else {
+                return Ok(());
+            };
+            let task_id = idx as TaskId;
+            self.senders[agent]
+                .send(&ToAgent::Assign {
+                    task_id,
+                    payload: self.payloads[idx].clone(),
+                })
+                .await?;
+            self.assigned.insert(task_id, (agent, idx));
+            self.in_flight[agent] += 1;
         }
-        let Some(idx) = self.pending.pop_front() else {
-            return Ok(());
-        };
-        let task_id = idx as TaskId;
-        self.senders[agent]
-            .send(&ToAgent::Assign {
-                task_id,
-                payload: self.payloads[idx].clone(),
-            })
-            .await?;
-        self.assigned.insert(task_id, (agent, idx));
-        self.busy[agent] = true;
         Ok(())
     }
 
@@ -139,7 +150,7 @@ where
         // `assigned` holds each task_id at most once (removed on first record),
         // so a duplicate returns `None` here and this runs exactly once per task.
         let (agent, idx) = self.assigned.remove(&task_id)?;
-        self.busy[agent] = false;
+        self.in_flight[agent] -= 1;
         self.results[idx] = Some(result);
         self.remaining -= 1;
         Some(agent)
@@ -163,6 +174,7 @@ where
                 self.pending.push_back(idx);
             }
         }
+        self.in_flight[agent] = 0;
     }
 
     /// Whether any agent is still alive to take work.
@@ -186,8 +198,8 @@ where
                 task: task_id,
                 ok,
             });
-            self.assign_one(agent).await?;
-            if !self.busy[agent] {
+            self.assign_up_to_capacity(agent).await?;
+            if self.in_flight[agent] == 0 {
                 events.emit(Obs::node(&labels[agent], NodeState::Idle));
             }
         }
@@ -244,6 +256,7 @@ where
     let Agents {
         senders,
         labels,
+        capacity,
         readers,
     } = connect_agents(agents, fn_key, &events_tx).await?;
     drop(events_tx); // the channel ends when every reader does
@@ -251,7 +264,8 @@ where
     let agent_count = senders.len();
     let mut job: Job<S> = Job {
         senders,
-        busy: vec![false; agent_count],
+        in_flight: vec![0; agent_count],
+        capacity,
         alive: vec![true; agent_count],
         pending: (0..num_tasks).collect(),
         assigned: HashMap::new(),
@@ -262,8 +276,8 @@ where
 
     events.emit(Obs::RunStarted { tasks: num_tasks });
     for (agent, label) in labels.iter().enumerate() {
-        job.assign_one(agent).await?;
-        if job.busy[agent] {
+        job.assign_up_to_capacity(agent).await?;
+        if job.in_flight[agent] > 0 {
             events.emit(Obs::node(label, NodeState::Working));
         }
     }
@@ -271,7 +285,7 @@ where
     while job.remaining > 0 {
         let event = events_rx.recv().await;
         match event {
-            Some(Event::Message(FromAgent::Ready)) => {
+            Some(Event::Message(FromAgent::Ready { .. })) => {
                 // Ready is a handshake message; a second one is a protocol error.
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -309,7 +323,7 @@ where
                     ));
                 }
                 for survivor in 0..agent_count {
-                    job.assign_one(survivor).await?;
+                    job.assign_up_to_capacity(survivor).await?;
                 }
             }
             None => {
@@ -593,7 +607,7 @@ mod tests {
         let fake_a = tokio::spawn(async move {
             let (mut tx, mut rx) = server_a.split();
             let _hello: ToAgent = rx.recv().await.unwrap().unwrap();
-            tx.send(&FromAgent::Ready).await.unwrap();
+            tx.send(&FromAgent::Ready { slots: 1 }).await.unwrap();
             let _assign: ToAgent = rx.recv().await.unwrap().unwrap();
             tx.send(&FromAgent::Failed {
                 task_id: 0,
@@ -655,13 +669,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_agent_is_filled_to_its_advertised_capacity() {
+        // An agent advertising three slots is handed three tasks up front,
+        // before it completes any: proof the coordinator keeps a multi-slot
+        // agent (a relay fronting a subtree) fed rather than one-at-a-time.
+        let (client, server) = connection_pair(256);
+        let fake = tokio::spawn(async move {
+            let (mut tx, mut rx) = server.split();
+            let _hello: ToAgent = rx.recv().await.unwrap().unwrap();
+            tx.send(&FromAgent::Ready { slots: 3 }).await.unwrap();
+
+            // Read three assignments before reporting any completion. With a
+            // one-slot agent this would deadlock (the coordinator would wait for
+            // a completion before sending the second), so reaching three proves
+            // the capacity is honored.
+            let mut ids = Vec::new();
+            for _ in 0..3 {
+                match rx.recv::<ToAgent>().await.unwrap().unwrap() {
+                    ToAgent::Assign { task_id, .. } => ids.push(task_id),
+                    other => panic!("expected Assign, got {other:?}"),
+                }
+            }
+            for id in ids {
+                tx.send(&FromAgent::Completed {
+                    task_id: id,
+                    output: postcard::to_allocvec(&0u32).unwrap(),
+                })
+                .await
+                .unwrap();
+            }
+            // The remaining two tasks arrive as slots free; complete each.
+            loop {
+                match rx.recv::<ToAgent>().await.unwrap() {
+                    Some(ToAgent::Assign { task_id, .. }) => tx
+                        .send(&FromAgent::Completed {
+                            task_id,
+                            output: postcard::to_allocvec(&0u32).unwrap(),
+                        })
+                        .await
+                        .unwrap(),
+                    Some(ToAgent::Shutdown) | None => break,
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        });
+
+        let out: Vec<Result<u32, String>> =
+            run(vec![client], "k", (0..5u32).collect()).await.unwrap();
+        assert_eq!(out, vec![Ok(0); 5]);
+        fake.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn errors_when_agent_readies_twice() {
         let (client, server) = connection_pair(64);
         let fake = tokio::spawn(async move {
             let (mut tx, mut rx) = server.split();
             let _hello: ToAgent = rx.recv().await.unwrap().unwrap();
-            tx.send(&FromAgent::Ready).await.unwrap();
-            tx.send(&FromAgent::Ready).await.unwrap();
+            tx.send(&FromAgent::Ready { slots: 1 }).await.unwrap();
+            tx.send(&FromAgent::Ready { slots: 1 }).await.unwrap();
             let _ = rx.recv::<ToAgent>().await;
         });
         let res = run::<_, u32, u32>(vec![client], "k", vec![1u32, 2, 3]).await;
@@ -715,7 +781,7 @@ mod tests {
         let fake = tokio::spawn(async move {
             let (mut tx, mut rx) = server.split();
             let _hello: ToAgent = rx.recv().await.unwrap().unwrap();
-            tx.send(&FromAgent::Ready).await.unwrap();
+            tx.send(&FromAgent::Ready { slots: 1 }).await.unwrap();
             let _assign: ToAgent = rx.recv().await.unwrap().unwrap();
             // Drop without completing: the coordinator sees end-of-stream.
         });
@@ -736,7 +802,7 @@ mod tests {
         let fake = tokio::spawn(async move {
             let (mut tx, mut rx) = server.split();
             let _hello: ToAgent = rx.recv().await.unwrap().unwrap();
-            tx.send(&FromAgent::Ready).await.unwrap();
+            tx.send(&FromAgent::Ready { slots: 1 }).await.unwrap();
             let _assign: ToAgent = rx.recv().await.unwrap().unwrap();
             // Output bytes that are not a valid u32 encoding.
             tx.send(&FromAgent::Completed {
@@ -759,7 +825,7 @@ mod tests {
         let fake = tokio::spawn(async move {
             let (mut tx, mut rx) = server.split();
             let _hello: ToAgent = rx.recv().await.unwrap().unwrap();
-            tx.send(&FromAgent::Ready).await.unwrap();
+            tx.send(&FromAgent::Ready { slots: 1 }).await.unwrap();
             tx.send(&255u8).await.unwrap(); // not a valid FromAgent frame
                                             // Stay connected until the coordinator reacts (it sends an Assign,
                                             // then drops); receiving that or EOF ends this task with no dead line.
@@ -776,7 +842,7 @@ mod tests {
         let fake = tokio::spawn(async move {
             let (mut tx, mut rx) = server.split();
             let _hello: ToAgent = rx.recv().await.unwrap().unwrap();
-            tx.send(&FromAgent::Ready).await.unwrap();
+            tx.send(&FromAgent::Ready { slots: 1 }).await.unwrap();
 
             // First task completes, then a duplicate completion for it arrives.
             let _a0: ToAgent = rx.recv().await.unwrap().unwrap();
