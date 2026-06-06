@@ -96,6 +96,22 @@ fn active_labels(
 /// metric measured so far, so the widest-bandwidth metric waits on a bandwidth
 /// probe.
 fn dedup_active(reports: &[FirstReport], labels: &[String], latencies: &[u64]) -> Vec<Vec<String>> {
+    let (relay_agents, relays) = relay_reports(reports, labels, latencies);
+    let chosen = crate::graph::choose_active(&relays, crate::graph::Metric::ShortestLatency);
+    let mut actives = vec![Vec::new(); reports.len()];
+    for (slot, agent) in relay_agents.into_iter().enumerate() {
+        actives[agent].clone_from(&chosen[slot]);
+    }
+    actives
+}
+
+/// The relay agents among `reports` as [`graph::RelayReport`]s for path analysis,
+/// paired with their agent indices (so results scatter back to the right agent).
+fn relay_reports(
+    reports: &[FirstReport],
+    labels: &[String],
+    latencies: &[u64],
+) -> (Vec<usize>, Vec<crate::graph::RelayReport>) {
     let mut relay_agents = Vec::new();
     let mut relays = Vec::new();
     for (agent, report) in reports.iter().enumerate() {
@@ -108,12 +124,7 @@ fn dedup_active(reports: &[FirstReport], labels: &[String], latencies: &[u64]) -
             });
         }
     }
-    let chosen = crate::graph::choose_active(&relays, crate::graph::Metric::ShortestLatency);
-    let mut actives = vec![Vec::new(); reports.len()];
-    for (slot, agent) in relay_agents.into_iter().enumerate() {
-        actives[agent].clone_from(&chosen[slot]);
-    }
-    actives
+    (relay_agents, relays)
 }
 
 /// An `InvalidData` error for an unexpected handshake reply.
@@ -146,6 +157,7 @@ pub(crate) async fn connect_agents<S>(
     fn_key: &str,
     events_tx: &mpsc::UnboundedSender<Event>,
     agent_latencies: &[u64],
+    require_redundancy: bool,
     policy: &ActivationPolicy,
 ) -> std::io::Result<Agents<S>>
 where
@@ -173,6 +185,16 @@ where
     // Phase 2: choose each relay's active children (deduping redundant paths by
     // the link metric), tell each relay, then read its readiness.
     let labels: Vec<String> = parts.iter().map(|(label, _, _)| label.clone()).collect();
+    if require_redundancy {
+        let (_, relays) = relay_reports(&reports, &labels, agent_latencies);
+        let gaps = crate::graph::redundancy_gaps(&relays);
+        if !gaps.is_empty() {
+            return Err(std::io::Error::other(format!(
+                "rayonet: require_redundancy: compute reachable through only one relay: {}",
+                gaps.join(", ")
+            )));
+        }
+    }
     let actives = active_labels(&reports, &labels, agent_latencies, policy);
     let mut out = Agents {
         senders: Vec::with_capacity(parts.len()),
@@ -462,6 +484,7 @@ pub(crate) async fn run_job_raw<S>(
     fn_key: &str,
     payloads: Vec<Vec<u8>>,
     agent_latencies: &[u64],
+    require_redundancy: bool,
     events: &dyn EventSink,
 ) -> std::io::Result<Vec<Result<Vec<u8>, String>>>
 where
@@ -481,6 +504,7 @@ where
         fn_key,
         &events_tx,
         agent_latencies,
+        require_redundancy,
         &ActivationPolicy::DedupById,
     )
     .await?;
@@ -560,8 +584,9 @@ where
 {
     let payloads = serialize_inputs(&inputs)?;
     // The typed entry carries no measured latencies, so redundant paths dedup by
-    // id order. The fleet's real path supplies them for metric-based selection.
-    let raw = run_job_raw(agents, fn_key, payloads, &[], events).await?;
+    // id order, and it does not enforce redundancy. The fleet's real path supplies
+    // both.
+    let raw = run_job_raw(agents, fn_key, payloads, &[], false, events).await?;
     Ok(raw.into_iter().map(decode_output::<O>).collect())
 }
 

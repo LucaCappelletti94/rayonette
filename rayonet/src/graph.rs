@@ -107,10 +107,30 @@ pub struct RelayReport {
 /// on its best path and the others hold it standby.
 #[must_use]
 pub fn choose_active(relays: &[RelayReport], metric: Metric) -> Vec<Vec<String>> {
-    // Synthesize the two-level run state (root -> relay -> child) the topology is
-    // built from, weighting each edge with its measured latency. A relay's own
-    // label doubles as its vertex id (relays are distinct), so only shared child
-    // ids dedup.
+    let primaries = Topology::from_run_state(&relay_topology(relays)).select_primaries(metric);
+    relays
+        .iter()
+        .map(|relay| {
+            relay
+                .children
+                .iter()
+                .filter(|child| {
+                    // A uniquely reached child (absent from the primary map) is
+                    // always active. A shared one runs only on its primary relay.
+                    primaries.get(&child.id).is_none_or(|order| {
+                        order.first().map(String::as_str) == Some(relay.label.as_str())
+                    })
+                })
+                .map(|child| child.label.clone())
+                .collect()
+        })
+        .collect()
+}
+
+/// The synthesized two-level run state (root -> relay -> child) the path metric is
+/// built from, weighting each edge with its measured latency. A relay's own label
+/// doubles as its vertex id (relays are distinct), so only shared child ids dedup.
+fn relay_topology(relays: &[RelayReport]) -> RunState {
     let mut state = RunState::default();
     for relay in relays {
         state.apply(&Event::profiled(
@@ -130,24 +150,23 @@ pub fn choose_active(relays: &[RelayReport], metric: Metric) -> Vec<Vec<String>>
             ));
         }
     }
-    let primaries = Topology::from_run_state(&state).select_primaries(metric);
-    relays
-        .iter()
-        .map(|relay| {
-            relay
-                .children
-                .iter()
-                .filter(|child| {
-                    // A uniquely reached child (absent from the primary map) is
-                    // always active. A shared one runs only on its primary relay.
-                    primaries.get(&child.id).is_none_or(|order| {
-                        order.first().map(String::as_str) == Some(relay.label.as_str())
-                    })
-                })
-                .map(|child| child.label.clone())
-                .collect()
-        })
-        .collect()
+    state
+}
+
+/// The physical ids of the compute children reachable through only one relay, so
+/// no alternate path survives that relay's death. A run that requires redundancy
+/// refuses to start when this is non-empty.
+#[must_use]
+pub fn redundancy_gaps(relays: &[RelayReport]) -> Vec<String> {
+    let topology = Topology::from_run_state(&relay_topology(relays));
+    let mut gaps = Vec::new();
+    let mut seen = BTreeSet::new();
+    for child in relays.iter().flat_map(|relay| &relay.children) {
+        if seen.insert(child.id.as_str()) && !topology.is_redundant(&child.id) {
+            gaps.push(child.id.clone());
+        }
+    }
+    gaps
 }
 
 /// The discovered relay tree as a DAG over physical nodes, keyed by stable id.
@@ -685,6 +704,32 @@ mod tests {
         // the shared leaf as a standby.
         assert_eq!(active[0], vec!["L".to_string(), "U".to_string()]);
         assert!(active[1].is_empty());
+    }
+
+    #[test]
+    fn redundancy_gaps_flags_compute_behind_a_single_relay() {
+        use super::{redundancy_gaps, RelayReport};
+        use crate::protocol::ChildAd;
+        let child = |label: &str, id: &str| ChildAd {
+            label: label.to_string(),
+            id: id.to_string(),
+            slots: 1,
+            latency_us: 0,
+        };
+        // L is shared by both relays (redundant). X hangs off relay A alone.
+        let relays = vec![
+            RelayReport {
+                label: "A".to_string(),
+                latency_us: 0,
+                children: vec![child("L", "idL"), child("X", "idX")],
+            },
+            RelayReport {
+                label: "B".to_string(),
+                latency_us: 0,
+                children: vec![child("L", "idL")],
+            },
+        ];
+        assert_eq!(redundancy_gaps(&relays), vec!["idX".to_string()]);
     }
 
     #[test]

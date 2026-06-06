@@ -368,6 +368,7 @@ where
         &fn_key,
         &child_events_tx,
         &latencies,
+        false,
         &ActivationPolicy::ApproveAll,
     )
     .await?;
@@ -920,6 +921,62 @@ mod tests {
         };
         let (res, ()) = tokio::join!(relay_fut, driver);
         assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn require_redundancy_refuses_compute_behind_a_lone_relay() {
+        use crate::coordinator::{run_job_raw, serialize_inputs};
+        // One relay with a single leaf has no redundant path, so a run that
+        // requires redundancy refuses before any task is scheduled.
+        let (coord, relay_side) = connection_pair(4096);
+        let relay_task = tokio::spawn(relay(
+            relay_side,
+            vec![LocalAgent::new(
+                "only",
+                Registry::new().with("id", handler(|x: u32| x)),
+            )],
+        ));
+        let payloads = serialize_inputs(&(0..4u32).collect::<Vec<_>>()).unwrap();
+        let err = run_job_raw(
+            vec![("A".to_string(), coord)],
+            "id",
+            payloads,
+            &[],
+            true,
+            &NoopSink,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("require_redundancy"), "{err}");
+        let _ = relay_task.await;
+    }
+
+    #[tokio::test]
+    async fn require_redundancy_admits_a_node_reached_through_two_relays() {
+        use crate::coordinator::{run_job_raw, serialize_inputs};
+        // Two relays reach a leaf with the same id, so the leaf is redundant and a
+        // redundancy-required run proceeds, scheduling on its primary path.
+        let reg = || Registry::new().with("id", handler(|x: u32| x));
+        let (coord_p, primary_side) = connection_pair(4096);
+        let primary = tokio::spawn(relay(primary_side, vec![LocalAgent::new("shared", reg())]));
+        let (coord_s, standby_side) = connection_pair(4096);
+        let standby = tokio::spawn(relay(standby_side, vec![LocalAgent::new("shared", reg())]));
+
+        let payloads = serialize_inputs(&(0..6u32).collect::<Vec<_>>()).unwrap();
+        let raw = run_job_raw(
+            vec![("A".to_string(), coord_p), ("B".to_string(), coord_s)],
+            "id",
+            payloads,
+            &[],
+            true,
+            &NoopSink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(raw.len(), 6);
+        assert!(raw.iter().all(Result::is_ok));
+        let _ = primary.await;
+        let _ = standby.await;
     }
 
     #[tokio::test]

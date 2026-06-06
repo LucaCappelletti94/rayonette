@@ -297,6 +297,7 @@ trait ErasedFleet: Send + Sync {
         fn_key: &'a str,
         payloads: Vec<Vec<u8>>,
         requires: Option<&'a Predicate>,
+        require_redundancy: bool,
     ) -> Pin<Box<dyn Future<Output = RawResults> + Send + 'a>>;
 }
 
@@ -306,6 +307,7 @@ impl<L: Launch + Send + Sync> ErasedFleet for Fleet<L> {
         fn_key: &'a str,
         payloads: Vec<Vec<u8>>,
         requires: Option<&'a Predicate>,
+        require_redundancy: bool,
     ) -> Pin<Box<dyn Future<Output = RawResults> + Send + 'a>> {
         Box::pin(async move {
             let events = self.events.as_ref();
@@ -322,7 +324,15 @@ impl<L: Launch + Send + Sync> ErasedFleet for Fleet<L> {
             if agents.is_empty() {
                 return Err(no_eligible_host(&failures));
             }
-            let result = run_job_raw(agents, fn_key, payloads, &latencies, events).await;
+            let result = run_job_raw(
+                agents,
+                fn_key,
+                payloads,
+                &latencies,
+                require_redundancy,
+                events,
+            )
+            .await;
             drop(guards); // agents already shut down via the job's `Shutdown`
             result
         })
@@ -370,6 +380,7 @@ pub struct NetMap<'a, F, I> {
     map: F,
     inputs: Vec<I>,
     requires: Option<Predicate>,
+    require_redundancy: bool,
 }
 
 impl<F, I> std::fmt::Debug for NetMap<'_, F, I> {
@@ -391,6 +402,14 @@ impl<F, I> NetMap<'_, F, I> {
         self.requires = Some(predicate);
         self
     }
+
+    /// Refuse to run if any compute node is reachable through only one relay, so a
+    /// single relay's death could strand it. The run fails before any task starts,
+    /// naming the nodes that lack a redundant path.
+    pub const fn require_redundancy(mut self) -> Self {
+        self.require_redundancy = true;
+        self
+    }
 }
 
 impl<F, I> NetMap<'_, F, I>
@@ -407,9 +426,12 @@ where
         let key = fn_key(&self.map);
         let payloads = serialize_inputs(&self.inputs)?;
         let requires = self.requires;
+        let redundancy = self.require_redundancy;
         let raw = match self.runner {
             RunnerRef::Borrowed(fleet) => {
-                fleet.run_erased(key, payloads, requires.as_ref()).await?
+                fleet
+                    .run_erased(key, payloads, requires.as_ref(), redundancy)
+                    .await?
             }
             RunnerRef::Global => {
                 let fleet = global_fleet().ok_or_else(|| {
@@ -417,7 +439,9 @@ where
                         "rayonet: no global fleet installed; call rayonet::install_fleet(fleet) or use net_map_with_fleet",
                     )
                 })?;
-                fleet.run_erased(key, payloads, requires.as_ref()).await?
+                fleet
+                    .run_erased(key, payloads, requires.as_ref(), redundancy)
+                    .await?
             }
         };
         Ok(raw.into_iter().map(decode_output::<O>).collect())
@@ -524,6 +548,7 @@ pub trait NetMapExt: IntoIterator + Sized {
             map,
             inputs: self.into_iter().collect(),
             requires: None,
+            require_redundancy: false,
         }
     }
 
@@ -545,6 +570,7 @@ pub trait NetMapExt: IntoIterator + Sized {
             map,
             inputs: self.into_iter().collect(),
             requires: None,
+            require_redundancy: false,
         }
     }
 }
@@ -1184,6 +1210,20 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no eligible host"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn require_redundancy_admits_direct_hosts() {
+        // Direct compute hosts sit behind no relay, so requiring redundancy does
+        // not reject them and the run proceeds.
+        let fleet = Fleet::new((0..2).map(|_| InProcess::serving(true)).collect());
+        let out: Vec<Result<u32, String>> = (0..6u32)
+            .net_map_with_fleet(double, &fleet)
+            .require_redundancy()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(out, (0..6u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
     }
 
     #[tokio::test]
