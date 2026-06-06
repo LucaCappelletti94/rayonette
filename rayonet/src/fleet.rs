@@ -142,35 +142,47 @@ pub(crate) struct Launched<L: Launch> {
     pub failures: Vec<std::io::Error>,
 }
 
-/// Bring up a set of launchers: connect, probe, drop any the `filter` does not
-/// assign [`Role::Compute`] or that fail the job `requires`, then activate the
-/// survivors. A host that fails any phase is dropped (its error kept), so a cold
-/// or filtered host never blocks the run. Shared by the fleet coordinator and
-/// the relay (which launches its own children the same way).
-pub(crate) async fn launch_all<L: Launch + Send + Sync>(
-    launchers: &[L],
+/// A host discovery has brought up: identified and eligible to run, holding the
+/// session [`provision_all`] will consume to activate it. Discovery identifies
+/// every host in a layer before any is activated, so a node reached by two relays
+/// can be deduped by id before either path provisions it (a payoff that lands in
+/// later redundancy work. Here every eligible host is simply provisioned).
+struct Discovered<'a, L: Launch> {
+    /// The launcher that discovered (and will activate) this host.
+    launcher: &'a L,
+    /// The host's label, used to attribute its observability events.
+    label: String,
+    /// The open session from [`Launch::connect`], handed to [`Launch::activate`].
+    session: L::Session,
+}
+
+/// Discovery: connect, probe, and identify every launcher, emitting each as a
+/// `Profiled` fact, and return those eligible to run (assigned [`Role::Compute`]
+/// and meeting the job `requires`) holding their open sessions. A host that fails
+/// to connect or probe is dropped with its error kept (for the no-eligible-host
+/// message). A filtered or unneeded host is dropped without error. No host is
+/// activated here: identity precedes provisioning.
+async fn discover_all<'a, L: Launch + Send + Sync>(
+    launchers: &'a [L],
     filter: Option<&Filter>,
     requires: Option<&Predicate>,
     events: &dyn EventSink,
-) -> Launched<L> {
-    let mut out = Launched {
-        agents: Vec::with_capacity(launchers.len()),
-        guards: Vec::with_capacity(launchers.len()),
-        failures: Vec::new(),
-    };
+) -> (Vec<Discovered<'a, L>>, Vec<std::io::Error>) {
+    let mut eligible = Vec::with_capacity(launchers.len());
+    let mut failures = Vec::new();
     for launcher in launchers {
         let label = launcher.label();
         let session = match launcher.connect().await {
             Ok(session) => session,
             Err(failure) => {
-                out.failures.push(failure);
+                failures.push(failure);
                 continue;
             }
         };
         let profile = match launcher.probe(&session).await {
             Ok(profile) => profile,
             Err(failure) => {
-                out.failures.push(failure);
+                failures.push(failure);
                 continue;
             }
         };
@@ -184,15 +196,56 @@ pub(crate) async fn launch_all<L: Launch + Send + Sync>(
         if role != Role::Compute || !meets_requirement {
             continue;
         }
-        match launcher.activate(session, events).await {
+        eligible.push(Discovered {
+            launcher,
+            label,
+            session,
+        });
+    }
+    (eligible, failures)
+}
+
+/// Provisioning: activate and spawn the agent on each discovered host, consuming
+/// its session. A host whose activation fails is dropped (its error added to the
+/// discovery `failures`), so a cold host never blocks the run.
+async fn provision_all<L: Launch + Send + Sync>(
+    discovered: Vec<Discovered<'_, L>>,
+    mut failures: Vec<std::io::Error>,
+    events: &dyn EventSink,
+) -> Launched<L> {
+    let mut agents = Vec::with_capacity(discovered.len());
+    let mut guards = Vec::with_capacity(discovered.len());
+    for host in discovered {
+        match host.launcher.activate(host.session, events).await {
             Ok((connection, guard)) => {
-                out.agents.push((label, connection));
-                out.guards.push(guard);
+                agents.push((host.label, connection));
+                guards.push(guard);
             }
-            Err(failure) => out.failures.push(failure),
+            Err(failure) => failures.push(failure),
         }
     }
-    out
+    Launched {
+        agents,
+        guards,
+        failures,
+    }
+}
+
+/// Bring up a set of launchers in two passes: discover every host (connect,
+/// probe, identify), dropping any the `filter` does not assign [`Role::Compute`]
+/// or that fail the job `requires`, then provision (activate) the survivors. A
+/// host that fails any phase is dropped (its error kept), so a cold or filtered
+/// host never blocks the run. Splitting discovery from provisioning means every
+/// host's identity is known before any is activated. Shared by the fleet
+/// coordinator and the relay (which launches its own children the same way).
+pub(crate) async fn launch_all<L: Launch + Send + Sync>(
+    launchers: &[L],
+    filter: Option<&Filter>,
+    requires: Option<&Predicate>,
+    events: &dyn EventSink,
+) -> Launched<L> {
+    let (discovered, failures) = discover_all(launchers, filter, requires, events).await;
+    provision_all(discovered, failures, events).await
 }
 
 /// The no-eligible-host error message from a [`launch_all`] pass that left no
@@ -709,6 +762,96 @@ mod tests {
     // case (which never folds) does not leave an uncovered closure behind.
     fn add(a: u32, b: u32) -> u32 {
         a + b
+    }
+
+    /// A launcher that records the order of its `probe` and `activate` calls into
+    /// a shared timeline, so a test can prove discovery (probe and identify) of a
+    /// whole layer precedes provisioning (activate) of any of it.
+    struct Timeline {
+        label: String,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        registry: Registry,
+    }
+
+    impl Launch for Timeline {
+        type Stream = DuplexStream;
+        type Guard = JoinHandle<std::io::Result<()>>;
+        type Session = ();
+
+        fn label(&self) -> String {
+            self.label.clone()
+        }
+
+        async fn connect(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        async fn probe(&self, _session: &()) -> std::io::Result<NodeProfile> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("probe {}", self.label));
+            Ok(NodeProfile::unknown())
+        }
+
+        async fn activate(
+            &self,
+            _session: (),
+            _events: &dyn EventSink,
+        ) -> std::io::Result<(Connection<DuplexStream>, Self::Guard)> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("activate {}", self.label));
+            let (client, server) = connection_pair(256);
+            let task = tokio::spawn(serve(server, self.registry.clone()));
+            Ok((client, task))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_layer_is_fully_discovered_before_any_of_it_is_provisioned() {
+        // Identity must be known before activation, so a node reached by two
+        // relays is not double-activated: every host in a layer is probed and
+        // identified before any host is activated. With the old interleaved
+        // launch (probe a, activate a, probe b, ...) host b's probe would land
+        // after host a's activate. The split orders all probes before any
+        // activate.
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let launchers = vec![
+            Timeline {
+                label: "a".to_string(),
+                log: log.clone(),
+                registry: Registry::new().with_fn(double),
+            },
+            Timeline {
+                label: "b".to_string(),
+                log: log.clone(),
+                registry: Registry::new().with_fn(double),
+            },
+        ];
+        let fleet = Fleet::new(launchers);
+
+        let out: Vec<Result<u32, String>> = (0..6u32)
+            .net_map_with_fleet(double, &fleet)
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(out, (0..6u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+
+        let log = log.lock().unwrap().clone();
+        let last_probe = log
+            .iter()
+            .rposition(|e| e.starts_with("probe"))
+            .expect("both hosts are probed");
+        let first_activate = log
+            .iter()
+            .position(|e| e.starts_with("activate"))
+            .expect("both hosts are activated");
+        assert!(
+            last_probe < first_activate,
+            "every host must be discovered before any is provisioned: {log:?}"
+        );
     }
 
     #[tokio::test]
