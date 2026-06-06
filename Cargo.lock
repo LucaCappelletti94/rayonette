@@ -1098,6 +1098,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ssh-run"
+version = "0.0.0"
+dependencies = [
+ "rayonet",
+ "rayonet-build",
+ "tokio",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

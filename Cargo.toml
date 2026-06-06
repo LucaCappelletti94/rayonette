@@ -6,6 +6,7 @@ members = [
     "fixtures/consumer",
     "harness/docker/consumer",
     "examples/montecarlo",
+    "examples/ssh-run",
 ]
 
 [workspace.package]

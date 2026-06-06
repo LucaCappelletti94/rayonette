@@ -1,0 +1,12 @@
+[package]
+name = "ssh-run"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rayonet = { path = "../../rayonet" }
+tokio = { version = "1", features = ["full"] }
+
+[build-dependencies]
+rayonet-build = { path = "../../rayonet-build" }
