@@ -12,11 +12,21 @@
 //! and is a given compute node reachable by more than one independent path so no
 //! single relay's death can strand it
 //! ([`ConnectedComponents`](geometric_traits::traits::algorithms::connected_components::ConnectedComponents)).
+//!
+//! When a node is reachable by more than one path, the coordinator must pick one
+//! to run it on (the primary) and keep the others as standbys. Each parent link
+//! carries a measured [`LinkMetric`], and [`Topology::select_primaries`] ranks a
+//! node's parents by a per-run [`Metric`]: the widest path (the largest
+//! bottleneck bandwidth, best for big payloads) or the shortest path (the least
+//! total latency, best for small ones). Shortest path runs on
+//! [`PairwiseDijkstra`](geometric_traits::traits::algorithms::pairwise_dijkstra::PairwiseDijkstra).
+//! Widest path is a maximum-bottleneck relaxation implemented here, since
+//! `geometric-traits` does not expose it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use geometric_traits::{
-    impls::{SortedVec, SquareCSR2D, SymmetricCSR2D, CSR2D},
+    impls::{SortedVec, SquareCSR2D, SymmetricCSR2D, ValuedCSR2D, CSR2D},
     prelude::*,
     traits::{
         algorithms::connected_components::ConnectedComponentsResult, EdgesBuilder,
@@ -31,6 +41,41 @@ use crate::observability::{parent_of, RunState};
 /// id.
 const ROOT: &str = "\0coordinator";
 
+/// A measured parent-to-child link, the weight a [`Metric`] ranks paths by.
+///
+/// Latency is the round-trip time of the discovery handshake, always known.
+/// Bandwidth comes from an opt-in calibrated transfer, so it is absent until that
+/// probe runs and the widest-path metric is meaningless without it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LinkMetric {
+    /// Link round-trip latency in milliseconds (lower is better).
+    pub latency_ms: f64,
+    /// Link bandwidth in bytes per second, if probed (higher is better).
+    pub bandwidth: Option<f64>,
+}
+
+impl Default for LinkMetric {
+    /// An unmeasured link: zero latency and no bandwidth, the neutral weight a
+    /// freshly assembled topology carries until discovery fills it in.
+    fn default() -> Self {
+        Self {
+            latency_ms: 0.0,
+            bandwidth: None,
+        }
+    }
+}
+
+/// How the coordinator ranks the candidate paths to a multiply-reachable node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Metric {
+    /// Maximize the path's bottleneck bandwidth (the default: the slowest hop
+    /// throttles a large transfer, so the widest bottleneck wins).
+    #[default]
+    WidestBandwidth,
+    /// Minimize the path's total latency (better for small, latency-bound work).
+    ShortestLatency,
+}
+
 /// The discovered relay tree as a DAG over physical nodes, keyed by stable id.
 #[derive(Debug)]
 pub struct Topology {
@@ -38,9 +83,9 @@ pub struct Topology {
     ids: Vec<String>,
     /// The vertex index of each physical id (and of [`ROOT`]).
     index: BTreeMap<String, usize>,
-    /// Directed parent -> child edges as vertex-index pairs, deduplicated (a node
-    /// reached by two relays contributes two distinct parent edges).
-    edges: BTreeSet<(usize, usize)>,
+    /// Directed parent -> child edges (a node reached by two relays contributes
+    /// two distinct parent edges), each with its measured link weight.
+    edges: BTreeMap<(usize, usize), LinkMetric>,
 }
 
 impl Topology {
@@ -68,10 +113,11 @@ impl Topology {
 
         // One edge per discovered node, from its parent path's physical id (or
         // the root) to its own. A node on two paths yields two parent edges into
-        // its single vertex, and identical edges collapse in the set. Self-loops
+        // its single vertex, and identical edges collapse in the map. Self-loops
         // (a node reaching itself) are dropped, since the articulation algorithm
-        // rejects them and they carry no topology.
-        let mut edges = BTreeSet::new();
+        // rejects them and they carry no topology. Link weights start neutral and
+        // are filled in as discovery measures them.
+        let mut edges = BTreeMap::new();
         for (path, view) in &state.nodes {
             let Some(child) = view.id.as_deref() else {
                 continue;
@@ -85,7 +131,7 @@ impl Topology {
             });
             let (parent, child) = (index[parent], index[child]);
             if parent != child {
-                edges.insert((parent, child));
+                edges.insert((parent, child), LinkMetric::default());
             }
         }
 
@@ -119,7 +165,7 @@ impl Topology {
             return BTreeSet::new();
         };
         self.edges
-            .iter()
+            .keys()
             .filter(|&&(_, c)| c == child)
             .filter_map(|&(parent, _)| self.ids.get(parent).cloned())
             .filter(|parent| parent != ROOT)
@@ -135,28 +181,61 @@ impl Topology {
             return false;
         };
         // Only an articulation point can separate the node from the root, so it
-        // is redundant unless removing one of them disconnects it. Removing a
-        // vertex means dropping the edges incident to it.
+        // is redundant unless removing one of them disconnects it.
         for cut in self.articulation_points() {
             if cut == node || cut == 0 {
                 continue;
             }
-            let survivors: Vec<(usize, usize)> = self
-                .edges
-                .iter()
-                .copied()
-                .filter(|&(parent, child)| parent != cut && child != cut)
-                .collect();
-            let graph = self.undirected(&survivors);
-            let components: Result<ConnectedComponentsResult<'_, _, usize>, _> =
-                graph.connected_components();
-            if let Ok(components) = components {
-                if components.component_of_node(node) != components.component_of_node(0) {
-                    return false;
-                }
+            if !self.root_reaches(node, cut) {
+                return false;
             }
         }
         true
+    }
+
+    /// Order each multiply-reachable node's parents best-first under `metric`: the
+    /// first is the primary path to run the node on, the rest are standbys. Nodes
+    /// with a single parent are omitted, since they offer no choice.
+    #[must_use]
+    pub fn select_primaries(&self, metric: Metric) -> BTreeMap<String, Vec<String>> {
+        // The cost-to-root of every vertex, in the units the chosen metric ranks
+        // by (summed latency, or bottleneck bandwidth).
+        let cost = match metric {
+            Metric::ShortestLatency => self.shortest_from_root(),
+            Metric::WidestBandwidth => self.widest_from_root(),
+        };
+
+        // Gather each child's parents, then keep only the multiply-reachable ones.
+        let mut parents: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for &(parent, child) in self.edges.keys() {
+            parents.entry(child).or_default().push(parent);
+        }
+
+        let mut chosen = BTreeMap::new();
+        for (child, mut candidates) in parents {
+            if candidates.len() < 2 {
+                continue;
+            }
+            // Rank ascending: a smaller key is the better path. Ties break on the
+            // parent id so the ordering is deterministic.
+            candidates.sort_by(|&a, &b| {
+                self.rank_key(metric, &cost, a, child)
+                    .total_cmp(&self.rank_key(metric, &cost, b, child))
+                    .then_with(|| self.ids.get(a).cmp(&self.ids.get(b)))
+            });
+            let ranked = candidates.iter().map(|&parent| self.name(parent)).collect();
+            chosen.insert(self.name(child), ranked);
+        }
+        chosen
+    }
+
+    /// Set a parent link's measured weight. Discovery fills these in for real in a
+    /// later step. Tests use it to weight a topology directly.
+    #[cfg(test)]
+    fn set_link(&mut self, parent: &str, child: &str, metric: LinkMetric) {
+        if let (Some(&parent), Some(&child)) = (self.index.get(parent), self.index.get(child)) {
+            self.edges.insert((parent, child), metric);
+        }
     }
 
     /// The directed CSR matrix of the DAG, the form [`Kahn`](geometric_traits::traits::algorithms::kahn::Kahn)
@@ -165,7 +244,7 @@ impl Topology {
         DiEdgesBuilder::default()
             .expected_number_of_edges(self.edges.len())
             .expected_shape(self.ids.len())
-            .edges(self.edges.iter().copied())
+            .edges(self.edges.keys().copied())
             .build()
             .expect("the edges are vertex-index pairs within the vertex count")
     }
@@ -190,11 +269,105 @@ impl Topology {
 
     /// The cut vertices of the undirected projection, as vertex indices.
     fn articulation_points(&self) -> Vec<usize> {
-        let edges: Vec<(usize, usize)> = self.edges.iter().copied().collect();
+        let edges: Vec<(usize, usize)> = self.edges.keys().copied().collect();
         self.undirected(&edges)
             .biconnected_components()
             .map(|decomposition| decomposition.articulation_points().collect())
             .unwrap_or_default()
+    }
+
+    /// The ranking key of routing `child` through `parent` under `metric`, given
+    /// the precomputed cost-to-root of every vertex. Smaller is better, so the
+    /// widest-path bottleneck is negated (a larger bottleneck sorts first).
+    fn rank_key(&self, metric: Metric, cost: &[f64], parent: usize, child: usize) -> f64 {
+        let link = self
+            .edges
+            .get(&(parent, child))
+            .copied()
+            .unwrap_or_default();
+        let parent_cost = cost.get(parent).copied().unwrap_or(f64::INFINITY);
+        match metric {
+            Metric::ShortestLatency => parent_cost + link.latency_ms,
+            Metric::WidestBandwidth => -parent_cost.min(link.bandwidth.unwrap_or(f64::INFINITY)),
+        }
+    }
+
+    /// The least summed latency from [`ROOT`] to every vertex, by
+    /// [`PairwiseDijkstra`](geometric_traits::traits::algorithms::pairwise_dijkstra::PairwiseDijkstra)
+    /// over a latency-valued matrix. An unreachable vertex is infinitely far.
+    fn shortest_from_root(&self) -> Vec<f64> {
+        let order = self.ids.len();
+        let valued: ValuedCSR2D<usize, usize, usize, f64> =
+            GenericEdgesBuilder::<_, ValuedCSR2D<usize, usize, usize, f64>>::default()
+                .expected_number_of_edges(self.edges.len())
+                .expected_shape((order, order))
+                .edges(
+                    self.edges
+                        .iter()
+                        .map(|(&(p, c), link)| (p, c, link.latency_ms)),
+                )
+                .build()
+                .expect("the edges are vertex-index pairs within the vertex count");
+        let distances = valued
+            .pairwise_dijkstra()
+            .expect("latencies are finite and non-negative");
+        (0..order)
+            .map(|v| distances.value((0, v)).unwrap_or(f64::INFINITY))
+            .collect()
+    }
+
+    /// Whether the root still reaches `node` once every edge touching `cut` is
+    /// removed (the test for whether losing the relay `cut` strands `node`).
+    fn root_reaches(&self, node: usize, cut: usize) -> bool {
+        let survivors: Vec<(usize, usize)> = self
+            .edges
+            .keys()
+            .copied()
+            .filter(|&(parent, child)| parent != cut && child != cut)
+            .collect();
+        let graph = self.undirected(&survivors);
+        let components: ConnectedComponentsResult<'_, _, usize> = graph
+            .connected_components()
+            .expect("a usize marker holds any component count");
+        components.component_of_node(node) == components.component_of_node(0)
+    }
+
+    /// The physical id at `vertex` (empty for an out-of-range vertex, which the
+    /// callers never pass).
+    fn name(&self, vertex: usize) -> String {
+        self.ids.get(vertex).cloned().unwrap_or_default()
+    }
+
+    /// The widest bottleneck bandwidth from [`ROOT`] to every vertex (a maximum
+    /// bottleneck relaxation, since `geometric-traits` has no widest-path). An
+    /// unmeasured link imposes no bottleneck, and an unreachable vertex is
+    /// infinitely narrow.
+    fn widest_from_root(&self) -> Vec<f64> {
+        let mut best = vec![f64::NEG_INFINITY; self.ids.len()];
+        if let Some(root) = best.first_mut() {
+            *root = f64::INFINITY;
+        }
+        loop {
+            let mut changed = false;
+            for (&(parent, child), link) in &self.edges {
+                let bandwidth = link.bandwidth.unwrap_or(f64::INFINITY);
+                let through = best
+                    .get(parent)
+                    .copied()
+                    .unwrap_or(f64::NEG_INFINITY)
+                    .min(bandwidth);
+                if through > best.get(child).copied().unwrap_or(f64::NEG_INFINITY) {
+                    if let Some(slot) = best.get_mut(child) {
+                        *slot = through;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        best
     }
 }
 
@@ -292,6 +465,77 @@ mod tests {
         let topo = Topology::from_run_state(&state);
         assert_eq!(topo.parents_of("idL"), ids(&["idA"]));
         assert!(!topo.is_redundant("idL"));
+    }
+
+    #[test]
+    fn the_metric_picks_the_expected_primary_on_a_weighted_diamond() {
+        use super::{LinkMetric, Metric, ROOT};
+        // Diamond: leaf L reachable via relay A and relay B. The route through A
+        // is low latency but narrow, the route through B is high latency but wide.
+        let state = discovered(&[("A", "idA"), ("B", "idB"), ("A/L", "idL"), ("B/L", "idL")]);
+        let mut topo = Topology::from_run_state(&state);
+        let link = |latency_ms, bandwidth| LinkMetric {
+            latency_ms,
+            bandwidth: Some(bandwidth),
+        };
+        topo.set_link(ROOT, "idA", link(1.0, 10.0));
+        topo.set_link("idA", "idL", link(1.0, 10.0));
+        topo.set_link(ROOT, "idB", link(5.0, 100.0));
+        topo.set_link("idB", "idL", link(1.0, 100.0));
+
+        // Widest path takes the wide route through B, shortest path the quick one
+        // through A. The other parent is the standby in each case.
+        let widest = topo.select_primaries(Metric::WidestBandwidth);
+        assert_eq!(widest["idL"], vec!["idB".to_string(), "idA".to_string()]);
+        let shortest = topo.select_primaries(Metric::ShortestLatency);
+        assert_eq!(shortest["idL"], vec!["idA".to_string(), "idB".to_string()]);
+    }
+
+    #[test]
+    fn metric_and_link_types_expose_their_derives() {
+        use super::{LinkMetric, Metric};
+        let link = LinkMetric {
+            latency_ms: 1.0,
+            bandwidth: Some(2.0),
+        };
+        let same = link;
+        assert_eq!(link, same);
+        assert_ne!(link, LinkMetric::default());
+        assert!(format!("{link:?}").contains("LinkMetric"));
+
+        assert_eq!(Metric::default(), Metric::WidestBandwidth);
+        assert_ne!(Metric::WidestBandwidth, Metric::ShortestLatency);
+        assert!(format!("{:?}", Metric::ShortestLatency).contains("Shortest"));
+    }
+
+    #[test]
+    fn equally_good_paths_break_ties_by_id() {
+        use super::{LinkMetric, Metric, ROOT};
+        // Both routes to L are identical, so neither metric prefers one. The tie
+        // breaks on the parent id, putting idA before idB deterministically.
+        let state = discovered(&[("A", "idA"), ("B", "idB"), ("A/L", "idL"), ("B/L", "idL")]);
+        let mut topo = Topology::from_run_state(&state);
+        let link = LinkMetric {
+            latency_ms: 1.0,
+            bandwidth: Some(50.0),
+        };
+        for (parent, child) in [(ROOT, "idA"), ("idA", "idL"), (ROOT, "idB"), ("idB", "idL")] {
+            topo.set_link(parent, child, link);
+        }
+        assert_eq!(
+            topo.select_primaries(Metric::WidestBandwidth)["idL"],
+            vec!["idA".to_string(), "idB".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_single_parent_node_offers_no_path_choice() {
+        use super::Metric;
+        // Nothing is multiply reachable, so the default (widest) selection, run
+        // over links with no measured bandwidth, is empty.
+        let state = discovered(&[("A", "idA"), ("A/L", "idL")]);
+        let topo = Topology::from_run_state(&state);
+        assert!(topo.select_primaries(Metric::default()).is_empty());
     }
 
     #[test]
