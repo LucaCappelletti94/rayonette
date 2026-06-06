@@ -41,6 +41,14 @@ use crate::observability::{parent_of, RunState};
 /// id.
 const ROOT: &str = "\0coordinator";
 
+/// Convert a microsecond latency to milliseconds for the path metric. A realistic
+/// latency is far below f64's exact-integer range, so the cast does not lose
+/// precision.
+#[allow(clippy::cast_precision_loss)]
+fn microseconds_to_millis(microseconds: u64) -> f64 {
+    microseconds as f64 / 1000.0
+}
+
 /// A measured parent-to-child link, the weight a [`Metric`] ranks paths by.
 ///
 /// Latency is the round-trip time of the discovery handshake, always known.
@@ -131,7 +139,16 @@ impl Topology {
             });
             let (parent, child) = (index[parent], index[child]);
             if parent != child {
-                edges.insert((parent, child), LinkMetric::default());
+                // This path's last-hop link latency weights its edge. A node on
+                // two paths gets two edges, each with its own latency.
+                let latency_ms = view.latency_us.map_or(0.0, microseconds_to_millis);
+                edges.insert(
+                    (parent, child),
+                    LinkMetric {
+                        latency_ms,
+                        bandwidth: None,
+                    },
+                );
             }
         }
 
@@ -391,7 +408,7 @@ mod tests {
     fn discovered(facts: &[(&str, &str)]) -> RunState {
         let mut state = RunState::default();
         for (path, id) in facts {
-            state.apply(&Event::profiled(path, id, profile(), Role::Compute));
+            state.apply(&Event::profiled(path, id, profile(), Role::Compute, 0));
         }
         state
     }
@@ -524,6 +541,43 @@ mod tests {
         }
         assert_eq!(
             topo.select_primaries(Metric::WidestBandwidth)["idL"],
+            vec!["idA".to_string(), "idB".to_string()]
+        );
+    }
+
+    #[test]
+    fn from_run_state_weights_edges_by_measured_latency() {
+        use super::Metric;
+        // A diamond whose discovery measured a faster last hop through A than B.
+        // The latencies ride the profiled events, so shortest-latency selection
+        // works straight off the run state with no hand-set weights.
+        let p = profile();
+        let mut state = RunState::default();
+        state.apply(&Event::profiled(
+            "A",
+            "idA",
+            p.clone(),
+            Role::Compute,
+            1_000,
+        ));
+        state.apply(&Event::profiled(
+            "B",
+            "idB",
+            p.clone(),
+            Role::Compute,
+            1_000,
+        ));
+        state.apply(&Event::profiled(
+            "A/L",
+            "idL",
+            p.clone(),
+            Role::Compute,
+            1_000,
+        ));
+        state.apply(&Event::profiled("B/L", "idL", p, Role::Compute, 9_000));
+        let topo = Topology::from_run_state(&state);
+        assert_eq!(
+            topo.select_primaries(Metric::ShortestLatency)["idL"],
             vec!["idA".to_string(), "idB".to_string()]
         );
     }

@@ -65,6 +65,9 @@ pub enum Event {
         profile: NodeProfile,
         /// The role the fleet filter assigned from that profile.
         role: Role,
+        /// Round-trip latency of the discovery probe, in microseconds: the weight
+        /// of the link from this node's parent, used to pick redundant paths.
+        latency_us: u64,
     },
     /// A task began running on a host.
     TaskStarted {
@@ -94,14 +97,22 @@ impl Event {
         }
     }
 
-    /// Build a capability-and-role event for `host` (a node with stable `id`).
+    /// Build a capability-and-role event for `host` (a node with stable `id`),
+    /// carrying the measured `latency_us` of the link from its parent.
     #[must_use]
-    pub fn profiled(host: &str, id: &str, profile: NodeProfile, role: Role) -> Self {
+    pub fn profiled(
+        host: &str,
+        id: &str,
+        profile: NodeProfile,
+        role: Role,
+        latency_us: u64,
+    ) -> Self {
         Self::Profiled {
             host: host.to_string(),
             id: id.to_string(),
             profile,
             role,
+            latency_us,
         }
     }
 
@@ -214,6 +225,9 @@ pub struct NodeView {
     /// The physical node's stable id, once profiled (two paths sharing an id are
     /// the same node, reachable redundantly).
     pub id: Option<String>,
+    /// The measured latency (microseconds) of the link from this node's parent,
+    /// once profiled.
+    pub latency_us: Option<u64>,
 }
 
 impl RunState {
@@ -229,11 +243,13 @@ impl RunState {
                 id,
                 profile,
                 role,
+                latency_us,
             } => {
                 let view = self.node(host);
                 view.profile = Some(profile.clone());
                 view.role = Some(*role);
                 view.id = Some(id.clone());
+                view.latency_us = Some(*latency_us);
             }
             Event::TaskStarted { host, .. } => {
                 self.node(host);
@@ -291,6 +307,7 @@ impl RunState {
             profile: None,
             role: None,
             id: None,
+            latency_us: None,
         })
     }
 }
@@ -408,12 +425,14 @@ mod tests {
             "node-1",
             profile.clone(),
             Role::Compute,
+            1_500,
         ));
 
         let view = &state.nodes["host-a"];
         assert_eq!(view.profile, Some(profile));
         assert_eq!(view.role, Some(Role::Compute));
         assert_eq!(view.id.as_deref(), Some("node-1"));
+        assert_eq!(view.latency_us, Some(1_500));
     }
 
     #[test]
@@ -431,14 +450,22 @@ mod tests {
             "shared",
             profile.clone(),
             Role::Compute,
+            0,
         ));
         state.apply(&Event::profiled(
             "b/shared",
             "shared",
             profile.clone(),
             Role::Compute,
+            0,
         ));
-        state.apply(&Event::profiled("a/solo", "solo", profile, Role::Compute));
+        state.apply(&Event::profiled(
+            "a/solo",
+            "solo",
+            profile,
+            Role::Compute,
+            0,
+        ));
 
         let by_id = state.paths_by_id();
         assert_eq!(by_id["shared"], vec!["a/shared", "b/shared"]);
@@ -455,7 +482,13 @@ mod tests {
         };
         let mut renderer = super::PlainRenderer::new();
         let line = renderer
-            .render(&Event::profiled("host-a", "node-1", profile, Role::Compute))
+            .render(&Event::profiled(
+                "host-a",
+                "node-1",
+                profile,
+                Role::Compute,
+                0,
+            ))
             .expect("profiled events print a line");
         assert!(line.contains("host-a"), "{line}");
         assert!(line.contains("Compute"), "{line}");

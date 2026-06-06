@@ -184,6 +184,9 @@ async fn discover_all<'a, L: Launch + Send + Sync>(
                 continue;
             }
         };
+        // Time the probe round-trip as the link's latency, the weight redundant
+        // paths are chosen by.
+        let probe_started = std::time::Instant::now();
         let profile = match launcher.probe(&session).await {
             Ok(profile) => profile,
             Err(failure) => {
@@ -191,13 +194,14 @@ async fn discover_all<'a, L: Launch + Send + Sync>(
                 continue;
             }
         };
+        let latency_us = u64::try_from(probe_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let role = filter.map_or(Role::Compute, |filter| filter.role_of(&profile));
         // A job requirement narrows the compute hosts further: a host the fleet
         // runs tasks on, but whose capabilities this job does not need, is
         // skipped for this run only.
         let meets_requirement = requires.is_none_or(|predicate| predicate.eval(&profile));
         let id = launcher.node_id(&session).await;
-        events.emit(Event::profiled(&label, &id, profile, role));
+        events.emit(Event::profiled(&label, &id, profile, role, latency_us));
         if role != Role::Compute || !meets_requirement {
             continue;
         }
