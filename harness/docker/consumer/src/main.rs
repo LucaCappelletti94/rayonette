@@ -54,9 +54,17 @@ fn env(key: &str) -> String {
 #[tokio::main]
 async fn main() {
     if process::is_agent() {
-        process::run_agent(__rayonet_registry())
-            .await
-            .expect("agent failed");
+        // Relay-capable agent: with a children file it relays to its own subtree,
+        // without one it serves as a leaf. This is what lets the harness build
+        // real relay trees, not just a flat star.
+        rayonet::node::run_node(rayonet::node::NodeConfig {
+            registry: __rayonet_registry(),
+            source: __rayonet_source(),
+            binary_name: "rayonet-docker-consumer".to_string(),
+            toolchain: std::env::var("RAYONET_TOOLCHAIN").unwrap_or_else(|_| "stable".to_string()),
+        })
+        .await
+        .expect("agent failed");
         return;
     }
 
