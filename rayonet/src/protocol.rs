@@ -23,6 +23,9 @@ pub struct ChildAd {
     pub id: String,
     /// How many tasks the child can hold in flight (its own advertised slots).
     pub slots: usize,
+    /// Measured latency (microseconds) of the relay's link to this child, the
+    /// weight used to pick the primary among redundant paths.
+    pub latency_us: u64,
 }
 
 /// Coordinator to agent.
@@ -173,6 +176,7 @@ mod tests {
                     label: "leaf-a".to_string(),
                     id: "node-1".to_string(),
                     slots: 2,
+                    latency_us: 1_200,
                 }],
             },
             FromAgent::Capacity { slots: 3 },
@@ -208,8 +212,18 @@ mod tests {
                 .prop_map(|(task_id, error)| FromAgent::Failed { task_id, error }),
             any::<usize>().prop_map(|tasks| FromAgent::Observe(Event::RunStarted { tasks })),
             prop::collection::vec(
-                (any::<String>(), any::<String>(), any::<usize>())
-                    .prop_map(|(label, id, slots)| ChildAd { label, id, slots }),
+                (
+                    any::<String>(),
+                    any::<String>(),
+                    any::<usize>(),
+                    any::<u64>()
+                )
+                    .prop_map(|(label, id, slots, latency_us)| ChildAd {
+                        label,
+                        id,
+                        slots,
+                        latency_us,
+                    },),
                 0..4,
             )
             .prop_map(|children| FromAgent::Discovered { children }),

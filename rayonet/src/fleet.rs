@@ -139,6 +139,9 @@ pub(crate) struct Launched<L: Launch> {
     /// Each ready agent's stable physical node id, parallel to `agents`, so a
     /// relay can advertise its children by id for redundant-path dedup.
     pub ids: Vec<String>,
+    /// Each ready agent's measured link latency (microseconds), parallel to
+    /// `agents`, the weight redundant paths are chosen by.
+    pub latencies: Vec<u64>,
     /// A guard per ready agent, held for the run's duration.
     pub guards: Vec<L::Guard>,
     /// Why each dropped host did not join (for the no-eligible-host message).
@@ -157,6 +160,8 @@ struct Discovered<'a, L: Launch> {
     label: String,
     /// The host's stable physical node id, carried through to [`Launched::ids`].
     id: String,
+    /// The measured link latency (microseconds), carried to [`Launched::latencies`].
+    latency_us: u64,
     /// The open session from [`Launch::connect`], handed to [`Launch::activate`].
     session: L::Session,
 }
@@ -209,6 +214,7 @@ async fn discover_all<'a, L: Launch + Send + Sync>(
             launcher,
             label,
             id,
+            latency_us,
             session,
         });
     }
@@ -225,12 +231,14 @@ async fn provision_all<L: Launch + Send + Sync>(
 ) -> Launched<L> {
     let mut agents = Vec::with_capacity(discovered.len());
     let mut ids = Vec::with_capacity(discovered.len());
+    let mut latencies = Vec::with_capacity(discovered.len());
     let mut guards = Vec::with_capacity(discovered.len());
     for host in discovered {
         match host.launcher.activate(host.session, events).await {
             Ok((connection, guard)) => {
                 agents.push((host.label, connection));
                 ids.push(host.id);
+                latencies.push(host.latency_us);
                 guards.push(guard);
             }
             Err(failure) => failures.push(failure),
@@ -239,6 +247,7 @@ async fn provision_all<L: Launch + Send + Sync>(
     Launched {
         agents,
         ids,
+        latencies,
         guards,
         failures,
     }
@@ -305,6 +314,7 @@ impl<L: Launch + Send + Sync> ErasedFleet for Fleet<L> {
             // tasks are simply scheduled onto the survivors by the pull scheduler.
             let Launched {
                 agents,
+                latencies,
                 guards,
                 failures,
                 ..
@@ -312,7 +322,7 @@ impl<L: Launch + Send + Sync> ErasedFleet for Fleet<L> {
             if agents.is_empty() {
                 return Err(no_eligible_host(&failures));
             }
-            let result = run_job_raw(agents, fn_key, payloads, events).await;
+            let result = run_job_raw(agents, fn_key, payloads, &latencies, events).await;
             drop(guards); // agents already shut down via the job's `Shutdown`
             result
         })

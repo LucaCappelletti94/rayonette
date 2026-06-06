@@ -251,6 +251,25 @@ where
     }
 }
 
+/// Shut freshly-built children down and await their readers, for the path where
+/// the parent leaves before naming an active set (so awaiting a reader whose
+/// child is still serving cannot hang).
+async fn discard_children<S, G>(
+    senders: Vec<Sender<S>>,
+    readers: Vec<tokio::task::JoinHandle<()>>,
+    guards: Vec<G>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    for mut sender in senders {
+        let _ = sender.send(&ToAgent::Shutdown).await;
+    }
+    for reader in readers {
+        let _ = reader.await;
+    }
+    drop(guards);
+}
+
 /// Announce the relay's built children to the parent and await the active-set it
 /// names, returning whether each child is active (parallel to `labels`), or
 /// `None` if the parent left before naming one.
@@ -260,6 +279,7 @@ async fn announce_children<P>(
     labels: &[String],
     ids: &[String],
     capacity: &[usize],
+    latencies: &[u64],
 ) -> io::Result<Option<Vec<bool>>>
 where
     P: AsyncRead + AsyncWrite + Unpin,
@@ -269,6 +289,7 @@ where
             label: labels[child].clone(),
             id: ids[child].clone(),
             slots: capacity[child],
+            latency_us: latencies.get(child).copied().unwrap_or(0),
         })
         .collect();
     parent_tx.send(&FromAgent::Discovered { children }).await?;
@@ -325,13 +346,13 @@ where
         tx: uplink_tx.clone(),
     };
 
-    // Launch the children (the provisioning cascade in the real path), then
-    // handshake them and spawn one reader per child feeding a central channel. A
-    // relay has no global view, so it activates every one of its own children
-    // (cross-subtree dedup is the coordinator's job).
+    // Launch and handshake the children, spawning one reader each. A relay has no
+    // global view, so it activates all its own children (the coordinator dedups
+    // across subtrees).
     let Launched {
         agents,
         ids,
+        latencies,
         guards,
         failures,
     } = launch_all(&children, None, None, &uplink_sink).await;
@@ -346,6 +367,7 @@ where
         agents,
         &fn_key,
         &child_events_tx,
+        &latencies,
         &ActivationPolicy::ApproveAll,
     )
     .await?;
@@ -361,18 +383,17 @@ where
     // Report the built children up by id so the coordinator can dedup redundant
     // paths, then run the children it names and hold the rest as standbys. If the
     // parent leaves before naming an active set there is nothing to run.
-    let Some(active) =
-        announce_children(&mut parent_tx, &mut parent_rx, &labels, &ids, &capacity).await?
+    let Some(active) = announce_children(
+        &mut parent_tx,
+        &mut parent_rx,
+        &labels,
+        &ids,
+        &capacity,
+        &latencies,
+    )
+    .await?
     else {
-        // Shut the children down so their readers end, otherwise awaiting them
-        // would hang, then tear down.
-        for mut sender in senders {
-            let _ = sender.send(&ToAgent::Shutdown).await;
-        }
-        for reader in readers {
-            let _ = reader.await;
-        }
-        drop(guards);
+        discard_children(senders, readers, guards).await;
         return Ok(());
     };
 

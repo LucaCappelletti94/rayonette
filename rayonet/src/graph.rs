@@ -34,7 +34,9 @@ use geometric_traits::{
     },
 };
 
-use crate::observability::{parent_of, RunState};
+use crate::capability::{NodeProfile, Role};
+use crate::observability::{parent_of, Event, RunState};
+use crate::protocol::ChildAd;
 
 /// The synthetic root vertex standing for the coordinator, the parent of every
 /// top-level node. The leading NUL keeps it from colliding with any real machine
@@ -82,6 +84,70 @@ pub enum Metric {
     WidestBandwidth,
     /// Minimize the path's total latency (better for small, latency-bound work).
     ShortestLatency,
+}
+
+/// One relay as the coordinator sees it at the handshake: its label, the latency
+/// of the coordinator's link to it, and the children it built and is offering.
+#[derive(Debug)]
+pub struct RelayReport {
+    /// The relay's label under the coordinator (its path segment).
+    pub label: String,
+    /// Measured latency (microseconds) of the coordinator's link to this relay.
+    pub latency_us: u64,
+    /// The children this relay discovered, by id and link latency.
+    pub children: Vec<ChildAd>,
+}
+
+/// Choose, by `metric`, which children each relay activates now.
+///
+/// A node reachable through several relays runs on its primary path, and every
+/// uniquely reached child runs too. Returns each relay's active child labels,
+/// parallel to `relays`. The coordinator runs this over the relays' discovery
+/// reports to dedup redundant paths before any task flows, so a shared node runs
+/// on its best path and the others hold it standby.
+#[must_use]
+pub fn choose_active(relays: &[RelayReport], metric: Metric) -> Vec<Vec<String>> {
+    // Synthesize the two-level run state (root -> relay -> child) the topology is
+    // built from, weighting each edge with its measured latency. A relay's own
+    // label doubles as its vertex id (relays are distinct), so only shared child
+    // ids dedup.
+    let mut state = RunState::default();
+    for relay in relays {
+        state.apply(&Event::profiled(
+            &relay.label,
+            &relay.label,
+            NodeProfile::unknown(),
+            Role::Compute,
+            relay.latency_us,
+        ));
+        for child in &relay.children {
+            state.apply(&Event::profiled(
+                &format!("{}/{}", relay.label, child.label),
+                &child.id,
+                NodeProfile::unknown(),
+                Role::Compute,
+                child.latency_us,
+            ));
+        }
+    }
+    let primaries = Topology::from_run_state(&state).select_primaries(metric);
+    relays
+        .iter()
+        .map(|relay| {
+            relay
+                .children
+                .iter()
+                .filter(|child| {
+                    // A uniquely reached child (absent from the primary map) is
+                    // always active. A shared one runs only on its primary relay.
+                    primaries.get(&child.id).is_none_or(|order| {
+                        order.first().map(String::as_str) == Some(relay.label.as_str())
+                    })
+                })
+                .map(|child| child.label.clone())
+                .collect()
+        })
+        .collect()
 }
 
 /// The discovered relay tree as a DAG over physical nodes, keyed by stable id.
@@ -580,6 +646,45 @@ mod tests {
             topo.select_primaries(Metric::ShortestLatency)["idL"],
             vec!["idA".to_string(), "idB".to_string()]
         );
+    }
+
+    #[test]
+    fn choose_active_runs_a_shared_child_on_its_lower_latency_relay() {
+        use super::{choose_active, Metric, RelayReport};
+        use crate::protocol::ChildAd;
+        let shared = |latency_us| ChildAd {
+            label: "L".to_string(),
+            id: "idL".to_string(),
+            slots: 1,
+            latency_us,
+        };
+        // Both relays reach leaf L, but "fast" has the lower-latency path. "fast"
+        // also has its own leaf U, reached only through it.
+        let relays = vec![
+            RelayReport {
+                label: "fast".to_string(),
+                latency_us: 100,
+                children: vec![
+                    shared(100),
+                    ChildAd {
+                        label: "U".to_string(),
+                        id: "idU".to_string(),
+                        slots: 1,
+                        latency_us: 100,
+                    },
+                ],
+            },
+            RelayReport {
+                label: "slow".to_string(),
+                latency_us: 5_000,
+                children: vec![shared(5_000)],
+            },
+        ];
+        let active = choose_active(&relays, Metric::ShortestLatency);
+        // The fast relay runs the shared leaf and its own; the slow relay holds
+        // the shared leaf as a standby.
+        assert_eq!(active[0], vec!["L".to_string(), "U".to_string()]);
+        assert!(active[1].is_empty());
     }
 
     #[test]

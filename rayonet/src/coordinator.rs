@@ -68,24 +68,52 @@ enum FirstReport {
 }
 
 /// The labels each agent should activate now, by `policy`, parallel to `reports`.
-/// Under `DedupById` a node id already claimed by an earlier relay is dropped, so
-/// it stays a standby on this path.
-fn active_labels(reports: &[FirstReport], policy: &ActivationPolicy) -> Vec<Vec<String>> {
-    let mut claimed = std::collections::HashSet::new();
-    reports
-        .iter()
-        .map(|report| match report {
-            FirstReport::Leaf(_) => Vec::new(),
-            FirstReport::Relay(children) => children
-                .iter()
-                .filter(|child| match policy {
-                    ActivationPolicy::ApproveAll => true,
-                    ActivationPolicy::DedupById => claimed.insert(child.id.clone()),
-                })
-                .map(|child| child.label.clone())
-                .collect(),
-        })
-        .collect()
+/// `ApproveAll` runs every child (a relay has no global view). `DedupById` chooses
+/// the metric-best path for a node reachable through several relays and holds the
+/// others standby (see [`crate::graph::choose_active`]).
+fn active_labels(
+    reports: &[FirstReport],
+    labels: &[String],
+    latencies: &[u64],
+    policy: &ActivationPolicy,
+) -> Vec<Vec<String>> {
+    match policy {
+        ActivationPolicy::ApproveAll => reports
+            .iter()
+            .map(|report| match report {
+                FirstReport::Leaf(_) => Vec::new(),
+                FirstReport::Relay(children) => {
+                    children.iter().map(|child| child.label.clone()).collect()
+                }
+            })
+            .collect(),
+        ActivationPolicy::DedupById => dedup_active(reports, labels, latencies),
+    }
+}
+
+/// Per-agent active labels with redundant paths deduped by the shortest-latency
+/// path through the sharing relays (leaves get none). Latency is the only link
+/// metric measured so far, so the widest-bandwidth metric waits on a bandwidth
+/// probe.
+fn dedup_active(reports: &[FirstReport], labels: &[String], latencies: &[u64]) -> Vec<Vec<String>> {
+    let mut relay_agents = Vec::new();
+    let mut relays = Vec::new();
+    for (agent, report) in reports.iter().enumerate() {
+        if let FirstReport::Relay(children) = report {
+            relay_agents.push(agent);
+            relays.push(crate::graph::RelayReport {
+                label: labels[agent].clone(),
+                latency_us: latencies.get(agent).copied().unwrap_or(0),
+                children: children.clone(),
+            });
+        }
+    }
+    let chosen = crate::graph::choose_active(&relays, crate::graph::Metric::ShortestLatency);
+    let mut actives = vec![Vec::new(); reports.len()];
+    for (slot, agent) in relay_agents.into_iter().enumerate() {
+        actives[agent].clone_from(&chosen[slot]);
+    }
+    actives
 }
 
 /// An `InvalidData` error for an unexpected handshake reply.
@@ -117,6 +145,7 @@ pub(crate) async fn connect_agents<S>(
     agents: Vec<(String, Connection<S>)>,
     fn_key: &str,
     events_tx: &mpsc::UnboundedSender<Event>,
+    agent_latencies: &[u64],
     policy: &ActivationPolicy,
 ) -> std::io::Result<Agents<S>>
 where
@@ -141,8 +170,10 @@ where
         parts.push((label, tx, rx));
     }
 
-    // Phase 2: tell each relay which children to run, then read its readiness.
-    let actives = active_labels(&reports, policy);
+    // Phase 2: choose each relay's active children (deduping redundant paths by
+    // the link metric), tell each relay, then read its readiness.
+    let labels: Vec<String> = parts.iter().map(|(label, _, _)| label.clone()).collect();
+    let actives = active_labels(&reports, &labels, agent_latencies, policy);
     let mut out = Agents {
         senders: Vec::with_capacity(parts.len()),
         labels: Vec::with_capacity(parts.len()),
@@ -430,6 +461,7 @@ pub(crate) async fn run_job_raw<S>(
     agents: Vec<(String, Connection<S>)>,
     fn_key: &str,
     payloads: Vec<Vec<u8>>,
+    agent_latencies: &[u64],
     events: &dyn EventSink,
 ) -> std::io::Result<Vec<Result<Vec<u8>, String>>>
 where
@@ -444,7 +476,14 @@ where
         capacity,
         standbys,
         readers,
-    } = connect_agents(agents, fn_key, &events_tx, &ActivationPolicy::DedupById).await?;
+    } = connect_agents(
+        agents,
+        fn_key,
+        &events_tx,
+        agent_latencies,
+        &ActivationPolicy::DedupById,
+    )
+    .await?;
     drop(events_tx); // the channel ends when every reader does
 
     let agent_count = senders.len();
@@ -520,7 +559,9 @@ where
     O: DeserializeOwned,
 {
     let payloads = serialize_inputs(&inputs)?;
-    let raw = run_job_raw(agents, fn_key, payloads, events).await?;
+    // The typed entry carries no measured latencies, so redundant paths dedup by
+    // id order. The fleet's real path supplies them for metric-based selection.
+    let raw = run_job_raw(agents, fn_key, payloads, &[], events).await?;
     Ok(raw.into_iter().map(decode_output::<O>).collect())
 }
 
