@@ -5,6 +5,7 @@
 //! `PLAN.md` at the repo root for the design and the phased build.
 
 pub mod agent;
+pub mod capability;
 pub mod coordinator;
 pub mod fleet;
 pub mod framing;

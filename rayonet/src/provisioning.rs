@@ -9,6 +9,7 @@
 use std::future::Future;
 use std::io;
 
+use crate::capability::{self, NodeProfile, Os};
 use crate::observability::{Event, EventSink, NodeState};
 
 /// The captured result of running a command to completion on a [`Remote`].
@@ -153,6 +154,65 @@ pub async fn provision<R: Remote>(
 
     events.emit(Event::node(host, NodeState::Ready));
     Ok(Provisioned { binary_path })
+}
+
+/// Probe a host's [`NodeProfile`] by running detection commands over `remote`,
+/// dispatching on the OS and feeding their output to the capability parsers.
+///
+/// Individual capability probes that fail or are missing (no `nvidia-smi`, say)
+/// are treated as "absent", not fatal, so only a failure of the OS probe itself
+/// errors.
+///
+/// # Errors
+/// Returns an error if the `uname -s` probe cannot run.
+pub async fn probe<R: Remote>(remote: &R) -> io::Result<NodeProfile> {
+    let os = capability::parse_os(&run_stdout(remote, "uname -s").await?);
+    let (cores, ram_mb, gpus) = if os == Os::MacOs {
+        (
+            capability::parse_cores(&run_or_empty(remote, "sysctl -n hw.ncpu").await),
+            capability::parse_macos_ram_mb(&run_or_empty(remote, "sysctl -n hw.memsize").await),
+            capability::parse_macos_gpus(
+                &run_or_empty(remote, "system_profiler SPDisplaysDataType").await,
+            ),
+        )
+    } else {
+        let cores = capability::parse_cores(&run_or_empty(remote, "nproc").await);
+        let ram_mb =
+            capability::parse_linux_ram_mb(&run_or_empty(remote, "cat /proc/meminfo").await);
+        let mut gpus = capability::parse_nvidia_smi(
+            &run_or_empty(
+                remote,
+                "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits",
+            )
+            .await,
+        );
+        gpus.extend(capability::parse_rocminfo(
+            &run_or_empty(remote, "rocminfo").await,
+        ));
+        (cores, ram_mb, gpus)
+    };
+    Ok(NodeProfile {
+        os,
+        cores,
+        ram_mb,
+        gpus,
+    })
+}
+
+/// Run `command` and return its stdout (a non-zero exit still yields its
+/// stdout); a transport failure propagates.
+async fn run_stdout<R: Remote>(remote: &R, command: &str) -> io::Result<String> {
+    let out = remote.run(command).await?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Run `command`, returning its stdout only if it succeeded; an error or a
+/// non-zero exit (a missing tool like `nvidia-smi`) yields an empty string.
+async fn run_or_empty<R: Remote>(remote: &R, command: &str) -> String {
+    match remote.run(command).await {
+        Ok(out) if out.status == 0 => String::from_utf8_lossy(&out.stdout).into_owned(),
+        _ => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -341,5 +401,90 @@ mod tests {
         let output_copy = output.clone();
         assert_eq!(output.status, output_copy.status);
         assert!(format!("{output:?}").contains("status"));
+    }
+
+    // A scripted host for probe tests: `uname -s` returns `os`, other commands
+    // match by substring, and a miss is a non-zero exit (like a missing tool).
+    struct ProbeHost {
+        os: &'static str,
+        replies: Vec<(&'static str, &'static str)>,
+    }
+
+    fn out(status: i32, stdout: &str) -> CommandOutput {
+        CommandOutput {
+            status,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    impl Remote for ProbeHost {
+        async fn run(&self, command: &str) -> std::io::Result<CommandOutput> {
+            if command.contains("uname -s") {
+                return Ok(out(0, self.os));
+            }
+            for (needle, stdout) in &self.replies {
+                if command.contains(needle) {
+                    return Ok(out(0, stdout));
+                }
+            }
+            Ok(out(1, ""))
+        }
+        async fn upload(&self, _bytes: &[u8], _dest: &str) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_linux_with_nvidia() {
+        use crate::capability::{GpuRuntime, Os};
+        let host = ProbeHost {
+            os: "Linux",
+            replies: vec![
+                ("nproc", "64\n"),
+                ("/proc/meminfo", "MemTotal:      131923148 kB\n"),
+                ("nvidia-smi", "NVIDIA GeForce RTX 4090, 24564\n"),
+            ],
+        };
+        let p = super::probe(&host).await.unwrap();
+        assert_eq!(p.os, Os::Linux);
+        assert_eq!(p.cores, 64);
+        assert_eq!(p.ram_mb, 131_923_148 / 1024);
+        assert_eq!(p.gpus.len(), 1);
+        assert_eq!(p.gpus[0].runtime, Some(GpuRuntime::Cuda));
+    }
+
+    #[tokio::test]
+    async fn probe_macos_with_metal() {
+        use crate::capability::{GpuRuntime, Os};
+        let host = ProbeHost {
+            os: "Darwin",
+            replies: vec![
+                ("hw.ncpu", "12\n"),
+                ("hw.memsize", "137438953472\n"),
+                ("system_profiler", "      Chipset Model: Apple M2 Pro\n"),
+            ],
+        };
+        let p = super::probe(&host).await.unwrap();
+        assert_eq!(p.os, Os::MacOs);
+        assert_eq!(p.cores, 12);
+        assert_eq!(p.ram_mb, 131_072);
+        assert_eq!(p.gpus.len(), 1);
+        assert_eq!(p.gpus[0].runtime, Some(GpuRuntime::Metal));
+    }
+
+    #[tokio::test]
+    async fn probe_treats_missing_gpu_tools_as_no_gpu() {
+        use crate::capability::Os;
+        let host = ProbeHost {
+            os: "Linux",
+            replies: vec![
+                ("nproc", "8\n"),
+                ("/proc/meminfo", "MemTotal: 8000000 kB\n"),
+            ],
+        };
+        let p = super::probe(&host).await.unwrap();
+        assert_eq!(p.os, Os::Linux);
+        assert!(p.gpus.is_empty());
     }
 }
