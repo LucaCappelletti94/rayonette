@@ -8,11 +8,16 @@ use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use crate::graph::Topology;
 use crate::observability::{depth, leaf_of, RunState};
 
-/// Draw the current run state into `frame`: a summary header and one row per
-/// node, indented by its depth so the tree's shape is visible.
+/// Draw the current run state into `frame`.
+///
+/// A summary header and one row per node, indented by its depth so the tree's
+/// shape is visible. A relay that is a single point of failure (no redundant path
+/// past it) is flagged `SPOF`.
 pub fn draw(frame: &mut Frame<'_>, state: &RunState) {
+    let spofs = Topology::from_run_state(state).single_points_of_failure();
     let mut lines = vec![Line::from(format!(
         "rayonet  {}/{} done  {} failed",
         state.completed, state.total_tasks, state.failed
@@ -21,8 +26,13 @@ pub fn draw(frame: &mut Frame<'_>, state: &RunState) {
         let role = view
             .role
             .map_or_else(String::new, |role| format!("  {role:?}"));
+        let spof = if view.id.as_deref().is_some_and(|id| spofs.contains(id)) {
+            "  SPOF"
+        } else {
+            ""
+        };
         lines.push(Line::from(format!(
-            "{}{}  {:?}{role}  {}",
+            "{}{}  {:?}{role}{spof}  {}",
             "  ".repeat(depth(host)),
             leaf_of(host),
             view.state,
@@ -115,6 +125,51 @@ mod tests {
                 "  leaf-a  Working  0",
                 "  leaf-b  Done  0",
             ],
+        );
+    }
+
+    #[test]
+    fn tui_flags_a_single_point_of_failure() {
+        use crate::capability::{NodeProfile, Os, Role};
+        // A relay with a single leaf has no redundant path, so the relay is a
+        // single point of failure. Its leaf, reached only through it, is not one.
+        let profile = NodeProfile {
+            os: Os::Linux,
+            cores: 8,
+            ram_mb: 16_000,
+            gpus: Vec::new(),
+        };
+        let mut state = RunState::default();
+        state.apply(&Event::profiled(
+            "relay",
+            "idR",
+            profile.clone(),
+            Role::Compute,
+            0,
+        ));
+        state.apply(&Event::profiled(
+            "relay/leaf",
+            "idL",
+            profile,
+            Role::Compute,
+            0,
+        ));
+        state.apply(&Event::node("relay", NodeState::Working));
+        state.apply(&Event::node("relay/leaf", NodeState::Working));
+
+        let mut terminal = Terminal::new(TestBackend::new(48, 3)).unwrap();
+        terminal.draw(|frame| super::draw(frame, &state)).unwrap();
+
+        let rows = rows(terminal.backend().buffer());
+        assert!(
+            rows.iter()
+                .any(|r| r.starts_with("relay") && r.contains("SPOF")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("leaf") && !r.contains("SPOF")),
+            "{rows:?}"
         );
     }
 

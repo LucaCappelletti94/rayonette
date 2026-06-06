@@ -259,6 +259,8 @@ Builds the relay tree of `DECISIONS.md` 32-43. The cross-phase criteria above st
 
 **Done when:** any node a survivor can still reach keeps working through any single relay's death.
 
+**Delivered.** Self-reported node identity, the discovery/provision split with a coordinator-driven two-phase activation handshake, the `geometric-traits` CSR graph (`graph.rs`: Kahn acyclicity, BiconnectedComponents single-points-of-failure surfaced in the TUI, ConnectedComponents reachability, a locally-implemented widest path, PairwiseDijkstra shortest path), metric-based primary selection over measured link latency, eager-built warm standbys promoted on a relay's death (exactly-once via `task_id` dedup), and a `require_redundancy` refusal. Scoped to depth-2 redundancy (the coordinator talks directly to the sharing relays). Latency is the measured metric so far, so the bandwidth probe and a per-run metric selector, plus deeper-than-depth-2 redundant paths, are carried forward.
+
 ### R6 - Elastic membership (join mid-run)
 
 **Goal:** a long run absorbs machines that come online after it started, the mirror of R5's leave path.

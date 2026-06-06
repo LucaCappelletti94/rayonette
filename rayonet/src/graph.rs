@@ -360,10 +360,13 @@ impl Topology {
             .symbols((0..order).enumerate())
             .build()
             .expect("a contiguous 0..order vocabulary is always valid");
+        // The undirected builder is upper triangular, so each edge is normalized
+        // to (min, max). A directed parent -> child edge can run either way once
+        // the vertices are numbered by id order.
         let matrix: SymmetricCSR2D<CSR2D<usize, usize, usize>> = UndiEdgesBuilder::default()
             .expected_number_of_edges(edges.len())
             .expected_shape(order)
-            .edges(edges.iter().copied())
+            .edges(edges.iter().map(|&(a, b)| (a.min(b), a.max(b))))
             .build()
             .expect("the edges are vertex-index pairs within the vertex count");
         UndiGraph::from((nodes, matrix))
