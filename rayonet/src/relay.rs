@@ -325,6 +325,41 @@ mod tests {
         }
     }
 
+    /// A child that is itself a relay over its own `leaves`, so a parent relay
+    /// sees one of its children recurse into another relay (depth-3 and beyond).
+    struct RelayAgent {
+        leaves: Vec<(String, Registry)>,
+    }
+
+    impl Launch for RelayAgent {
+        type Stream = DuplexStream;
+        type Guard = JoinHandle<std::io::Result<()>>;
+        type Session = ();
+
+        fn label(&self) -> String {
+            "sub-relay".to_string()
+        }
+
+        async fn connect(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        async fn activate(
+            &self,
+            _session: (),
+            _events: &dyn EventSink,
+        ) -> std::io::Result<(Connection<DuplexStream>, Self::Guard)> {
+            let (client, server) = connection_pair(256);
+            let leaves: Vec<LocalAgent> = self
+                .leaves
+                .iter()
+                .map(|(label, registry)| LocalAgent::new(label, registry.clone()))
+                .collect();
+            let task = tokio::spawn(async move { relay(server, leaves, &NoopSink).await });
+            Ok((client, task))
+        }
+    }
+
     /// Drive `inputs` through a top coordinator -> relay -> `children` and return
     /// the coordinator's results.
     async fn through_relay<L: Launch + Send + Sync>(
@@ -355,6 +390,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, (0..20u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn a_relay_whose_child_is_itself_a_relay_runs_to_depth_three() {
+        // coordinator -> relay -> sub-relay -> two leaves. The middle relay sees
+        // one child that is itself a relay; capacity and results pass through
+        // both hops transparently.
+        let children = vec![RelayAgent {
+            leaves: vec![
+                (
+                    "leaf-a".to_string(),
+                    Registry::new().with("double", handler(double)),
+                ),
+                (
+                    "leaf-b".to_string(),
+                    Registry::new().with("double", handler(double)),
+                ),
+            ],
+        }];
+        let out = through_relay(children, "double", (0..24u32).collect())
+            .await
+            .unwrap();
+        assert_eq!(out, (0..24u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
     }
 
     #[tokio::test]

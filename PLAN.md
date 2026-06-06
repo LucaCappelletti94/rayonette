@@ -207,17 +207,19 @@ Builds the relay tree of `DECISIONS.md` 32-43. The cross-phase criteria above st
 
 **Goal:** recursion to any depth.
 
-**Deliverables:**
-- A relay's child may itself be a relay.
-- DAG assembly and `Kahn` ordering generalize to N levels (still one path per node, so no metric yet).
-- Nothing in R2 assumes depth 2.
+**Deliverables (delivered by R2's design, confirmed here):**
+- A relay's child may itself be a relay. This falls out of R2 with no new code: a relay launches each child with `Ssh::build` and the child boots through `node::run_node`, which reads its own children file and becomes a relay if it has one. Capacity (the `slots` sum) and results pass through each hop transparently, and a relay re-ships the `__rayonet_source()` it was built from, so the cascade recurses to any depth.
+- Provisioning order is respected for free: the cascade is recursively decentralized, so a node is built and running before it builds its own children. There is no central build DAG to order.
+- Nothing in R2 assumes depth 2 (the relay and node code are depth-agnostic).
 
 **Tests**
-- An in-process three-level tree returns correct ordered results.
-- Topological order is respected in provisioning.
-- A mid-tree `RelayOnly` node forwards through to deeper compute.
+- An in-process three-level tree (coordinator -> relay -> sub-relay -> two leaves) returns correct ordered results.
+- A mid-tree relay (the sub-relay has no registry of its own) forwards through to the deeper leaves, which do all the compute.
 
-**Done when:** depth is unbounded and proven at three levels in-process.
+**Scoped out (deferred):**
+- The coordinator-side `geometric-traits` CSR DAG and `Kahn` ordering. With the decentralized cascade there is nothing central to order for a run; the CSR graph is a coordinator-side view/policy structure, so it lands with the tree view (R4) and redundancy (R5) that actually consume it.
+
+**Done when:** depth is unbounded and proven at three levels in-process. (Met: the depth-three relay test passes against the R2 implementation unchanged.)
 
 ### R4 - Observability and the TUI tree
 
