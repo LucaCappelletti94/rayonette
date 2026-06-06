@@ -16,11 +16,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
 use crate::agent::recv_hello;
-use crate::coordinator::{connect_agents, Agents, Event as ChildEvent};
+use crate::coordinator::{connect_agents, ActivationPolicy, Agents, Event as ChildEvent};
 use crate::fleet::{launch_all, Launch, Launched};
-use crate::framing::{Connection, Sender};
+use crate::framing::{Connection, Receiver, Sender};
 use crate::observability::{Event, EventSink, NodeState};
-use crate::protocol::{FromAgent, TaskId, ToAgent};
+use crate::protocol::{ChildAd, FromAgent, TaskId, ToAgent};
 
 /// An [`EventSink`] that forwards each event onto the relay's uplink channel, so
 /// a child's observability (its `Profiled` and provisioning ladder) can be sent
@@ -43,6 +43,9 @@ struct Relay<S> {
     labels: Vec<String>,
     /// Each child's advertised capacity (slots it can hold in flight).
     capacity: Vec<usize>,
+    /// Whether each child is in the active set. A standby child is built and
+    /// connected but takes no tasks until the coordinator promotes it.
+    active: Vec<bool>,
     /// Whether each child is still up; a lost one takes no more tasks.
     alive: Vec<bool>,
     /// How many tasks each child is currently running.
@@ -63,6 +66,7 @@ where
         senders: Vec<Sender<S>>,
         labels: Vec<String>,
         capacity: Vec<usize>,
+        active: Vec<bool>,
         uplink: mpsc::UnboundedSender<Event>,
     ) -> Self {
         let n = senders.len();
@@ -70,12 +74,33 @@ where
             senders,
             labels,
             capacity,
+            active,
             alive: vec![true; n],
             load: vec![0; n],
             pending: VecDeque::new(),
             inflight: HashMap::new(),
             uplink,
         }
+    }
+
+    /// The relay's advertised capacity: the slots of its active children only, so
+    /// a standby child is not counted until it is promoted.
+    fn active_capacity(&self) -> usize {
+        (0..self.senders.len())
+            .filter(|&c| self.active[c])
+            .map(|c| self.capacity[c])
+            .sum()
+    }
+
+    /// Bring the standby child labelled `child` into the active set on reroute,
+    /// returning its index, or `None` if there is no such standby child.
+    fn promote(&mut self, child: &str) -> Option<usize> {
+        let index = self.labels.iter().position(|label| label == child)?;
+        if self.active[index] {
+            return None;
+        }
+        self.active[index] = true;
+        Some(index)
     }
 
     /// Queue a node-state event for `child` to be reported up to the parent.
@@ -88,8 +113,8 @@ where
     /// reported as `Working`.
     async fn dispatch(&mut self) -> io::Result<()> {
         while !self.pending.is_empty() {
-            let Some(child) =
-                (0..self.senders.len()).find(|&c| self.alive[c] && self.load[c] < self.capacity[c])
+            let Some(child) = (0..self.senders.len())
+                .find(|&c| self.active[c] && self.alive[c] && self.load[c] < self.capacity[c])
             else {
                 return Ok(());
             };
@@ -138,6 +163,83 @@ where
         self.report(child, NodeState::Lost);
     }
 
+    /// Handle one event from a child, forwarding its task lifecycle and
+    /// observability up to `parent_tx` and keeping the schedule fed. Returns
+    /// `false` when the subtree is gone and the relay should tear down.
+    async fn handle_child<P>(
+        &mut self,
+        parent_tx: &mut Sender<P>,
+        event: Option<ChildEvent>,
+    ) -> io::Result<bool>
+    where
+        P: AsyncRead + AsyncWrite + Unpin,
+    {
+        match event {
+            Some(ChildEvent::Message(_, FromAgent::Started { task_id })) => {
+                parent_tx.send(&FromAgent::Started { task_id }).await?;
+            }
+            Some(ChildEvent::Message(_, FromAgent::Completed { task_id, output })) => {
+                if let Some(child) = self.on_terminal(task_id) {
+                    parent_tx
+                        .send(&FromAgent::Completed { task_id, output })
+                        .await?;
+                    self.dispatch().await?;
+                    if self.load[child] == 0 {
+                        self.report(child, NodeState::Idle);
+                    }
+                }
+            }
+            Some(ChildEvent::Message(_, FromAgent::Failed { task_id, error })) => {
+                if let Some(child) = self.on_terminal(task_id) {
+                    parent_tx
+                        .send(&FromAgent::Failed { task_id, error })
+                        .await?;
+                    self.dispatch().await?;
+                    if self.load[child] == 0 {
+                        self.report(child, NodeState::Idle);
+                    }
+                }
+            }
+            // A grandchild's observability event: prefix its host with this
+            // child's label so it carries a path, then pass it further up.
+            Some(ChildEvent::Message(child, FromAgent::Observe(mut event))) => {
+                event.prefix_host(&self.labels[child]);
+                parent_tx.send(&FromAgent::Observe(event)).await?;
+            }
+            // A grandchild relay promoted a standby of its own, so its capacity
+            // grew: fold it into this child's and report the larger subtree up.
+            Some(ChildEvent::Message(child, FromAgent::Capacity { slots })) => {
+                self.capacity[child] = slots;
+                parent_tx
+                    .send(&FromAgent::Capacity {
+                        slots: self.active_capacity(),
+                    })
+                    .await?;
+                self.dispatch().await?;
+            }
+            // A child readies or describes itself only during the handshake in
+            // `connect_agents`, never again on the live channel.
+            Some(ChildEvent::Message(
+                _,
+                FromAgent::Ready { .. } | FromAgent::Discovered { .. },
+            )) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "a child sent a handshake message on the live channel",
+                ));
+            }
+            // A dropped child: requeue its in-flight tasks onto the survivors.
+            Some(ChildEvent::Lost(child)) => {
+                self.on_lost(child);
+                self.dispatch().await?;
+            }
+            // Every child reader has ended (each emits one `Lost` first), so the
+            // subtree is gone: tear down and let the parent requeue.
+            None => return Ok(false),
+        }
+        Ok(true)
+    }
+
     /// Shut the live children down cleanly, reporting each `Done`.
     async fn shutdown(&mut self) {
         for child in 0..self.senders.len() {
@@ -149,16 +251,53 @@ where
     }
 }
 
+/// Announce the relay's built children to the parent and await the active-set it
+/// names, returning whether each child is active (parallel to `labels`), or
+/// `None` if the parent left before naming one.
+async fn announce_children<P>(
+    parent_tx: &mut Sender<P>,
+    parent_rx: &mut Receiver<P>,
+    labels: &[String],
+    ids: &[String],
+    capacity: &[usize],
+) -> io::Result<Option<Vec<bool>>>
+where
+    P: AsyncRead + AsyncWrite + Unpin,
+{
+    let children: Vec<ChildAd> = (0..labels.len())
+        .map(|child| ChildAd {
+            label: labels[child].clone(),
+            id: ids[child].clone(),
+            slots: capacity[child],
+        })
+        .collect();
+    parent_tx.send(&FromAgent::Discovered { children }).await?;
+    let active = match parent_rx.recv::<ToAgent>().await? {
+        Some(ToAgent::Activate { active }) => active,
+        Some(ToAgent::Shutdown) | None => return Ok(None),
+        Some(other) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected Activate, got {other:?}"),
+            ));
+        }
+    };
+    Ok(Some(
+        labels.iter().map(|label| active.contains(label)).collect(),
+    ))
+}
+
 /// Run as a relay over `parent`, coordinating `children`.
 ///
 /// A relay is an agent to its parent and a coordinator to its children: it
 /// handshakes the parent (learning the job's `fn_key`), launches and handshakes
-/// the children, advertises their combined capacity, then forwards work down and
+/// the children, reports them up by id, runs the active set the coordinator names
+/// and holds the rest as standbys, then forwards work down and
 /// `Started`/`Completed`/`Failed` straight back up (task ids pass through intact)
-/// until the parent sends `Shutdown` or the connection closes. A child that drops
-/// mid-run has its in-flight tasks requeued onto the survivors; with none left
-/// the relay tears down so the parent requeues the whole subtree (no redundancy
-/// in R2).
+/// until the parent sends `Shutdown` or the connection closes. On reroute a
+/// `Promote` brings a standby child into the active set. A child that drops
+/// mid-run has its in-flight tasks requeued onto the survivors. With none left
+/// the relay tears down so the parent requeues the whole subtree.
 ///
 /// Subtree observability flows up too: the relay reports each child's role,
 /// profile, and lifecycle state to the parent as `Observe` events (prefixing a
@@ -187,9 +326,12 @@ where
     };
 
     // Launch the children (the provisioning cascade in the real path), then
-    // handshake them and spawn one reader per child feeding a central channel.
+    // handshake them and spawn one reader per child feeding a central channel. A
+    // relay has no global view, so it activates every one of its own children
+    // (cross-subtree dedup is the coordinator's job).
     let Launched {
         agents,
+        ids,
         guards,
         failures,
     } = launch_all(&children, None, None, &uplink_sink).await;
@@ -199,23 +341,48 @@ where
         labels,
         capacity,
         readers,
-    } = connect_agents(agents, &fn_key, &child_events_tx).await?;
+        ..
+    } = connect_agents(
+        agents,
+        &fn_key,
+        &child_events_tx,
+        &ActivationPolicy::ApproveAll,
+    )
+    .await?;
     drop(child_events_tx); // the channel ends when every child reader does
 
-    // Advertise the subtree's combined capacity so the parent keeps it fed. A
-    // relay whose children all failed to launch has nothing to offer; it errors
-    // (naming why each child dropped) rather than advertising zero, which would
-    // stall the parent; the parent then treats the dead subtree as a lost host.
-    let total_slots: usize = capacity.iter().sum();
-    if total_slots == 0 {
+    // A relay whose children all failed to launch has nothing to offer. It errors
+    // (naming why each child dropped) rather than reporting an empty subtree, so
+    // the parent treats the dead subtree as a lost host.
+    if labels.is_empty() {
         return Err(no_usable_children(&failures));
     }
-    parent_tx
-        .send(&FromAgent::Ready { slots: total_slots })
-        .await?;
+
+    // Report the built children up by id so the coordinator can dedup redundant
+    // paths, then run the children it names and hold the rest as standbys. If the
+    // parent leaves before naming an active set there is nothing to run.
+    let Some(active) =
+        announce_children(&mut parent_tx, &mut parent_rx, &labels, &ids, &capacity).await?
+    else {
+        // Shut the children down so their readers end, otherwise awaiting them
+        // would hang, then tear down.
+        for mut sender in senders {
+            let _ = sender.send(&ToAgent::Shutdown).await;
+        }
+        for reader in readers {
+            let _ = reader.await;
+        }
+        drop(guards);
+        return Ok(());
+    };
 
     // Splice the two sides until the parent is done or the subtree dies.
-    let mut sched = Relay::new(senders, labels, capacity, uplink_tx);
+    let mut sched = Relay::new(senders, labels, capacity, active, uplink_tx);
+    parent_tx
+        .send(&FromAgent::Ready {
+            slots: sched.active_capacity(),
+        })
+        .await?;
     loop {
         tokio::select! {
             from_parent = parent_rx.recv::<ToAgent>() => match from_parent? {
@@ -223,58 +390,32 @@ where
                     sched.pending.push_back((task_id, payload));
                     sched.dispatch().await?;
                 }
+                // Promote a standby child on reroute: bring it into the active
+                // set, report the larger capacity up, and feed it pending work.
+                Some(ToAgent::Promote { child }) => {
+                    if let Some(child) = sched.promote(&child) {
+                        sched.report(child, NodeState::Idle);
+                        parent_tx
+                            .send(&FromAgent::Capacity {
+                                slots: sched.active_capacity(),
+                            })
+                            .await?;
+                        sched.dispatch().await?;
+                    }
+                }
                 // A clean Shutdown or a dropped parent both end the relay.
                 Some(ToAgent::Shutdown) | None => break,
-                Some(other @ ToAgent::Hello { .. }) => {
+                Some(other @ (ToAgent::Hello { .. } | ToAgent::Activate { .. })) => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("unexpected message from parent: {other:?}"),
                     ));
                 }
             },
-            from_child = child_events_rx.recv() => match from_child {
-                Some(ChildEvent::Message(_, FromAgent::Started { task_id })) => {
-                    parent_tx.send(&FromAgent::Started { task_id }).await?;
+            from_child = child_events_rx.recv() => {
+                if !sched.handle_child(&mut parent_tx, from_child).await? {
+                    break;
                 }
-                Some(ChildEvent::Message(_, FromAgent::Completed { task_id, output })) => {
-                    if let Some(child) = sched.on_terminal(task_id) {
-                        parent_tx.send(&FromAgent::Completed { task_id, output }).await?;
-                        sched.dispatch().await?;
-                        if sched.load[child] == 0 {
-                            sched.report(child, NodeState::Idle);
-                        }
-                    }
-                }
-                Some(ChildEvent::Message(_, FromAgent::Failed { task_id, error })) => {
-                    if let Some(child) = sched.on_terminal(task_id) {
-                        parent_tx.send(&FromAgent::Failed { task_id, error }).await?;
-                        sched.dispatch().await?;
-                        if sched.load[child] == 0 {
-                            sched.report(child, NodeState::Idle);
-                        }
-                    }
-                }
-                // A grandchild's observability event: prefix its host with this
-                // child's label so it carries a path, then pass it further up.
-                Some(ChildEvent::Message(child, FromAgent::Observe(mut event))) => {
-                    event.prefix_host(&sched.labels[child]);
-                    parent_tx.send(&FromAgent::Observe(event)).await?;
-                }
-                // A child should ready only once, during `connect_agents`.
-                Some(ChildEvent::Message(_, FromAgent::Ready { .. })) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "a child sent Ready more than once",
-                    ));
-                }
-                // A dropped child: requeue its in-flight tasks onto the survivors.
-                Some(ChildEvent::Lost(child)) => {
-                    sched.on_lost(child);
-                    sched.dispatch().await?;
-                }
-                // Every child reader has ended (each emits one `Lost` first), so
-                // the subtree is gone: tear down and let the parent requeue.
-                None => break,
             },
             // Forward this subtree's own observability up to the parent.
             Some(event) = uplink_rx.recv() => {
@@ -659,6 +800,128 @@ mod tests {
         assert!(!err.to_string().is_empty());
     }
 
+    /// A leaf whose handler sleeps briefly, so tasks are in flight when a relay
+    /// is severed and the reroute path is genuinely exercised.
+    fn slow_id(x: u32) -> u32 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        x
+    }
+
+    #[tokio::test]
+    async fn a_diamond_reroutes_through_the_standby_when_the_primary_relay_dies() {
+        // Two relays front a leaf with the same node id "shared", so the
+        // coordinator runs it on the primary (A) and holds the standby (B) idle.
+        // A's coordinator-facing reads are severed mid-run, and the standby is
+        // then promoted and finishes every task once.
+        let reg = || Registry::new().with("id", handler(slow_id));
+
+        // The primary relay: its reads from the coordinator are cut after the
+        // handshake, simulating the relay dropping mid-run.
+        let (cut_here, primary_side) = duplex(4096);
+        let primary_link = Connection::new(FaultInjector::cut_reads_after(cut_here, 120));
+        let primary = tokio::spawn(relay(
+            Connection::new(primary_side),
+            vec![LocalAgent::new("shared", reg())],
+        ));
+
+        // The standby relay: healthy, ready to take over.
+        let (whole, standby_side) = duplex(4096);
+        let standby_link = Connection::new(FaultInjector::cut_reads_after(whole, usize::MAX));
+        let standby = tokio::spawn(relay(
+            Connection::new(standby_side),
+            vec![LocalAgent::new("shared", reg())],
+        ));
+
+        let agents = vec![
+            ("A".to_string(), primary_link),
+            ("B".to_string(), standby_link),
+        ];
+        let out: Vec<Result<u32, String>> = run_job(agents, "id", (0..30u32).collect(), &NoopSink)
+            .await
+            .unwrap();
+
+        assert_eq!(out, (0..30u32).map(Ok).collect::<Vec<_>>());
+        let _ = primary.await; // The primary errors once its coordinator read is cut.
+        let _ = standby.await;
+    }
+
+    #[tokio::test]
+    async fn a_relay_whose_parent_leaves_during_the_handshake_exits_cleanly() {
+        // The parent greets the relay, takes its Discovered, then shuts down
+        // before naming an active set: the relay tears down without erroring.
+        let children = vec![LocalAgent::new(
+            "leaf",
+            Registry::new().with("id", handler(|x: u32| x)),
+        )];
+        let (coord, relay_side) = connection_pair(256);
+        let relay_fut = relay(relay_side, children);
+        let driver = async {
+            let (mut tx, mut rx) = coord.split();
+            tx.send(&ToAgent::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                fn_key: "id".to_string(),
+            })
+            .await
+            .unwrap();
+            let discovered: FromAgent = rx.recv().await.unwrap().unwrap();
+            assert!(matches!(discovered, FromAgent::Discovered { .. }));
+            tx.send(&ToAgent::Shutdown).await.unwrap();
+        };
+        let (res, ()) = tokio::join!(relay_fut, driver);
+        res.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_relay_rejects_a_non_activate_reply_to_discovery() {
+        // After Discovered the relay expects Activate; anything else is rejected.
+        let children = vec![LocalAgent::new(
+            "leaf",
+            Registry::new().with("id", handler(|x: u32| x)),
+        )];
+        let (coord, relay_side) = connection_pair(256);
+        let relay_fut = relay(relay_side, children);
+        let driver = async {
+            let (mut tx, mut rx) = coord.split();
+            tx.send(&ToAgent::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                fn_key: "id".to_string(),
+            })
+            .await
+            .unwrap();
+            let _discovered: FromAgent = rx.recv().await.unwrap().unwrap();
+            tx.send(&ToAgent::Assign {
+                task_id: 0,
+                payload: Vec::new(),
+            })
+            .await
+            .unwrap();
+            while let Ok(Some(_)) = rx.recv::<FromAgent>().await {}
+        };
+        let (res, ()) = tokio::join!(relay_fut, driver);
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn work_stranded_behind_a_dead_lone_relay_fails() {
+        // A single relay with no redundant path is an articulation point: severing
+        // it strands its leaf with no alternate, so the run surfaces an error.
+        let (coord, relay_side) = duplex(4096);
+        let client = Connection::new(FaultInjector::cut_reads_after(coord, 120));
+        let relay_task = tokio::spawn(relay(
+            Connection::new(relay_side),
+            vec![LocalAgent::new(
+                "only",
+                Registry::new().with("id", handler(slow_id)),
+            )],
+        ));
+        let agents = vec![("A".to_string(), client)];
+        let err = run_job::<_, u32, u32>(agents, "id", (0..30u32).collect(), &NoopSink)
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().is_empty());
+        let _ = relay_task.await;
+    }
+
     #[tokio::test]
     async fn a_relay_with_no_usable_children_errors() {
         let (coord_side, relay_side) = connection_pair(256);
@@ -692,9 +955,19 @@ mod tests {
             })
             .await
             .unwrap();
-            // Wait for the relay to advertise, then send a second Hello mid-run.
+            // The relay describes its children, so activate them all to ready it.
+            let discovered: FromAgent = rx.recv().await.unwrap().unwrap();
+            let FromAgent::Discovered { children } = discovered else {
+                panic!("expected Discovered, got {discovered:?}");
+            };
+            tx.send(&ToAgent::Activate {
+                active: children.into_iter().map(|child| child.label).collect(),
+            })
+            .await
+            .unwrap();
             let ready: FromAgent = rx.recv().await.unwrap().unwrap();
             assert!(matches!(ready, FromAgent::Ready { .. }));
+            // Now send a second Hello mid-run, which the relay must reject.
             tx.send(&ToAgent::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 fn_key: "id".to_string(),
@@ -716,7 +989,13 @@ mod tests {
         let (client, _server) = connection_pair(64);
         let (tx, _rx) = client.split();
         let (uplink_tx, _uplink_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut sched = super::Relay::new(vec![tx], vec!["leaf".to_string()], vec![1], uplink_tx);
+        let mut sched = super::Relay::new(
+            vec![tx],
+            vec!["leaf".to_string()],
+            vec![1],
+            vec![true],
+            uplink_tx,
+        );
         sched.load[0] = 1;
         sched.inflight.insert(7, (0, vec![1, 2, 3]));
         assert!(sched.on_terminal(7).is_some(), "first terminal is known");
@@ -736,9 +1015,15 @@ mod tests {
             })
             .await
             .unwrap();
-            // Keep the parent alive and drain (Ready, Observe, ...) until the
-            // relay errors on the child's second Ready and closes, so the parent
-            // does not drop first and end the relay cleanly.
+            // Activate the child so the relay enters its loop and processes the
+            // child's bogus second Ready, then drain until it errors and closes.
+            if let Ok(Some(FromAgent::Discovered { children })) = rx.recv::<FromAgent>().await {
+                tx.send(&ToAgent::Activate {
+                    active: children.into_iter().map(|child| child.label).collect(),
+                })
+                .await
+                .unwrap();
+            }
             while let Ok(Some(_)) = rx.recv::<FromAgent>().await {}
         };
         let (res, ()) = tokio::join!(relay_fut, driver);

@@ -5,10 +5,25 @@ use serde::{Deserialize, Serialize};
 /// Bumped when the wire protocol changes. Because the agent is compiled from the
 /// same source as the coordinator (whole-crate compile), this is a sanity
 /// assertion rather than a true negotiation.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Identifies a task within a run.
 pub type TaskId = u64;
+
+/// One child a relay has discovered and built, advertised up for path selection.
+///
+/// The coordinator decides which paths to run from these. A node reached through
+/// two relays appears once under each, with the same `id`, which is how the
+/// coordinator dedups it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildAd {
+    /// The child's local label under this relay (its path segment).
+    pub label: String,
+    /// The child's stable physical node id (shared across redundant paths).
+    pub id: String,
+    /// How many tasks the child can hold in flight (its own advertised slots).
+    pub slots: usize,
+}
 
 /// Coordinator to agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +41,22 @@ pub enum ToAgent {
         task_id: TaskId,
         /// Postcard-encoded task input.
         payload: Vec<u8>,
+    },
+    /// The coordinator's answer to a relay's `Discovered`: the labels of the
+    /// children to run now. Any discovered child not named is held as a built but
+    /// idle standby (a redundant path the coordinator deduped away), ready to be
+    /// brought in later with `Promote`. The relay replies `Ready` with the active
+    /// capacity.
+    Activate {
+        /// Labels of the children to schedule to.
+        active: Vec<String>,
+    },
+    /// Bring a standby child into the active set after its primary path died, so
+    /// the relay starts scheduling to it. The relay replies `Capacity` with its
+    /// new total.
+    Promote {
+        /// Label of the standby child to activate.
+        child: String,
     },
     /// Stop serving and exit cleanly (sent once every result is in).
     Shutdown,
@@ -61,6 +92,19 @@ pub enum FromAgent {
         /// Captured panic message.
         error: String,
     },
+    /// A relay's built children, sent in place of `Ready` so the coordinator can
+    /// dedup redundant paths and choose which to run before any task flows. The
+    /// relay then waits for `Activate`. A leaf never sends this (it just readies).
+    Discovered {
+        /// Every child this relay built, with its id and slots.
+        children: Vec<ChildAd>,
+    },
+    /// A relay's updated in-flight capacity after a `Promote` brought a standby
+    /// child into its active set, so the coordinator feeds the larger subtree.
+    Capacity {
+        /// The relay's new total concurrent slots across its active children.
+        slots: usize,
+    },
     /// An observability event about this agent's subtree, forwarded up so the
     /// top coordinator can see the whole tree. A relay sends these for its
     /// children (and passes its grandchildren's up); a leaf never sends one. The
@@ -71,7 +115,7 @@ pub enum FromAgent {
 
 #[cfg(test)]
 mod tests {
-    use super::{FromAgent, ToAgent, PROTOCOL_VERSION};
+    use super::{ChildAd, FromAgent, ToAgent, PROTOCOL_VERSION};
     use crate::observability::{Event, NodeState};
     use proptest::prelude::*;
 
@@ -98,6 +142,12 @@ mod tests {
                 task_id: 7,
                 payload: vec![1, 2, 3, 255, 0],
             },
+            ToAgent::Activate {
+                active: vec!["leaf-a".to_string(), "leaf-b".to_string()],
+            },
+            ToAgent::Promote {
+                child: "leaf-b".to_string(),
+            },
             ToAgent::Shutdown,
         ] {
             roundtrip_to_agent(&msg);
@@ -118,6 +168,14 @@ mod tests {
                 error: "panicked at 'boom'".to_string(),
             },
             FromAgent::Observe(Event::node("relay/leaf", NodeState::Working)),
+            FromAgent::Discovered {
+                children: vec![ChildAd {
+                    label: "leaf-a".to_string(),
+                    id: "node-1".to_string(),
+                    slots: 2,
+                }],
+            },
+            FromAgent::Capacity { slots: 3 },
         ] {
             roundtrip_from_agent(&msg);
         }
@@ -133,6 +191,9 @@ mod tests {
             }),
             (any::<u64>(), any::<Vec<u8>>())
                 .prop_map(|(task_id, payload)| ToAgent::Assign { task_id, payload }),
+            prop::collection::vec(any::<String>(), 0..4)
+                .prop_map(|active| ToAgent::Activate { active }),
+            any::<String>().prop_map(|child| ToAgent::Promote { child }),
             Just(ToAgent::Shutdown),
         ]
     }
@@ -146,6 +207,13 @@ mod tests {
             (any::<u64>(), any::<String>())
                 .prop_map(|(task_id, error)| FromAgent::Failed { task_id, error }),
             any::<usize>().prop_map(|tasks| FromAgent::Observe(Event::RunStarted { tasks })),
+            prop::collection::vec(
+                (any::<String>(), any::<String>(), any::<usize>())
+                    .prop_map(|(label, id, slots)| ChildAd { label, id, slots }),
+                0..4,
+            )
+            .prop_map(|children| FromAgent::Discovered { children }),
+            any::<usize>().prop_map(|slots| FromAgent::Capacity { slots }),
         ]
     }
 

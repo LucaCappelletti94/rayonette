@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 
 use crate::framing::{Connection, Receiver, Sender};
 use crate::observability::{Event as Obs, EventSink, NodeState};
-use crate::protocol::{FromAgent, TaskId, ToAgent, PROTOCOL_VERSION};
+use crate::protocol::{ChildAd, FromAgent, TaskId, ToAgent, PROTOCOL_VERSION};
 
 /// What a reader task forwards to the coordinator's central loop. A read error
 /// and a clean disconnect are treated alike: the agent is lost. Shared with the
@@ -50,49 +50,129 @@ where
     })
 }
 
+/// How a parent decides which of a relay's discovered children to activate now.
+pub(crate) enum ActivationPolicy {
+    /// The coordinator's global dedup: the first relay to claim a physical node id
+    /// runs it, and a later relay reaching the same node holds it as a standby
+    /// (the basis of redundant-path reroute).
+    DedupById,
+    /// A relay over its own children, with no global view, activates them all.
+    ApproveAll,
+}
+
+/// An agent's first handshake reply: a leaf readies with its slot count, a relay
+/// first describes the children it built so the parent can choose which to run.
+enum FirstReport {
+    Leaf(usize),
+    Relay(Vec<ChildAd>),
+}
+
+/// The labels each agent should activate now, by `policy`, parallel to `reports`.
+/// Under `DedupById` a node id already claimed by an earlier relay is dropped, so
+/// it stays a standby on this path.
+fn active_labels(reports: &[FirstReport], policy: &ActivationPolicy) -> Vec<Vec<String>> {
+    let mut claimed = std::collections::HashSet::new();
+    reports
+        .iter()
+        .map(|report| match report {
+            FirstReport::Leaf(_) => Vec::new(),
+            FirstReport::Relay(children) => children
+                .iter()
+                .filter(|child| match policy {
+                    ActivationPolicy::ApproveAll => true,
+                    ActivationPolicy::DedupById => claimed.insert(child.id.clone()),
+                })
+                .map(|child| child.label.clone())
+                .collect(),
+        })
+        .collect()
+}
+
+/// An `InvalidData` error for an unexpected handshake reply.
+fn unexpected(want: &str, got: Option<&FromAgent>) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("expected {want}, got {got:?}"),
+    )
+}
+
 /// The per-agent state produced by the handshake.
 pub(crate) struct Agents<S> {
     pub(crate) senders: Vec<Sender<S>>,
     pub(crate) labels: Vec<String>,
     /// Each agent's advertised concurrency: how many tasks it can hold at once
-    /// (1 for a leaf, the ready-slot count for a relay).
+    /// (1 for a leaf, the active-slot sum for a relay).
     pub(crate) capacity: Vec<usize>,
+    /// Per agent, the children it holds as built-but-idle standbys (a node the
+    /// coordinator deduped onto another path), for reroute on a relay's death.
+    pub(crate) standbys: Vec<Vec<ChildAd>>,
     pub(crate) readers: Vec<JoinHandle<()>>,
 }
 
-/// Handshake with every agent (send `Hello`, receive `Ready`) and spawn each
-/// agent's reader task feeding the central channel. The agent's advertised
-/// `slots` become its scheduling capacity.
+/// Handshake with every agent and spawn its reader task. A leaf replies `Ready`;
+/// a relay replies `Discovered`, is told which children to `Activate` by `policy`,
+/// then replies `Ready` with its active capacity. Children a relay does not
+/// activate are kept as standbys.
 pub(crate) async fn connect_agents<S>(
     agents: Vec<(String, Connection<S>)>,
     fn_key: &str,
     events_tx: &mpsc::UnboundedSender<Event>,
+    policy: &ActivationPolicy,
 ) -> std::io::Result<Agents<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut out = Agents {
-        senders: Vec::with_capacity(agents.len()),
-        labels: Vec::with_capacity(agents.len()),
-        capacity: Vec::with_capacity(agents.len()),
-        readers: Vec::with_capacity(agents.len()),
-    };
-    for (agent_id, (label, conn)) in agents.into_iter().enumerate() {
+    // Phase 1: greet every agent and read its first reply.
+    let mut parts = Vec::with_capacity(agents.len());
+    let mut reports = Vec::with_capacity(agents.len());
+    for (label, conn) in agents {
         let (mut tx, mut rx) = conn.split();
         tx.send(&ToAgent::Hello {
             protocol_version: PROTOCOL_VERSION,
             fn_key: fn_key.to_string(),
         })
         .await?;
-        match rx.recv::<FromAgent>().await? {
-            Some(FromAgent::Ready { slots }) => out.capacity.push(slots),
-            other => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("expected Ready, got {other:?}"),
-                ));
+        let report = match rx.recv::<FromAgent>().await? {
+            Some(FromAgent::Ready { slots }) => FirstReport::Leaf(slots),
+            Some(FromAgent::Discovered { children }) => FirstReport::Relay(children),
+            other => return Err(unexpected("Ready or Discovered", other.as_ref())),
+        };
+        reports.push(report);
+        parts.push((label, tx, rx));
+    }
+
+    // Phase 2: tell each relay which children to run, then read its readiness.
+    let actives = active_labels(&reports, policy);
+    let mut out = Agents {
+        senders: Vec::with_capacity(parts.len()),
+        labels: Vec::with_capacity(parts.len()),
+        capacity: Vec::with_capacity(parts.len()),
+        standbys: Vec::with_capacity(parts.len()),
+        readers: Vec::with_capacity(parts.len()),
+    };
+    for (agent_id, ((label, mut tx, mut rx), report)) in parts.into_iter().zip(reports).enumerate()
+    {
+        let active = &actives[agent_id];
+        let (slots, standby) = match report {
+            FirstReport::Leaf(slots) => (slots, Vec::new()),
+            FirstReport::Relay(children) => {
+                tx.send(&ToAgent::Activate {
+                    active: active.clone(),
+                })
+                .await?;
+                let slots = match rx.recv::<FromAgent>().await? {
+                    Some(FromAgent::Ready { slots }) => slots,
+                    other => return Err(unexpected("Ready after Activate", other.as_ref())),
+                };
+                let standby = children
+                    .into_iter()
+                    .filter(|child| !active.contains(&child.label))
+                    .collect();
+                (slots, standby)
             }
-        }
+        };
+        out.capacity.push(slots);
+        out.standbys.push(standby);
         out.senders.push(tx);
         out.labels.push(label);
         out.readers
@@ -109,6 +189,10 @@ struct Job<S> {
     /// How many tasks each agent may hold in flight at once (its advertised
     /// `slots`): 1 for a leaf, more for a relay fronting a subtree.
     capacity: Vec<usize>,
+    /// Per agent, the children it holds as built-but-idle standbys (redundant
+    /// paths the coordinator deduped away). On a relay's death these are promoted
+    /// so a survivor takes over the orphaned subtree.
+    standbys: Vec<Vec<ChildAd>>,
     /// Whether each agent's connection is still up; a lost one takes no tasks.
     alive: Vec<bool>,
     pending: VecDeque<usize>,
@@ -180,6 +264,107 @@ where
     /// Whether any agent is still alive to take work.
     fn any_alive(&self) -> bool {
         self.alive.iter().any(|alive| *alive)
+    }
+
+    /// React to a relay's death by promoting every standby a survivor holds, so a
+    /// node the dead relay was the primary path to is brought up on its alternate
+    /// path. Each promoted relay replies `Capacity` with its larger total, which
+    /// the loop folds in before feeding it the requeued work. A node with no
+    /// surviving path (behind a dead articulation relay) has no standby to
+    /// promote, so its work simply finds no taker and the run fails clearly.
+    async fn reroute(&mut self) -> std::io::Result<()> {
+        for agent in 0..self.senders.len() {
+            if !self.alive[agent] {
+                continue;
+            }
+            for child in std::mem::take(&mut self.standbys[agent]) {
+                self.senders[agent]
+                    .send(&ToAgent::Promote { child: child.label })
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Fold one event from the central channel into the run: record a terminal,
+    /// surface a task or subtree event, fold in a promoted relay's larger
+    /// capacity, or react to a lost agent by rerouting onto standbys. Returns an
+    /// error on a protocol violation or when no agent is left to make progress.
+    async fn on_event(
+        &mut self,
+        event: Option<Event>,
+        labels: &[String],
+        events: &dyn EventSink,
+    ) -> std::io::Result<()> {
+        match event {
+            Some(Event::Message(_, FromAgent::Ready { .. } | FromAgent::Discovered { .. })) => {
+                // Ready and Discovered are handshake messages, so seeing one on
+                // the live channel is a protocol error.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "agent sent a handshake message more than once",
+                ));
+            }
+            // A promoted relay reports its larger capacity after reroute: fold it
+            // in and feed it the requeued work, marking it working if it took any.
+            Some(Event::Message(agent, FromAgent::Capacity { slots })) => {
+                self.capacity[agent] = slots;
+                self.assign_up_to_capacity(agent).await?;
+                if self.in_flight[agent] > 0 {
+                    events.emit(Obs::node(&labels[agent], NodeState::Working));
+                }
+            }
+            Some(Event::Message(_, FromAgent::Started { task_id })) => {
+                if let Some((agent, _)) = self.assigned.get(&task_id) {
+                    events.emit(Obs::TaskStarted {
+                        host: labels[*agent].clone(),
+                        task: task_id,
+                    });
+                }
+            }
+            Some(Event::Message(_, FromAgent::Completed { task_id, output })) => {
+                // The raw bytes are kept as-is; decoding happens in the typed
+                // layer, so a `Completed` is `ok` at the protocol level here.
+                self.finish(task_id, Ok(output), true, labels, events)
+                    .await?;
+            }
+            Some(Event::Message(_, FromAgent::Failed { task_id, error })) => {
+                self.finish(task_id, Err(error), false, labels, events)
+                    .await?;
+            }
+            // A subtree event from a relay child: prefix its host with that
+            // child's label so it carries a full path from the root, then
+            // re-emit it so the whole tree surfaces in the run's event stream.
+            Some(Event::Message(agent, FromAgent::Observe(mut event))) => {
+                event.prefix_host(&labels[agent]);
+                events.emit(event);
+            }
+            // A dropped or erroring agent is abandoned: mark it lost, requeue its
+            // in-flight tasks, promote standbys so a survivor takes over the
+            // orphaned subtree, and feed the survivors. The run fails only when no
+            // agent is left.
+            Some(Event::Lost(agent)) => {
+                events.emit(Obs::node(&labels[agent], NodeState::Lost));
+                self.requeue_lost(agent);
+                if !self.any_alive() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "every agent was lost before the job completed",
+                    ));
+                }
+                self.reroute().await?;
+                for survivor in 0..self.senders.len() {
+                    self.assign_up_to_capacity(survivor).await?;
+                }
+            }
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "all agents gone before completion",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Record a terminal outcome, emit its task event, and hand the freed agent
@@ -257,8 +442,9 @@ where
         senders,
         labels,
         capacity,
+        standbys,
         readers,
-    } = connect_agents(agents, fn_key, &events_tx).await?;
+    } = connect_agents(agents, fn_key, &events_tx, &ActivationPolicy::DedupById).await?;
     drop(events_tx); // the channel ends when every reader does
 
     let agent_count = senders.len();
@@ -266,6 +452,7 @@ where
         senders,
         in_flight: vec![0; agent_count],
         capacity,
+        standbys,
         alive: vec![true; agent_count],
         pending: (0..num_tasks).collect(),
         assigned: HashMap::new(),
@@ -284,62 +471,7 @@ where
 
     while job.remaining > 0 {
         let event = events_rx.recv().await;
-        match event {
-            Some(Event::Message(_, FromAgent::Ready { .. })) => {
-                // Ready is a handshake message; a second one is a protocol error.
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "agent sent Ready more than once",
-                ));
-            }
-            Some(Event::Message(_, FromAgent::Started { task_id })) => {
-                if let Some((agent, _)) = job.assigned.get(&task_id) {
-                    events.emit(Obs::TaskStarted {
-                        host: labels[*agent].clone(),
-                        task: task_id,
-                    });
-                }
-            }
-            Some(Event::Message(_, FromAgent::Completed { task_id, output })) => {
-                // The raw bytes are kept as-is; decoding happens in the typed
-                // layer, so a `Completed` is `ok` at the protocol level here.
-                job.finish(task_id, Ok(output), true, &labels, events)
-                    .await?;
-            }
-            Some(Event::Message(_, FromAgent::Failed { task_id, error })) => {
-                job.finish(task_id, Err(error), false, &labels, events)
-                    .await?;
-            }
-            // A subtree event from a relay child: prefix its host with that
-            // child's label so it carries a full path from the root, then
-            // re-emit it so the whole tree surfaces in the run's event stream.
-            Some(Event::Message(agent, FromAgent::Observe(mut event))) => {
-                event.prefix_host(&labels[agent]);
-                events.emit(event);
-            }
-            // A dropped or erroring agent is abandoned: mark it lost, requeue
-            // its in-flight tasks, and let the survivors absorb them. The run
-            // fails only when no agent is left.
-            Some(Event::Lost(agent)) => {
-                events.emit(Obs::node(&labels[agent], NodeState::Lost));
-                job.requeue_lost(agent);
-                if !job.any_alive() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionReset,
-                        "every agent was lost before the job completed",
-                    ));
-                }
-                for survivor in 0..agent_count {
-                    job.assign_up_to_capacity(survivor).await?;
-                }
-            }
-            None => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionReset,
-                    "all agents gone before completion",
-                ));
-            }
-        }
+        job.on_event(event, &labels, events).await?;
     }
 
     for (agent, label) in labels.iter().enumerate() {

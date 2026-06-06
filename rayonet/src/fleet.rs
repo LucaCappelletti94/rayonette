@@ -136,6 +136,9 @@ pub(crate) struct Launched<L: Launch> {
     /// Each ready agent's label and live connection, ready to hand to a
     /// coordinator ([`run_job_raw`]) or a relay (`crate::relay`).
     pub agents: Vec<(String, Connection<L::Stream>)>,
+    /// Each ready agent's stable physical node id, parallel to `agents`, so a
+    /// relay can advertise its children by id for redundant-path dedup.
+    pub ids: Vec<String>,
     /// A guard per ready agent, held for the run's duration.
     pub guards: Vec<L::Guard>,
     /// Why each dropped host did not join (for the no-eligible-host message).
@@ -152,6 +155,8 @@ struct Discovered<'a, L: Launch> {
     launcher: &'a L,
     /// The host's label, used to attribute its observability events.
     label: String,
+    /// The host's stable physical node id, carried through to [`Launched::ids`].
+    id: String,
     /// The open session from [`Launch::connect`], handed to [`Launch::activate`].
     session: L::Session,
 }
@@ -199,6 +204,7 @@ async fn discover_all<'a, L: Launch + Send + Sync>(
         eligible.push(Discovered {
             launcher,
             label,
+            id,
             session,
         });
     }
@@ -214,11 +220,13 @@ async fn provision_all<L: Launch + Send + Sync>(
     events: &dyn EventSink,
 ) -> Launched<L> {
     let mut agents = Vec::with_capacity(discovered.len());
+    let mut ids = Vec::with_capacity(discovered.len());
     let mut guards = Vec::with_capacity(discovered.len());
     for host in discovered {
         match host.launcher.activate(host.session, events).await {
             Ok((connection, guard)) => {
                 agents.push((host.label, connection));
+                ids.push(host.id);
                 guards.push(guard);
             }
             Err(failure) => failures.push(failure),
@@ -226,6 +234,7 @@ async fn provision_all<L: Launch + Send + Sync>(
     }
     Launched {
         agents,
+        ids,
         guards,
         failures,
     }
@@ -294,6 +303,7 @@ impl<L: Launch + Send + Sync> ErasedFleet for Fleet<L> {
                 agents,
                 guards,
                 failures,
+                ..
             } = launch_all(&self.launchers, self.filter.as_ref(), requires, events).await;
             if agents.is_empty() {
                 return Err(no_eligible_host(&failures));
