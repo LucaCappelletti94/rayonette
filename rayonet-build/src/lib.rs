@@ -160,6 +160,9 @@ fn bundle_source(
 
 /// Recursively add the files under `root.join(rel)` to `tar` (named by their
 /// path relative to `root`), skipping `target`, `.git`, and `out_dir`.
+///
+/// Entries are sorted by name so the archive order does not depend on the
+/// filesystem's `read_dir` order.
 fn append_tree<W: std::io::Write>(
     tar: &mut tar::Builder<W>,
     root: &std::path::Path,
@@ -167,8 +170,10 @@ fn append_tree<W: std::io::Write>(
     out_dir: &std::path::Path,
     bundled: &mut Vec<std::path::PathBuf>,
 ) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(root.join(rel))? {
-        let entry = entry?;
+    let mut entries = std::fs::read_dir(root.join(rel))?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+
+    for entry in entries {
         let name = entry.file_name();
         if name == "target" || name == ".git" {
             continue;
@@ -181,11 +186,32 @@ fn append_tree<W: std::io::Write>(
         if entry.file_type()?.is_dir() {
             append_tree(tar, root, &child, out_dir, bundled)?;
         } else {
-            tar.append_path_with_name(&absolute, &child)?;
+            append_file(tar, &absolute, &child)?;
             bundled.push(absolute);
         }
     }
     Ok(())
+}
+
+/// Append one file under a canonical header (zeroed mtime and ownership, fixed
+/// mode), so a tree's archive bytes depend only on file names and contents, not
+/// on filesystem metadata that varies build to build. This keeps the bundle's
+/// content hash stable, which is what the remote build cache keys on.
+fn append_file<W: std::io::Write>(
+    tar: &mut tar::Builder<W>,
+    absolute: &std::path::Path,
+    name: &std::path::Path,
+) -> std::io::Result<()> {
+    let mut file = std::fs::File::open(absolute)?;
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_size(file.metadata()?.len());
+    header.set_mode(0o644);
+    header.set_mtime(0);
+    header.set_uid(0);
+    header.set_gid(0);
+    // `append_data` sets the path and recomputes the checksum.
+    tar.append_data(&mut header, name, &mut file)
 }
 
 /// Error if the consumer's `Cargo.toml` has a non-rayonet local `path`
@@ -344,6 +370,36 @@ mod tests {
                 .iter()
                 .any(|n| n.starts_with("target") || n.starts_with(".git")),
             "build output or vcs leaked: {names:?}"
+        );
+    }
+
+    #[test]
+    fn bundle_is_byte_reproducible_despite_mtimes() {
+        use std::time::{Duration, SystemTime};
+
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("Cargo.toml"), "[package]\nname = \"c\"\n").unwrap();
+        std::fs::create_dir(src.path().join("src")).unwrap();
+        let main = src.path().join("src").join("main.rs");
+        std::fs::write(&main, "fn a() { let _ = x.net_map(double); }").unwrap();
+
+        // Bundle into an out dir outside the source tree (so it is not itself
+        // bundled), capturing the bytes.
+        let out_a = tempfile::tempdir().unwrap();
+        super::extract_into(src.path(), out_a.path()).unwrap();
+        let tar_a = std::fs::read(out_a.path().join("rayonet_source.tar")).unwrap();
+
+        // Change a file's mtime without touching its content, then re-bundle.
+        let file = std::fs::File::options().write(true).open(&main).unwrap();
+        file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000))
+            .unwrap();
+        let out_b = tempfile::tempdir().unwrap();
+        super::extract_into(src.path(), out_b.path()).unwrap();
+        let tar_b = std::fs::read(out_b.path().join("rayonet_source.tar")).unwrap();
+
+        assert_eq!(
+            tar_a, tar_b,
+            "the source bundle must be byte-reproducible regardless of file mtimes"
         );
     }
 
