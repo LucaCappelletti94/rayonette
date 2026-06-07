@@ -1,0 +1,25 @@
+# elastic: coordinator -> {leaf-a, leaf-b}, both reachable directly. The run
+# starts with leaf-a only; leaf-b is started mid-run so the coordinator's rejoin
+# driver discovers it, provisions it by cache hit, and it picks up pending work.
+name: rayonet-elastic
+
+volumes:
+  rayonet-topo-cache:
+    external: true
+
+x-agent: &agent
+  init: true
+  image: rayonet-harness-base:latest
+  volumes:
+    - ../../secrets:/secrets:ro
+    - rayonet-topo-cache:/home/rayonet/.cache
+
+services:
+  leaf-a:
+    <<: *agent
+    ports:
+      - "2220:22"
+  leaf-b:
+    <<: *agent
+    ports:
+      - "2221:22"

@@ -1,11 +1,12 @@
 # Relay-tree topology bestiarium
 
-Docker scenarios that stress the R5 relay tree on real, segmented networks. The
+Docker scenarios that stress the relay tree on real, segmented networks. The
 topology is enforced by docker networks (a relay bridges its parent-side and
 child-side networks, so killing it genuinely partitions) plus a children file
 written onto each relay. The harness consumer is relay-capable (it runs
-`node::run_node`, so a children file makes it a relay), and each run kills a node
-mid-run to check the system behaves as expected.
+`node::run_node`, so a children file makes it a relay). The R5 scenarios kill a
+node mid-run (the fleet shrinks and recovers); the R6 `elastic` scenario brings a
+node online mid-run (the fleet grows and absorbs it).
 
 ## Topologies
 
@@ -16,6 +17,7 @@ mid-run to check the system behaves as expected.
 | `diamond`           | leaf reachable via relayA and relayB    | dedup to one primary, kill the primary bridge, standby finishes        |
 | `articulation`      | diamond plus a solo leaf under relayA   | kill relayA: solo's work reroutes onto the surviving compute           |
 | `require_redundancy`| line2 (no redundancy) and diamond       | refuse a non-redundant topology, admit a redundant one                 |
+| `elastic`           | coordinator -> two leaves               | start with one leaf, bring the second up mid-run, the rejoin driver absorbs it |
 
 ## Usage
 
