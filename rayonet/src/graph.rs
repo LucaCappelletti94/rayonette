@@ -331,6 +331,21 @@ impl Topology {
         chosen
     }
 
+    /// The physical node ids in vertex-index order, index 0 being the synthetic
+    /// coordinator root. A graph layout positions one point per entry.
+    #[must_use]
+    pub fn vertices(&self) -> &[String] {
+        &self.ids
+    }
+
+    /// The directed parent -> child edges as vertex-index pairs into
+    /// [`vertices`](Self::vertices). A node reached through two relays contributes
+    /// two edges into its single vertex.
+    #[must_use]
+    pub fn edge_indices(&self) -> Vec<(usize, usize)> {
+        self.edges.keys().copied().collect()
+    }
+
     /// Set a parent link's measured weight. Discovery fills these in for real in a
     /// later step. Tests use it to weight a topology directly.
     #[cfg(test)]

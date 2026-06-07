@@ -26,9 +26,10 @@ futures = "0.3"
 blake3 = "1"
 openssh = "0.11"
 # Coordinator-side topology graph: CSR structs plus Kahn, BiconnectedComponents,
-# and ConnectedComponents over the discovered DAG. `alloc` is the feature these
-# algorithms need; pinned by revision (not published to crates.io).
-geometric-traits = { git = "https://github.com/earth-metabolome-initiative/geometric-traits", rev = "0178cb4712c3868f8bc5dd17b4749ab2a8bdf2b4", default-features = false, features = [
+# and ConnectedComponents over the discovered DAG, and the ForceAtlas2 layout the
+# graph panel positions nodes with. `alloc` is the feature these algorithms need;
+# pinned by revision (not published to crates.io).
+geometric-traits = { git = "https://github.com/earth-metabolome-initiative/geometric-traits", rev = "d6a2df5a15d843cc0c39c4ca4ff0a2481ff9ab9b", default-features = false, features = [
     "alloc",
 ] }
 rayon = { version = "1", optional = true }

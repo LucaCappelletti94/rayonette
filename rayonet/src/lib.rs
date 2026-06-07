@@ -10,6 +10,8 @@ pub mod coordinator;
 pub mod fleet;
 pub mod framing;
 pub mod graph;
+#[cfg(feature = "tui")]
+pub mod layout;
 pub mod node;
 pub mod observability;
 pub mod process;
