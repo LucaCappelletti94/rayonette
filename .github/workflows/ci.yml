@@ -79,3 +79,13 @@ jobs:
           echo "$out"
           examples/montecarlo/cluster/down.sh
           echo "$out" | grep -qE 'pi ~= 3\.1[0-9]' || { echo "pi estimate missing or wrong"; exit 1; }
+      # The relay-tree bestiarium (R5-R7): segmented, multi-level, redundant, and
+      # elastic topologies on real ssh, each asserting behaviour through a kill or
+      # a mid-run join. The kill/join scenarios use the wall-clock `dawdle` task at
+      # a modest count so the event lands mid-run in a couple of seconds on a
+      # shared runner, instead of the heavy CPU-bound `crunch` used locally.
+      - name: Relay-tree bestiarium (CI-scaled tasks)
+        env:
+          RAYONET_HEAVY_TASK: dawdle
+          RAYONET_HEAVY_COUNT: "300"
+        run: bash harness/docker/topologies/run-all.sh

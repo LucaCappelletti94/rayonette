@@ -30,7 +30,7 @@ else
 fi
 
 echo "=== diamond: reroute (kill the primary bridge) ==="
-topo_drive "$config" relayA,relayB crunch 400 >/tmp/diamond-kill.log 2>&1 &
+topo_drive "$config" relayA,relayB "$HEAVY_TASK" "$HEAVY_COUNT" >/tmp/diamond-kill.log 2>&1 &
 pid=$!
 primary=""
 for _ in $(seq 1 160); do
@@ -42,7 +42,7 @@ sleep 0.3
 echo "  killing primary $primary"
 docker kill "$PROJ-$primary-1" >/dev/null 2>&1
 wait "$pid"
-grep -q 'ok: 400 results' /tmp/diamond-kill.log \
+grep -q "ok: $HEAVY_COUNT results" /tmp/diamond-kill.log \
   && echo "  PASS: all tasks completed once via the standby" \
   || { echo "  FAIL: not all 80 tasks completed"; fails=$((fails + 1)); }
 grep -qE "state $primary Lost" /tmp/diamond-kill.log \

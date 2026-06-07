@@ -25,7 +25,7 @@ grep -q 'ok: 8 results' /tmp/line3-run.log \
   || { echo "  FAIL: depth-3 cascade did not complete"; fails=$((fails + 1)); }
 
 echo "=== line3: kill the interior relay (relay2) ==="
-topo_drive "$config" relay1 crunch 400 >/tmp/line3-kill.log 2>&1 &
+topo_drive "$config" relay1 "$HEAVY_TASK" "$HEAVY_COUNT" >/tmp/line3-kill.log 2>&1 &
 pid=$!
 for _ in $(seq 1 160); do
   grep -qE 'state relay1 Working' /tmp/line3-kill.log && break; sleep 0.25
@@ -34,7 +34,7 @@ sleep 0.3
 echo "  killing relay2"
 docker kill "$PROJ-relay2-1" >/dev/null 2>&1
 wait "$pid"
-if grep -q 'error:' /tmp/line3-kill.log && ! grep -q 'ok: 400 results' /tmp/line3-kill.log; then
+if grep -q 'error:' /tmp/line3-kill.log && ! grep -q "ok: $HEAVY_COUNT results" /tmp/line3-kill.log; then
   echo "  PASS: stranding the leaf behind a dead interior relay fails the run"
 else
   echo "  FAIL: expected a clear failure after relay2 died"; fails=$((fails + 1))

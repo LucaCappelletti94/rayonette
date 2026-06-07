@@ -22,7 +22,7 @@ topo_seed_ids "$PROJ" leaf-a
 echo "=== elastic: run starts with one leaf, a second joins mid-run ==="
 # Both leaves are named, but leaf-b is unreachable at launch, so it becomes a
 # rejoin candidate the driver retries.
-topo_drive "$config" leaf-a,leaf-b crunch 400 >/tmp/elastic.log 2>&1 &
+topo_drive "$config" leaf-a,leaf-b "$HEAVY_TASK" "$HEAVY_COUNT" >/tmp/elastic.log 2>&1 &
 pid=$!
 for _ in $(seq 1 240); do
   grep -qE 'state leaf-a Working' /tmp/elastic.log && break
@@ -35,7 +35,7 @@ topo_wait "$config" leaf-b || echo "  warning: leaf-b sshd slow to answer"
 topo_seed_ids "$PROJ" leaf-b
 wait "$pid"
 
-grep -q 'ok: 400 results' /tmp/elastic.log \
+grep -q "ok: $HEAVY_COUNT results" /tmp/elastic.log \
   && echo "  PASS: every task completed" \
   || { echo "  FAIL: not all tasks completed"; fails=$((fails + 1)); }
 shareb=$(grep -E '^share leaf-b ' /tmp/elastic.log | awk '{print $NF}')

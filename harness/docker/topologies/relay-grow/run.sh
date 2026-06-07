@@ -21,7 +21,7 @@ topo_seed_ids "$PROJ" relay leaf-a
 topo_children "$PROJ" relay "$(child leaf-a)"
 
 echo "=== relay-grow: a child added to the relay's file mid-run is absorbed ==="
-topo_drive "$config" relay crunch 400 >/tmp/relay-grow.log 2>&1 &
+topo_drive "$config" relay "$HEAVY_TASK" "$HEAVY_COUNT" >/tmp/relay-grow.log 2>&1 &
 pid=$!
 for _ in $(seq 1 240); do
   grep -qE 'state relay Working' /tmp/relay-grow.log && break
@@ -35,7 +35,7 @@ topo_seed_ids "$PROJ" leaf-b
 topo_children "$PROJ" relay "$(child leaf-a)" "$(child leaf-b)"
 wait "$pid"
 
-grep -q 'ok: 400 results' /tmp/relay-grow.log \
+grep -q "ok: $HEAVY_COUNT results" /tmp/relay-grow.log \
   && echo "  PASS: every task completed" \
   || { echo "  FAIL: not all tasks completed"; fails=$((fails + 1)); }
 grep -qE 'state relay/leaf-b' /tmp/relay-grow.log \

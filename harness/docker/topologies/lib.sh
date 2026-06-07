@@ -15,6 +15,14 @@ SECRETS="$(cd "$TOPO_DIR/../secrets" && pwd)"
 BIN="$ROOT/target/release/rayonet-docker-consumer"
 CACHE_VOLUME=rayonet-topo-cache
 
+# The kill and join scenarios need a run long enough for the event to land
+# mid-run. Locally that is a heavy CPU task (`crunch`) with a high count; CI
+# overrides these with the wall-clock `dawdle` task and a modest count, so the
+# timing holds on a slow shared runner without minutes of compute. Set
+# RAYONET_HEAVY_TASK / RAYONET_HEAVY_COUNT (the CI workflow does) to switch.
+HEAVY_TASK="${RAYONET_HEAVY_TASK:-crunch}"
+HEAVY_COUNT="${RAYONET_HEAVY_COUNT:-400}"
+
 # A child file entry pointing at <name> over the shared key (the bare label keeps
 # the path segment clean: relay/<name>, not relay/rayonet@<name>).
 child() { echo "$1=/secrets/id_ed25519"; }

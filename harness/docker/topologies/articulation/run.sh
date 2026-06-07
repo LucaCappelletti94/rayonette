@@ -22,7 +22,7 @@ topo_children "$PROJ" relayA "$(child shared)" "$(child solo)"
 topo_children "$PROJ" relayB "$(child shared)"
 
 echo "=== articulation: kill relayA (the only path to solo) mid-run ==="
-topo_drive "$config" relayA,relayB crunch 400 >/tmp/articulation-kill.log 2>&1 &
+topo_drive "$config" relayA,relayB "$HEAVY_TASK" "$HEAVY_COUNT" >/tmp/articulation-kill.log 2>&1 &
 pid=$!
 for _ in $(seq 1 160); do
   grep -qE 'state relay[AB] Working' /tmp/articulation-kill.log && break; sleep 0.25
@@ -31,7 +31,7 @@ sleep 0.3
 echo "  killing relayA"
 docker kill "$PROJ-relayA-1" >/dev/null 2>&1
 wait "$pid"
-grep -q 'ok: 400 results' /tmp/articulation-kill.log \
+grep -q "ok: $HEAVY_COUNT results" /tmp/articulation-kill.log \
   && echo "  PASS: every task completed via the surviving compute (relayB)" \
   || { echo "  FAIL: not all tasks completed after the articulation relay died"; fails=$((fails + 1)); }
 grep -qE 'state relayA Lost' /tmp/articulation-kill.log \

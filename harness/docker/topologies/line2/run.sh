@@ -24,7 +24,7 @@ grep -q 'ok: 8 results' /tmp/line2-run.log \
   || { echo "  FAIL: cascade did not complete"; fails=$((fails + 1)); }
 
 echo "=== line2: kill the sole relay (no redundant path) ==="
-topo_drive "$config" relay crunch 400 >/tmp/line2-kill.log 2>&1 &
+topo_drive "$config" relay "$HEAVY_TASK" "$HEAVY_COUNT" >/tmp/line2-kill.log 2>&1 &
 pid=$!
 for _ in $(seq 1 160); do
   grep -qE 'state relay Working' /tmp/line2-kill.log && break; sleep 0.25
@@ -33,7 +33,7 @@ sleep 0.3
 echo "  killing the relay"
 docker kill "$PROJ-relay-1" >/dev/null 2>&1
 wait "$pid"
-if grep -q 'error:' /tmp/line2-kill.log && ! grep -q 'ok: 400 results' /tmp/line2-kill.log; then
+if grep -q 'error:' /tmp/line2-kill.log && ! grep -q "ok: $HEAVY_COUNT results" /tmp/line2-kill.log; then
   echo "  PASS: stranded subtree fails the run legibly"
 else
   echo "  FAIL: expected a clear failure after the relay died"; fails=$((fails + 1))

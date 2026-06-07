@@ -24,7 +24,7 @@ topo_children "$PROJ" gatewayA "$(child shared)"
 topo_children "$PROJ" gatewayB "$(child shared)"
 
 echo "=== capstone: redundant + multi-level + elastic, through a gateway kill ==="
-topo_drive "$config" gatewayA,gatewayB crunch 400 >/tmp/capstone.log 2>&1 &
+topo_drive "$config" gatewayA,gatewayB "$HEAVY_TASK" "$HEAVY_COUNT" >/tmp/capstone.log 2>&1 &
 pid=$!
 # Whichever gateway runs shared first is the primary; the other is the standby.
 primary=""
@@ -54,7 +54,7 @@ echo "  killing primary $primary"
 docker kill "$PROJ-$primary-1" >/dev/null 2>&1
 wait "$pid"
 
-grep -q 'ok: 400 results' /tmp/capstone.log \
+grep -q "ok: $HEAVY_COUNT results" /tmp/capstone.log \
   && echo "  PASS: every task completed once (redundant + elastic, through the kill)" \
   || { echo "  FAIL: not all tasks completed"; fails=$((fails + 1)); }
 grep -qE "state $primary Lost" /tmp/capstone.log \

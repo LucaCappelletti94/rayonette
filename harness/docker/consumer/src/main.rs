@@ -29,6 +29,16 @@ fn crunch(x: u32) -> u32 {
     acc
 }
 
+/// A wall-clock task: it sleeps a fixed span rather than burning CPU, so a run's
+/// duration is predictable regardless of how fast the host is. The kill and join
+/// scenarios use this in CI (with a modest count) so the event reliably lands
+/// mid-run on a slow shared runner, where a CPU-bound `crunch` would either crawl
+/// or, on a fast runner, drain before a joiner could provision.
+fn dawdle(x: u32) -> u32 {
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    x
+}
+
 rayonet::embed_microcrates!();
 
 /// Prints each node-state transition and reduces the stream so the run's
@@ -99,6 +109,13 @@ async fn main() {
     let require_redundancy = std::env::var("RAYONET_REQUIRE_REDUNDANCY").is_ok();
     let result = if task == "crunch" {
         let job = inputs.clone().net_map_with_fleet(crunch, &fleet);
+        if require_redundancy {
+            job.require_redundancy().collect().await
+        } else {
+            job.collect().await
+        }
+    } else if task == "dawdle" {
+        let job = inputs.clone().net_map_with_fleet(dawdle, &fleet);
         if require_redundancy {
             job.require_redundancy().collect().await
         } else {

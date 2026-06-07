@@ -28,6 +28,11 @@ node online mid-run (the fleet grows and absorbs it).
 ./run-all.sh             # warm the cache, then run every topology
 ./diamond/run.sh         # or run one topology
 KEEP=1 ./diamond/run.sh  # keep the containers up afterward (fast re-runs)
+
+# CI runs the kill/join scenarios with the wall-clock `dawdle` task at a modest
+# count, so an event lands mid-run in a couple of seconds on a slow shared runner
+# instead of the heavy CPU-bound `crunch` used locally:
+RAYONET_HEAVY_TASK=dawdle RAYONET_HEAVY_COUNT=300 ./run-all.sh
 ```
 
 ## How it stays fast
