@@ -1,0 +1,31 @@
+# line2: coordinator -> relay -> {leaf-a, leaf-b}. The relay is the sole bridge
+# to its leaves (which are published nowhere), so killing it strands the whole
+# subtree with no alternate path: the run must fail legibly.
+name: rayonet-line2
+
+volumes:
+  rayonet-topo-cache:
+    external: true
+
+networks:
+  inner: {}
+
+x-agent: &agent
+  init: true
+  image: rayonet-harness-base:latest
+  volumes:
+    - ../../secrets:/secrets:ro
+    - rayonet-topo-cache:/home/rayonet/.cache
+
+services:
+  relay:
+    <<: *agent
+    networks: [inner]
+    ports:
+      - "2210:22"
+  leaf-a:
+    <<: *agent
+    networks: [inner]
+  leaf-b:
+    <<: *agent
+    networks: [inner]

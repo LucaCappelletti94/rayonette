@@ -56,16 +56,15 @@ async fn main() {
     if process::is_agent() {
         // Relay-capable agent: with a children file it relays to its own subtree,
         // without one it serves as a leaf. This is what lets the harness build
-        // real relay trees, not just a flat star.
-        rayonet::node::run_node(rayonet::node::NodeConfig {
+        // real relay trees, not just a flat star. agent_main serves, then exits
+        // the process (an agent must not linger on its parent's stdin).
+        rayonet::node::agent_main(rayonet::node::NodeConfig {
             registry: __rayonet_registry(),
             source: __rayonet_source(),
             binary_name: "rayonet-docker-consumer".to_string(),
             toolchain: std::env::var("RAYONET_TOOLCHAIN").unwrap_or_else(|_| "stable".to_string()),
         })
-        .await
-        .expect("agent failed");
-        return;
+        .await;
     }
 
     let config_path = env("RAYONET_SSH_CONFIG");
@@ -95,20 +94,33 @@ async fn main() {
     let fleet = Fleet::observed(launchers, sink.clone());
 
     let inputs: Vec<u32> = (0..count).collect();
-    let out = if task == "crunch" {
-        inputs
-            .clone()
-            .net_map_with_fleet(crunch, &fleet)
-            .collect()
-            .await
+    // Task functions must appear literally in `net_map_with_fleet(<fn>, ...)` so
+    // the build-time extractor registers them, hence the duplicated branches.
+    let require_redundancy = std::env::var("RAYONET_REQUIRE_REDUNDANCY").is_ok();
+    let result = if task == "crunch" {
+        let job = inputs.clone().net_map_with_fleet(crunch, &fleet);
+        if require_redundancy {
+            job.require_redundancy().collect().await
+        } else {
+            job.collect().await
+        }
     } else {
-        inputs
-            .clone()
-            .net_map_with_fleet(double, &fleet)
-            .collect()
-            .await
-    }
-    .expect("net_map failed");
+        let job = inputs.clone().net_map_with_fleet(double, &fleet);
+        if require_redundancy {
+            job.require_redundancy().collect().await
+        } else {
+            job.collect().await
+        }
+    };
+    // A run can fail legibly (every relay lost, or redundancy required but not
+    // met): print the error so the harness can assert on it, rather than panic.
+    let out = match result {
+        Ok(out) => out,
+        Err(error) => {
+            println!("error: {error}");
+            std::process::exit(1);
+        }
+    };
 
     assert_eq!(out.len(), inputs.len());
     assert!(out.iter().all(Result::is_ok), "some task failed: {out:?}");
