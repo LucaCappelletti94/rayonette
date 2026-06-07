@@ -43,3 +43,39 @@ cache key).
 A note on what the per-host completed counts show: the coordinator attributes a
 finished task to the direct agent it scheduled to (the relay), so dedup and
 reroute show in the relays' `share` lines, not the deep leaf paths.
+
+## Real-host run (R7)
+
+The bestiarium runs over real openssh and real cargo provisioning inside docker;
+the same code was also exercised across real, physically separate machines over
+Tailscale ssh, using the `ssh-run` example (`examples/ssh-run`).
+
+Flat, cross-architecture (this Linux box -> a macOS arm64 host as a compute leaf):
+
+```sh
+RAYONET_HOSTS="mac" cargo run -p ssh-run --release
+# mac: Compute (MacOs, 18 cores, 24576 MB RAM, 1 GPUs)
+# mac: Probing -> Syncing -> Building -> Ready -> Working -> Done
+# results: [Ok(0), Ok(2), ...]  8/8 tasks succeeded
+```
+
+A real multi-level relay tree (coordinator -> macOS gateway -> Linux leaf), each
+hop reaching the next with its own credentials (decentralized discovery): set the
+gateway's children file on the gateway itself, then drive through it.
+
+```sh
+ssh mac 'mkdir -p ~/.config/rayonet && printf "pippo\n" > ~/.config/rayonet/children'
+RAYONET_HOSTS="mac" cargo run -p ssh-run --release
+ssh mac 'rm -f ~/.config/rayonet/children'   # always remove it afterward
+# mac: Compute (MacOs, ...) -> Probing -> Ready -> Working          (the gateway)
+#   pippo: Compute (Linux, 64 cores, ...) -> Probing -> Syncing -> Building -> Ready
+#   pippo: Working ... Done                                          (the leaf the gateway built)
+# 8/8 tasks succeeded
+```
+
+The gateway here is relay-only by construction (a relay forwards work, it never
+runs tasks). Redundant reroute and mid-run elastic membership are proven over
+real openssh by the `diamond`, `elastic`, `relay-grow`, and `capstone` docker
+scenarios above; the same children-file edit shown here, applied mid-run, is what
+a real gateway re-reads to absorb a node. Always delete a real children file when
+done, or later agent runs on that host will try to relay.
