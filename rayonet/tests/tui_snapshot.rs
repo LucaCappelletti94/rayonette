@@ -14,11 +14,12 @@ use std::path::PathBuf;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::Terminal;
-use rayonet::observability::{RecordedEvent, RunState};
+use rayonet::observability::RecordedEvent;
+use rayonet::tui::App;
 
 /// A fixed frame size, so the rendered text is stable across machines.
-const WIDTH: u16 = 64;
-const HEIGHT: u16 = 8;
+const WIDTH: u16 = 120;
+const HEIGHT: u16 = 40;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -40,11 +41,11 @@ fn rows(buffer: &Buffer) -> Vec<String> {
         .collect()
 }
 
-/// Render the TUI for `state` to text (one line per row).
-fn render(state: &RunState) -> String {
+/// Render the TUI for `app` to text (one line per row).
+fn render(app: &App) -> String {
     let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
     terminal
-        .draw(|frame| rayonet::tui::draw(frame, state))
+        .draw(|frame| rayonet::tui::draw(frame, app))
         .unwrap();
     rows(terminal.backend().buffer()).join("\n")
 }
@@ -64,12 +65,13 @@ fn tui_matches_the_capstone_golden() {
     let mut snapshot = String::new();
     for pct in [25_usize, 50, 75, 100] {
         let count = (events.len() * pct / 100).max(1);
-        let mut state = RunState::default();
+        let mut app = App::new();
         for record in &events[..count] {
-            state.apply(&record.event);
+            app.apply(&record.event);
+            app.elapsed = std::time::Duration::from_millis(record.elapsed_ms);
         }
         writeln!(snapshot, "=== after {pct}% of the run ===").unwrap();
-        snapshot.push_str(&render(&state));
+        snapshot.push_str(&render(&app));
         snapshot.push_str("\n\n");
     }
 

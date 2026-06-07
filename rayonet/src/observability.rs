@@ -312,6 +312,30 @@ impl RunState {
         by_id
     }
 
+    /// The state to display for `path`, accounting for a dead ancestor.
+    ///
+    /// A node reached only through a relay that went [`NodeState::Lost`] is
+    /// stranded: its own last-reported state is stale (no further event can reach
+    /// it through the dead relay), so it is shown `Lost`. A node whose ancestors
+    /// are all alive keeps its own reported state, which is how a reroute stays
+    /// visible: the surviving path's copy of the node still completes. An unknown
+    /// path takes the first-sighting default of [`NodeState::Working`].
+    #[must_use]
+    pub fn effective_state(&self, path: &str) -> NodeState {
+        let own = self
+            .nodes
+            .get(path)
+            .map_or(NodeState::Working, |view| view.state);
+        let mut ancestor = parent_of(path);
+        while let Some(id) = ancestor {
+            if self.nodes.get(id).map(|view| view.state) == Some(NodeState::Lost) {
+                return NodeState::Lost;
+            }
+            ancestor = parent_of(id);
+        }
+        own
+    }
+
     /// The view for `host`, created (defaulting to [`NodeState::Working`]) on
     /// first sighting if a task event arrives before any node-state event.
     fn node(&mut self, host: &str) -> &mut NodeView {
@@ -423,6 +447,28 @@ mod tests {
         assert_eq!(state.children_of("a"), vec!["a/b", "a/c"]);
         assert_eq!(state.children_of("a/b"), vec!["a/b/d"]);
         assert!(state.children_of("e").is_empty());
+    }
+
+    #[test]
+    fn effective_state_strands_a_child_of_a_lost_relay() {
+        let mut state = RunState::default();
+        // gatewayA dies; gatewayB survives. Both front the same shared leaf, so
+        // the work reroutes to gatewayB and completes there.
+        state.apply(&Event::node("gatewayA", NodeState::Lost));
+        state.apply(&Event::node("gatewayA/shared", NodeState::Working));
+        state.apply(&Event::node("gatewayB", NodeState::Done));
+        state.apply(&Event::node("gatewayB/shared", NodeState::Done));
+
+        // A child reached only through a Lost relay is stranded: shown Lost, even
+        // though no event ever updated its own (now stale Working) state.
+        assert_eq!(state.effective_state("gatewayA/shared"), NodeState::Lost);
+        // A child whose ancestors are all alive keeps its own reported state, so
+        // the reroute is visible as gatewayB/shared completing.
+        assert_eq!(state.effective_state("gatewayB/shared"), NodeState::Done);
+        // A node reports its own state when it has no ancestor at all.
+        assert_eq!(state.effective_state("gatewayA"), NodeState::Lost);
+        // An unknown path falls back to Working, matching first-sighting defaults.
+        assert_eq!(state.effective_state("nope"), NodeState::Working);
     }
 
     #[test]

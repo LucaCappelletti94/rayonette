@@ -23,7 +23,8 @@ use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::Terminal;
-use rayonet::observability::{RecordedEvent, RunState};
+use rayonet::observability::RecordedEvent;
+use rayonet::tui::App;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -82,7 +83,7 @@ fn replay(terminal: &mut Term, path: &str, speed: f64, follow: bool) -> io::Resu
         }
     };
 
-    let mut state = RunState::default();
+    let mut app = App::new();
     let start = Instant::now();
     let mut line = String::new();
     loop {
@@ -109,8 +110,9 @@ fn replay(terminal: &mut Term, path: &str, speed: f64, follow: bool) -> io::Resu
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
-        state.apply(&record.event);
-        terminal.draw(|frame| rayonet::tui::draw(frame, &state))?;
+        app.apply(&record.event);
+        app.elapsed = start.elapsed();
+        terminal.draw(|frame| rayonet::tui::draw(frame, &app))?;
         if quit_requested()? {
             return Ok(());
         }
