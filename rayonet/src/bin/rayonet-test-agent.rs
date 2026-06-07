@@ -3,7 +3,7 @@
 //! (Test scaffolding; Phase 7 will feature-gate or relocate it.)
 
 use rayonet::agent::{handler, Registry};
-use rayonet::node::{run_node, NodeConfig};
+use rayonet::node::{agent_main, NodeConfig};
 use rayonet::process;
 
 #[tokio::main]
@@ -31,8 +31,7 @@ async fn main() {
         binary_name: "rayonet-test-agent".to_string(),
         toolchain: "stable".to_string(),
     };
-    if let Err(e) = run_node(config).await {
-        eprintln!("rayonet-test-agent: node error: {e}");
-        std::process::exit(1);
-    }
+    // Serve, then exit the process (an agent must not linger on its parent's
+    // stdin; see rayonet::node::agent_main).
+    agent_main(config).await;
 }

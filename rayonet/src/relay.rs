@@ -530,6 +530,47 @@ mod tests {
         }
     }
 
+    /// A child that is itself a relay (over its own leaves) whose parent-facing
+    /// reads are severed after `cut_after` bytes, modelling an interior relay
+    /// that is killed mid-run (line3: coordinator -> relay1 -> relay2 -> leaf,
+    /// kill relay2). The parent of the severed relay is itself a relay.
+    struct FaultyRelayChild {
+        leaves: Vec<(String, Registry)>,
+        cut_after: usize,
+    }
+
+    impl Launch for FaultyRelayChild {
+        type Stream = FaultInjector<DuplexStream>;
+        type Guard = JoinHandle<std::io::Result<()>>;
+        type Session = ();
+
+        fn label(&self) -> String {
+            "sub-relay".to_string()
+        }
+
+        async fn connect(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        async fn activate(
+            &self,
+            _session: (),
+            _events: &dyn EventSink,
+        ) -> std::io::Result<(Connection<FaultInjector<DuplexStream>>, Self::Guard)> {
+            let (client_raw, server_raw) = duplex(4096);
+            let client =
+                Connection::new(FaultInjector::cut_reads_after(client_raw, self.cut_after));
+            let leaves: Vec<LocalAgent> = self
+                .leaves
+                .iter()
+                .map(|(label, registry)| LocalAgent::new(label, registry.clone()))
+                .collect();
+            let task =
+                tokio::spawn(async move { relay(Connection::new(server_raw), leaves).await });
+            Ok((client, task))
+        }
+    }
+
     /// A misbehaving child that readies twice, to exercise the relay's
     /// protocol-violation guard.
     struct DoubleReadyChild;
@@ -865,6 +906,30 @@ mod tests {
         assert_eq!(out, (0..30u32).map(Ok).collect::<Vec<_>>());
         let _ = primary.await; // The primary errors once its coordinator read is cut.
         let _ = standby.await;
+    }
+
+    #[tokio::test]
+    async fn an_interior_relay_killed_mid_run_tears_down_its_whole_chain() {
+        // The line3 shape: coordinator -> relay1 -> relay2 -> leaf, then relay2
+        // (an interior relay, whose parent is itself a relay) is severed mid-run.
+        // relay1 must notice its only child is gone and tear down so the top
+        // coordinator sees the subtree lost and the run errors, rather than the
+        // chain hanging forever. tokio::time::timeout fails the test on a hang.
+        let children = vec![FaultyRelayChild {
+            leaves: vec![(
+                "leaf".to_string(),
+                Registry::new().with("id", handler(slow_id)),
+            )],
+            cut_after: 120,
+        }];
+        let run = through_relay(children, "id", (0..30u32).collect());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("the chain hung instead of tearing down after the interior relay died");
+        assert!(
+            result.is_err(),
+            "stranding the leaf behind a dead interior relay must fail the run"
+        );
     }
 
     #[tokio::test]

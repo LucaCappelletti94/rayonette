@@ -90,13 +90,48 @@ where
 /// Run this node in agent mode over its stdio.
 ///
 /// A leaf if it has no children file, else a relay over the children it names
-/// (which reports its subtree's state up to its parent). Call from the
-/// consumer's `main` when [`crate::process::is_agent`] is true.
+/// (which reports its subtree's state up to its parent). Most agent binaries
+/// should call [`agent_main`] instead, which runs this and then exits the
+/// process. This lower-level form returns its result and is what the node and
+/// relay tests drive directly.
 ///
 /// # Errors
 /// Returns an error on a protocol violation or a transport failure.
 pub async fn run_node(config: NodeConfig) -> io::Result<()> {
     dispatch(agent_connection(), load_children(), config).await
+}
+
+/// The process exit code for an agent run: 0 on success, 1 on error (logged to
+/// stderr, which the parent captures verbatim).
+fn agent_exit_code(result: io::Result<()>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("rayonet agent: {error}");
+            1
+        }
+    }
+}
+
+/// Run this node as an agent over its stdio, then terminate the process.
+///
+/// This is the entry point an agent binary's `main` should call once
+/// [`crate::process::is_agent`] is true. It runs the node ([`run_node`]) and,
+/// when serving ends, exits the process rather than returning.
+///
+/// Exiting directly is deliberate, not a shortcut. An agent reads its parent
+/// over `tokio::io::stdin`, which tokio drives from a blocking thread that
+/// cannot be cancelled while a read is outstanding. A live parent holds the
+/// agent's stdin open, so once the agent has nothing left to do (most
+/// importantly a relay that has lost its whole subtree and is tearing down) a
+/// graceful runtime shutdown would block forever on that thread and the process
+/// would never close its stdout. The parent, waiting on that stdout for
+/// end-of-stream, would then hang too. Exiting closes stdout at once, which is
+/// exactly what lets the parent observe the agent's departure and reroute.
+/// Returning from `run_node` first guarantees the agent's final frames were
+/// flushed to the parent, so nothing is truncated.
+pub async fn agent_main(config: NodeConfig) -> ! {
+    std::process::exit(agent_exit_code(run_node(config).await));
 }
 
 #[cfg(test)]
@@ -137,6 +172,16 @@ mod tests {
         );
 
         std::fs::remove_file(&file).ok();
+    }
+
+    #[test]
+    fn agent_exit_code_maps_success_and_failure() {
+        // agent_main exits with this code: 0 for a clean serve, 1 for an error.
+        assert_eq!(super::agent_exit_code(Ok(())), 0);
+        assert_eq!(
+            super::agent_exit_code(Err(std::io::Error::other("boom"))),
+            1
+        );
     }
 
     #[test]
