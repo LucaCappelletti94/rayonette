@@ -90,7 +90,7 @@ This file records the architecture decisions made for rayonet during design disc
 
 ## Relay tree (v2)
 
-These supersede the flat-star topology of v1 (Phases 0-7), which remains the degenerate depth-1 case. Built in PLAN.md phases R1-R7.
+These supersede the flat-star topology of v1 (Phases 0-7), which remains the degenerate depth-1 case. Built in PLAN.md phases R1-R7, now all delivered. R7 closed the epic with a capstone that is segmented, multi-level, redundant, and elastic in one run (a node joins a standby gateway mid-run, then the primary gateway is killed and reroutes, all deduped), validated in the docker bestiarium and over real Tailscale ssh between different-architecture machines (a macOS gateway building and driving a Linux leaf). RelayOnly is realized structurally (a relay never computes); filter-driven RelayOnly for a compute-capable node, deduping a late joiner against the running set by id, a bandwidth probe with a per-run metric selector, and redundancy deeper than depth two are the carried-forward refinements.
 
 32. **rayonet v2 is a relay tree (revises decisions 5, 24, 25).** The coordinator connects to a first tier of nodes, and each node may itself relay to children it reaches, so a deployment is a tree (a DAG once redundancy is allowed). Each node is *an agent that is also a coordinator*: whole-crate-compile already ships the coordinator code to every host, so a relay is activation, not new transport. The v1 flat star is exactly the depth-1 tree.
 
