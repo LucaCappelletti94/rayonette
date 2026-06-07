@@ -41,11 +41,13 @@ fn rows(buffer: &Buffer) -> Vec<String> {
         .collect()
 }
 
-/// Render the TUI for `app` to text (one line per row).
+/// Render the TUI for `app` to text (one line per row). Drawing records a hit map
+/// into the app, so it renders into a clone.
 fn render(app: &App) -> String {
+    let mut app = app.clone();
     let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
     terminal
-        .draw(|frame| rayonet::tui::draw(frame, app))
+        .draw(|frame| rayonet::tui::draw(frame, &mut app))
         .unwrap();
     rows(terminal.backend().buffer()).join("\n")
 }

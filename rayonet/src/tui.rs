@@ -9,7 +9,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
-use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
@@ -18,16 +17,67 @@ use ratatui::Frame;
 
 use crate::graph::{Metric, Topology};
 use crate::layout::positions;
-use crate::observability::{leaf_of, Event, NodeState, RunState};
+use crate::observability::{leaf_of, parent_of, Event, NodeState, RunState};
 
 /// The most recent event-log lines [`App`] keeps for the log panel.
 const LOG_CAPACITY: usize = 256;
+
+/// Where on the graph a screen cell falls, used to resolve mouse events to the
+/// vertex or edge under the pointer.
+#[derive(Debug, Clone, Default)]
+struct HitMap {
+    /// Cells of a vertex label, mapped to its physical node id.
+    nodes: BTreeMap<(u16, u16), String>,
+    /// Cells of a drawn link, mapped to its `(parent id, child id)`.
+    edges: BTreeMap<(u16, u16), (String, String)>,
+}
+
+/// A semantic input the dashboard understands, decoupled from the terminal's raw
+/// key and mouse events so the driver translates and the state stays testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Input {
+    /// Select the next vertex (Tab / Down).
+    SelectNext,
+    /// Select the previous vertex (Shift-Tab / Up).
+    SelectPrev,
+    /// Clear the current selection and hover (Esc).
+    Clear,
+    /// Toggle the paused flag (the driver decides what pausing means).
+    TogglePause,
+    /// Ask to quit (q).
+    Quit,
+    /// The pointer moved to an absolute terminal cell.
+    PointerMoved {
+        /// Column of the cell.
+        col: u16,
+        /// Row of the cell.
+        row: u16,
+    },
+    /// The primary button was pressed at an absolute terminal cell.
+    Click {
+        /// Column of the cell.
+        col: u16,
+        /// Row of the cell.
+        row: u16,
+    },
+}
+
+/// What the driver should do after handling an [`Input`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    /// Keep running.
+    Continue,
+    /// Tear down and exit.
+    Quit,
+}
 
 /// The live dashboard state a renderer draws.
 ///
 /// Folds the event stream into a [`RunState`] and a rolling human-readable log.
 /// `elapsed` is supplied by the driver (wall clock for a live run, the recorded
-/// timestamp for a replay) so rendering stays a pure function of this state.
+/// timestamp for a replay) so rendering stays a pure function of this state. The
+/// selection and hover are driven by [`on_input`](App::on_input); the graph draw
+/// records a hit map so a pointer event resolves to the vertex or edge under it.
 #[derive(Debug, Clone, Default)]
 pub struct App {
     /// The reduced per-node and per-task picture.
@@ -36,6 +86,14 @@ pub struct App {
     pub log: VecDeque<String>,
     /// Time since the run started, set by the driver.
     pub elapsed: Duration,
+    /// The physical id of the currently selected vertex, if any.
+    pub selected: Option<String>,
+    /// The `(parent id, child id)` of the currently hovered link, if any.
+    pub hovered: Option<(String, String)>,
+    /// Whether the driver has been asked to pause.
+    pub paused: bool,
+    /// The last graph draw's cell-to-vertex and cell-to-edge map.
+    hit: HitMap,
 }
 
 impl App {
@@ -55,6 +113,59 @@ impl App {
             }
             self.log.push_back(line);
         }
+    }
+
+    /// The physical node ids that can be selected, in stable id order.
+    fn selectable(&self) -> Vec<String> {
+        self.state.paths_by_id().into_keys().collect()
+    }
+
+    /// Move the selection one step `forward` (or backward) through the selectable
+    /// vertices, wrapping, and starting from the ends when nothing is selected.
+    fn step_selection(&mut self, forward: bool) {
+        let ids = self.selectable();
+        let Some(last) = ids.len().checked_sub(1) else {
+            return;
+        };
+        let current = self
+            .selected
+            .as_ref()
+            .and_then(|id| ids.iter().position(|candidate| candidate == id));
+        let next = match current {
+            Some(index) if forward => (index + 1) % ids.len(),
+            Some(0) => last,
+            Some(index) => index - 1,
+            // No selection yet: forward lands on the first, backward on the last.
+            None if forward => 0,
+            None => last,
+        };
+        self.selected = Some(ids[next].clone());
+        self.hovered = None;
+    }
+
+    /// Apply one semantic input, updating selection, hover, or pause, and report
+    /// whether the driver should keep running.
+    pub fn on_input(&mut self, input: Input) -> Action {
+        match input {
+            Input::SelectNext => self.step_selection(true),
+            Input::SelectPrev => self.step_selection(false),
+            Input::Clear => {
+                self.selected = None;
+                self.hovered = None;
+            }
+            Input::TogglePause => self.paused = !self.paused,
+            Input::Quit => return Action::Quit,
+            Input::PointerMoved { col, row } => {
+                self.hovered = self.hit.edges.get(&(col, row)).cloned();
+            }
+            Input::Click { col, row } => {
+                if let Some(id) = self.hit.nodes.get(&(col, row)) {
+                    self.selected = Some(id.clone());
+                    self.hovered = None;
+                }
+            }
+        }
+        Action::Continue
     }
 }
 
@@ -82,9 +193,11 @@ fn log_line(event: &Event, state: &RunState) -> Option<String> {
 
 /// Draw the dashboard for `app` into `frame`.
 ///
-/// A vertical stack: a header with the progress gauge, the topology panel, the
-/// per-node table, and the event log.
-pub fn draw(frame: &mut Frame<'_>, app: &App) {
+/// A vertical stack: a header with the progress gauge, a middle row split into the
+/// topology graph and an info panel (the selected node's detail, the hovered
+/// link's info, or a legend), the per-node table, and the event log. The graph
+/// draw records a hit map into `app`, hence the mutable borrow.
+pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -95,8 +208,14 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
         ])
         .split(frame.area());
 
+    let middle = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(34)])
+        .split(rows[1]);
+
     render_header(frame, rows[0], app);
-    render_topology(frame, rows[1], app);
+    render_graph(frame, middle[0], app);
+    render_info(frame, middle[1], app);
     render_table(frame, rows[2], app);
     render_log(frame, rows[3], app);
 }
@@ -144,31 +263,38 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// Vertices are physical nodes (a machine reached through two relays is one
 /// vertex), positioned by the deterministic [`positions`] layout and coloured by
 /// state. Parent links are drawn as lines, the active (primary) path bright and a
-/// deduped standby path dim. A relay that is a single point of failure is marked.
-fn render_topology(frame: &mut Frame<'_>, area: Rect, app: &App) {
+/// deduped standby path dim. A relay that is a single point of failure is marked,
+/// the selected vertex is reversed, and the hovered link is brightened. The cells
+/// each vertex and link occupy are recorded in `app`'s hit map for pointer input.
+fn render_graph(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let block = Block::default().borders(Borders::ALL).title(" topology ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 2 || inner.height < 2 {
+        app.hit = HitMap::default();
         return;
     }
 
     let geometry = graph_geometry(inner, app);
+    let selected = app.selected.clone();
+    let hovered = app.hovered.clone();
     let occupied: BTreeSet<(u16, u16)> = geometry.nodes.iter().map(|node| node.cell).collect();
+    let mut hit = HitMap::default();
     let buffer = frame.buffer_mut();
 
     // Edges first, so the node labels drawn next sit on top of them.
     for edge in &geometry.edges {
-        let style = if edge.active {
-            Style::default().fg(Color::Green)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
+        let is_hovered = hovered
+            .as_ref()
+            .is_some_and(|(parent, child)| *parent == edge.parent && *child == edge.child);
+        let style = edge_style(edge.active, is_hovered);
         let glyph = edge_char(edge.from, edge.to);
         for cell in line_cells(edge.from, edge.to) {
             if occupied.contains(&cell) {
                 continue;
             }
+            hit.edges
+                .insert(cell, (edge.parent.clone(), edge.child.clone()));
             if let Some(slot) = buffer.cell_mut(cell) {
                 slot.set_char(glyph).set_style(style);
             }
@@ -176,7 +302,6 @@ fn render_topology(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     for node in &geometry.nodes {
-        let style = node_style(node.state).add_modifier(Modifier::BOLD);
         // A single point of failure is flagged with a leading marker so the graph
         // shows it even without colour.
         let label = if node.spof {
@@ -184,12 +309,202 @@ fn render_topology(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             node.label.clone()
         };
-        draw_label(buffer, inner, node.cell, &label, style);
+        let mut style = node_style(node.state).add_modifier(Modifier::BOLD);
+        if selected.as_deref() == Some(node.id.as_str()) {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        let (start, count) = label_bounds(inner, node.cell, &label);
+        // The coordinator root (no state) carries no detail, so it is drawn but
+        // not made selectable.
+        if node.state.is_some() {
+            for offset in 0..count {
+                hit.nodes
+                    .insert((start + offset, node.cell.1), node.id.clone());
+            }
+        }
+        buffer.set_stringn(start, node.cell.1, &label, count as usize, style);
+    }
+
+    app.hit = hit;
+}
+
+/// The style a link is drawn in: brightened white when hovered, otherwise green
+/// for the active primary path and dim grey for a deduped standby.
+fn edge_style(active: bool, hovered: bool) -> Style {
+    if hovered {
+        return Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD);
+    }
+    if active {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+/// The info panel beside the graph: the hovered link's detail, else the selected
+/// vertex's detail, else a legend of keys and colours.
+fn render_info(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let (title, lines) = if let Some((parent, child)) = &app.hovered {
+        (" link ", edge_info_lines(&app.state, parent, child))
+    } else if let Some(id) = &app.selected {
+        (" details ", node_detail_lines(&app.state, id))
+    } else {
+        (" keys ", legend_lines())
+    };
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
+        area,
+    );
+}
+
+/// The detail lines for the selected vertex: its identity, role, state, redundancy
+/// standing, progress, and machine capabilities. The vertex is always a profiled
+/// node (the coordinator root is not selectable), so its view and profile are
+/// present.
+fn node_detail_lines(state: &RunState, id: &str) -> Vec<Line<'static>> {
+    let topology = Topology::from_run_state(state);
+    let label = vertex_labels(state)
+        .get(id)
+        .cloned()
+        .expect("a selected vertex is a labelled node");
+    let paths = state.paths_by_id();
+    let mine = paths
+        .get(id)
+        .expect("a selected vertex has at least one path");
+    let view = state
+        .nodes
+        .get(*mine.first().expect("the path list is non-empty"))
+        .expect("a discovered path has a view");
+    let profile = view
+        .profile
+        .as_ref()
+        .expect("a profiled node has a profile");
+    let completed: usize = mine
+        .iter()
+        .filter_map(|path| state.nodes.get(*path))
+        .map(|view| view.completed)
+        .sum();
+
+    vec![
+        Line::from(format!("node  {label}")),
+        Line::from(format!("id    {id:.8}")),
+        Line::from(format!(
+            "role  {:?}",
+            view.role.expect("a profiled node has a role")
+        )),
+        Line::from(format!(
+            "state {:?}",
+            vertex_state(state, id).expect("a selected vertex has a state")
+        )),
+        Line::from(format!(
+            "spof  {}",
+            yes_no(topology.single_points_of_failure().contains(id))
+        )),
+        Line::from(format!("redund {}", yes_no(topology.is_redundant(id)))),
+        Line::from(format!("done  {completed}")),
+        Line::from(format!(
+            "lat   {:.1} ms",
+            microseconds_to_millis(view.latency_us.expect("a profiled node has a latency"))
+        )),
+        Line::from(format!("os    {:?}", profile.os)),
+        Line::from(format!("arch  {}", profile.arch.isa)),
+        Line::from(format!("cores {}", profile.cores)),
+        Line::from(format!("ram   {} MB", profile.ram_mb)),
+        Line::from(format!("gpus  {}", profile.gpus.len())),
+    ]
+}
+
+/// The detail lines for the hovered link: its endpoints, measured latency, and
+/// whether it is the active primary path or a deduped standby.
+fn edge_info_lines(state: &RunState, parent_id: &str, child_id: &str) -> Vec<Line<'static>> {
+    let labels = vertex_labels(state);
+    let from = labels
+        .get(parent_id)
+        .cloned()
+        .unwrap_or_else(|| "coordinator".to_string());
+    let to = labels
+        .get(child_id)
+        .cloned()
+        .expect("a link's child is a labelled node");
+    let latency = edge_latency(state, parent_id, child_id).map_or_else(
+        || "n/a".to_string(),
+        |us| format!("{:.1} ms", microseconds_to_millis(us)),
+    );
+    let kind = if edge_is_active(state, parent_id, child_id) {
+        "active (primary)"
+    } else {
+        "standby"
+    };
+    vec![
+        Line::from("link"),
+        Line::from(format!("{from} -> {to}")),
+        Line::from(format!("lat   {latency}")),
+        Line::from(format!("path  {kind}")),
+    ]
+}
+
+/// The legend shown when nothing is selected or hovered.
+fn legend_lines() -> Vec<Line<'static>> {
+    [
+        "keys",
+        "Tab / S-Tab  select",
+        "click        select",
+        "hover edge   link info",
+        "p pause   q quit",
+        "",
+        "green working  blue done",
+        "red lost   cyan ready",
+        "yellow building",
+    ]
+    .into_iter()
+    .map(Line::from)
+    .collect()
+}
+
+/// Whether the link from `parent_id` to `child_id` is the active primary path. A
+/// uniquely reached child is always active; a multiply-reachable one is active
+/// only through the parent its metric ranks first.
+fn edge_is_active(state: &RunState, parent_id: &str, child_id: &str) -> bool {
+    Topology::from_run_state(state)
+        .select_primaries(Metric::ShortestLatency)
+        .get(child_id)
+        .is_none_or(|ranked| ranked.first().map(String::as_str) == Some(parent_id))
+}
+
+/// The measured latency of the specific path from `parent_id` to `child_id`, by
+/// finding the discovered path whose last hop matches that parent and child.
+fn edge_latency(state: &RunState, parent_id: &str, child_id: &str) -> Option<u64> {
+    let topology = Topology::from_run_state(state);
+    let root = topology.vertices().first()?;
+    for (path, view) in &state.nodes {
+        if view.id.as_deref() != Some(child_id) {
+            continue;
+        }
+        let resolved_parent = parent_of(path).map_or(Some(root.as_str()), |parent_path| {
+            state.nodes.get(parent_path).and_then(|v| v.id.as_deref())
+        });
+        if resolved_parent == Some(parent_id) {
+            return view.latency_us;
+        }
+    }
+    None
+}
+
+/// `yes` or `no`, for a boolean detail field.
+const fn yes_no(flag: bool) -> &'static str {
+    if flag {
+        "yes"
+    } else {
+        "no"
     }
 }
 
 /// One positioned vertex of the topology graph.
 struct GraphNode {
+    /// The vertex's physical node id (`ROOT` for the coordinator).
+    id: String,
     /// The vertex's display label (its node's local name, or `coordinator`).
     label: String,
     /// The screen cell the vertex is centred on.
@@ -202,6 +517,10 @@ struct GraphNode {
 
 /// One drawn parent -> child link of the topology graph.
 struct GraphEdge {
+    /// The parent vertex's physical id.
+    parent: String,
+    /// The child vertex's physical id.
+    child: String,
     /// The parent vertex's cell.
     from: (u16, u16),
     /// The child vertex's cell.
@@ -235,6 +554,7 @@ fn graph_geometry(inner: Rect, app: &App) -> GraphGeometry {
     let nodes = vertices
         .iter()
         .map(|id| GraphNode {
+            id: id.clone(),
             label: labels
                 .get(id)
                 .cloned()
@@ -257,6 +577,8 @@ fn graph_geometry(inner: Rect, app: &App) -> GraphGeometry {
                 .get(child_id)
                 .is_none_or(|ranked| ranked.first().map(String::as_str) == Some(parent_id));
             Some(GraphEdge {
+                parent: parent_id.clone(),
+                child: child_id.clone(),
                 from: cell_of(parent_id),
                 to: cell_of(child_id),
                 active,
@@ -364,16 +686,17 @@ fn line_cells(from: (u16, u16), to: (u16, u16)) -> Vec<(u16, u16)> {
     cells
 }
 
-/// Draw `label` centred on `cell`, clamped within `inner`.
-fn draw_label(buffer: &mut Buffer, inner: Rect, cell: (u16, u16), label: &str, style: Style) {
+/// Where a `label` centred on `cell` is drawn within `inner`: its start column and
+/// the number of cells it spans, clamped to the panel so it neither underflows the
+/// left border nor overruns the right.
+fn label_bounds(inner: Rect, cell: (u16, u16), label: &str) -> (u16, u16) {
     let len = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
-    let half = len / 2;
     let start = cell
         .0
-        .saturating_sub(half)
+        .saturating_sub(len / 2)
         .clamp(inner.x, inner.right().saturating_sub(len).max(inner.x));
-    let room = inner.right().saturating_sub(start) as usize;
-    buffer.set_stringn(start, cell.1, label, room, style);
+    let count = len.min(inner.right().saturating_sub(start));
+    (start, count)
 }
 
 /// The per-node table: full path (so two paths to one node stay distinct), role,
@@ -462,14 +785,27 @@ fn state_style(state: NodeState) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{draw, App};
+    use super::{draw, Action, App, Input};
     use crate::capability::{CpuArch, NodeProfile, Os, Role};
+    use crate::graph::Topology;
     use crate::observability::{Event, NodeState};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::style::Color;
     use ratatui::Terminal;
+
+    /// The synthetic coordinator id for `app`'s current topology.
+    fn root_id(app: &App) -> String {
+        Topology::from_run_state(&app.state).vertices()[0].clone()
+    }
+
+    /// Draw `app` on a fixed backend, mutating it so its hit map is populated for
+    /// pointer-input tests.
+    fn draw_into(app: &mut App) {
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+    }
 
     /// A simple Linux profile with the given instruction set, for table tests.
     fn profile(isa: &str) -> NodeProfile {
@@ -505,10 +841,11 @@ mod tests {
     }
 
     /// Render `app` to a buffer on a fixed backend, keeping cell styles for tests
-    /// that inspect colour.
+    /// that inspect colour. Drawing records a hit map, so it draws into a clone.
     fn render_buffer(app: &App) -> Buffer {
+        let mut app = app.clone();
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         terminal.backend().buffer().clone()
     }
 
@@ -813,10 +1150,10 @@ mod tests {
     fn draw_survives_a_terminal_too_small_for_the_graph() {
         // The topology panel shrinks below a drawable size on a tiny terminal; it
         // must skip the graph rather than panic.
-        let app = diamond();
+        let mut app = diamond();
         // Three columns leave the topology panel only one cell inside its border.
         let mut terminal = Terminal::new(TestBackend::new(3, 40)).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     }
 
     #[test]
@@ -833,5 +1170,166 @@ mod tests {
         assert_eq!(cells.last(), Some(&(5, 4)));
         // A single-cell line is just that cell.
         assert_eq!(line_cells((3, 3), (3, 3)), vec![(3, 3)]);
+    }
+
+    #[test]
+    fn keyboard_cycles_the_selection() {
+        // Selectable ids in order: idA, idB, idS.
+        let mut app = diamond();
+        assert_eq!(app.on_input(Input::SelectNext), Action::Continue);
+        assert_eq!(app.selected.as_deref(), Some("idA"));
+        app.on_input(Input::SelectNext);
+        assert_eq!(app.selected.as_deref(), Some("idB"));
+        app.on_input(Input::SelectPrev);
+        assert_eq!(app.selected.as_deref(), Some("idA"));
+        // Stepping back past the first wraps to the last.
+        app.on_input(Input::SelectPrev);
+        assert_eq!(app.selected.as_deref(), Some("idS"));
+        app.on_input(Input::Clear);
+        assert_eq!(app.selected, None);
+        // With nothing selected, a backward step lands on the last.
+        app.on_input(Input::SelectPrev);
+        assert_eq!(app.selected.as_deref(), Some("idS"));
+    }
+
+    #[test]
+    fn selection_on_an_empty_run_is_a_no_op() {
+        let mut app = App::new();
+        app.on_input(Input::SelectNext);
+        assert_eq!(app.selected, None);
+    }
+
+    #[test]
+    fn pause_toggles_and_quit_signals() {
+        let mut app = App::new();
+        assert!(!app.paused);
+        assert_eq!(app.on_input(Input::TogglePause), Action::Continue);
+        assert!(app.paused);
+        app.on_input(Input::TogglePause);
+        assert!(!app.paused);
+        assert_eq!(app.on_input(Input::Quit), Action::Quit);
+    }
+
+    #[test]
+    fn a_click_selects_the_node_under_the_pointer() {
+        let mut app = diamond();
+        draw_into(&mut app);
+        let (&(col, row), _) = app
+            .hit
+            .nodes
+            .iter()
+            .find(|(_, id)| id.as_str() == "idA")
+            .expect("gatewayA is hittable after a draw");
+        assert_eq!(app.on_input(Input::Click { col, row }), Action::Continue);
+        assert_eq!(app.selected.as_deref(), Some("idA"));
+    }
+
+    #[test]
+    fn a_click_and_the_equivalent_key_reach_the_same_state() {
+        let mut by_key = diamond();
+        by_key.on_input(Input::SelectNext); // lands on idA, the first id
+
+        let mut by_click = diamond();
+        draw_into(&mut by_click);
+        let (&(col, row), _) = by_click
+            .hit
+            .nodes
+            .iter()
+            .find(|(_, id)| id.as_str() == "idA")
+            .expect("gatewayA is hittable");
+        by_click.on_input(Input::Click { col, row });
+
+        assert_eq!(by_key.selected, by_click.selected);
+    }
+
+    #[test]
+    fn hovering_a_link_records_it() {
+        let mut app = diamond();
+        draw_into(&mut app);
+        let (&(col, row), edge) = app
+            .hit
+            .edges
+            .iter()
+            .next()
+            .expect("a link is hittable after a draw");
+        let expected = edge.clone();
+        app.on_input(Input::PointerMoved { col, row });
+        assert_eq!(app.hovered, Some(expected));
+    }
+
+    #[test]
+    fn the_coordinator_is_not_selectable() {
+        let mut app = diamond();
+        draw_into(&mut app);
+        let root = root_id(&app);
+        assert!(
+            app.hit.nodes.values().all(|id| *id != root),
+            "the coordinator root has no hittable label"
+        );
+    }
+
+    #[test]
+    fn the_detail_panel_describes_the_selected_node() {
+        let mut app = diamond();
+        app.selected = Some("idA".to_string());
+        let text = render(&app).join("\n");
+        assert!(text.contains("details"), "{text}");
+        assert!(text.contains("node  gatewayA"), "{text}");
+        assert!(text.contains("Compute"), "{text}");
+        assert!(text.contains("cores 8"), "{text}");
+        assert!(text.contains("arch  x86_64"), "{text}");
+    }
+
+    #[test]
+    fn the_link_panel_distinguishes_primary_and_standby() {
+        let mut app = diamond();
+        app.hovered = Some(("idA".to_string(), "idS".to_string()));
+        let primary = render(&app).join("\n");
+        assert!(primary.contains("gatewayA -> shared"), "{primary}");
+        assert!(primary.contains("0.1 ms"), "{primary}");
+        assert!(primary.contains("active (primary)"), "{primary}");
+
+        app.hovered = Some(("idB".to_string(), "idS".to_string()));
+        let standby = render(&app).join("\n");
+        assert!(standby.contains("0.2 ms"), "{standby}");
+        assert!(standby.contains("standby"), "{standby}");
+    }
+
+    #[test]
+    fn the_link_panel_names_the_coordinator_and_resolves_root_latency() {
+        let mut app = diamond();
+        app.hovered = Some((root_id(&app), "idA".to_string()));
+        let text = render(&app).join("\n");
+        assert!(text.contains("coordinator -> gatewayA"), "{text}");
+        assert!(text.contains("1.0 ms"), "{text}");
+        assert!(text.contains("active (primary)"), "{text}");
+    }
+
+    #[test]
+    fn the_link_panel_handles_an_unknown_latency() {
+        // A pair with no discovered path shows n/a rather than a latency.
+        let mut app = diamond();
+        app.hovered = Some(("idA".to_string(), "idB".to_string()));
+        assert!(render(&app).join("\n").contains("n/a"));
+    }
+
+    #[test]
+    fn the_legend_shows_when_nothing_is_selected() {
+        let text = render(&diamond()).join("\n");
+        assert!(text.contains("keys"), "{text}");
+        assert!(text.contains("pause"), "{text}");
+    }
+
+    #[test]
+    fn edge_latency_resolves_paths_and_misses() {
+        use super::edge_latency;
+        let app = diamond();
+        let root = root_id(&app);
+        // The coordinator link to a gateway carries the gateway's own latency.
+        assert_eq!(edge_latency(&app.state, &root, "idA"), Some(1_000));
+        // A standby leaf link carries that path's measured latency.
+        assert_eq!(edge_latency(&app.state, "idB", "idS"), Some(200));
+        // An unrelated pair resolves to no path.
+        assert_eq!(edge_latency(&app.state, "idA", "idB"), None);
     }
 }
