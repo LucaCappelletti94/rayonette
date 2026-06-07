@@ -9,7 +9,7 @@ topo_setup
 topo_warm || { echo "warm-up failed"; exit 1; }
 
 total=0
-for t in line2 line3 diamond articulation require_redundancy elastic relay-grow; do
+for t in line2 line3 diamond articulation require_redundancy elastic relay-grow capstone; do
   echo
   echo "############################## $t ##############################"
   bash "$t/run.sh"

@@ -19,6 +19,7 @@ node online mid-run (the fleet grows and absorbs it).
 | `require_redundancy`| line2 (no redundancy) and diamond       | refuse a non-redundant topology, admit a redundant one                 |
 | `elastic`           | coordinator -> two leaves               | start with one leaf, bring the second up mid-run, the rejoin driver absorbs it |
 | `relay-grow`        | coordinator -> relay -> two leaves      | add a leaf to the relay's children file mid-run, the relay re-reads and absorbs it |
+| `capstone`          | two gateways -> shared private leaf + a leaf joining mid-run | segmented, multi-level, redundant, and elastic at once: a node joins the standby gateway mid-run, then the primary gateway is killed and reroutes, all deduped |
 
 ## Usage
 
