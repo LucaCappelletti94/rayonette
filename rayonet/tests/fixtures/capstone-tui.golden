@@ -1,0 +1,40 @@
+=== after 25% of the run ===
+rayonet  28/120 done  0 failed
+gatewayA  Working  Compute  28
+  shared  Working  Compute  0
+gatewayB  Ready  Compute  0
+  shared  Ready  Compute  0
+
+
+
+
+=== after 50% of the run ===
+rayonet  58/120 done  0 failed
+gatewayA  Working  Compute  55
+  shared  Working  Compute  0
+gatewayB  Working  Compute  SPOF  3
+  extra  Working  Compute  0
+  shared  Ready  Compute  0
+
+
+
+=== after 75% of the run ===
+rayonet  89/120 done  0 failed
+gatewayA  Lost  Compute  69
+  shared  Working  Compute  0
+gatewayB  Working  Compute  SPOF  20
+  extra  Working  Compute  0
+  shared  Working  Compute  0
+
+
+
+=== after 100% of the run ===
+rayonet  120/120 done  0 failed
+gatewayA  Lost  Compute  69
+  shared  Working  Compute  0
+gatewayB  Done  Compute  SPOF  51
+  extra  Done  Compute  0
+  shared  Done  Compute  0
+
+
+

@@ -84,3 +84,34 @@ real openssh by the `diamond`, `elastic`, `relay-grow`, and `capstone` docker
 scenarios above; the same children-file edit shown here, applied mid-run, is what
 a real gateway re-reads to absorb a node. Always delete a real children file when
 done, or later agent runs on that host will try to relay.
+
+## Watching and refining the TUI
+
+The consumer records its full event stream when `RAYONET_EVENT_LOG` is set, and
+`topo_drive` forwards it, so any scenario can be captured or watched. The
+`tui-replay` example (`examples/tui-replay`) renders a recording through the same
+`rayonet::tui::draw` the live run uses.
+
+Watch a finished trace (a committed capstone recording lives at
+`rayonet/tests/fixtures/capstone.jsonl`), paced by its own timestamps at 4x:
+
+```sh
+cargo run -p tui-replay -- rayonet/tests/fixtures/capstone.jsonl 4
+```
+
+Watch a run live: set the log, run the scenario, and follow the log from another
+terminal (it renders events as they are written):
+
+```sh
+RAYONET_EVENT_LOG=/tmp/run.jsonl KEEP=1 ./capstone/run.sh    # one terminal
+cargo run -p tui-replay -- --follow /tmp/run.jsonl           # another terminal
+```
+
+Refine the TUI against a real run: edit `rayonet/src/tui.rs`, run the snapshot
+test, read the text diff of how the captured capstone now renders at 25 / 50 / 75
+/ 100% of the run, and re-bless the golden when the change is intended:
+
+```sh
+cargo test -p rayonet --features tui --test tui_snapshot      # diff against the golden
+RAYONET_TUI_BLESS=1 cargo test -p rayonet --features tui --test tui_snapshot  # accept changes
+```

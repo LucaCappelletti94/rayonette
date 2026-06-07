@@ -88,6 +88,9 @@ topo_drive() { # config leaves task count [require]
   local -a vars=(RAYONET_SSH_CONFIG="$config" RAYONET_LEAVES="$leaves"
                  RAYONET_TOOLCHAIN=stable RAYONET_TASK="$task" RAYONET_COUNT="$count")
   [ -n "$require" ] && vars+=(RAYONET_REQUIRE_REDUNDANCY=1)
+  # Forward the event-recording path if the caller set one, so a run can be
+  # captured for TUI replay (see examples/tui-replay) without changing scenarios.
+  [ -n "${RAYONET_EVENT_LOG:-}" ] && vars+=(RAYONET_EVENT_LOG="$RAYONET_EVENT_LOG")
   # Line-buffer stdout so the per-node state lines reach a piped log promptly,
   # which is what lets a kill scenario detect "Working" and fire mid-run. The
   # timeout is a backstop: a correct run finishes or fails in seconds, so if a

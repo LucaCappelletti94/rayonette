@@ -8,10 +8,11 @@
 //! node-state transition (so the harness can assert the ladder) and, at the end,
 //! a per-host completed-task count (so the harness can assert work-share).
 
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use rayonet::fleet::{Fleet, NetMapExt};
-use rayonet::observability::{Event, EventSink, RunState};
+use rayonet::observability::{Event, EventSink, RecordedEvent, RunState};
 use rayonet::process;
 use rayonet::ssh::{Ssh, SshConfig};
 
@@ -41,11 +42,48 @@ fn dawdle(x: u32) -> u32 {
 
 rayonet::embed_microcrates!();
 
-/// Prints each node-state transition and reduces the stream so the run's
-/// per-host work-share can be reported when it finishes.
-#[derive(Default)]
+/// Appends each event to the `RAYONET_EVENT_LOG` file as JSONL, timestamped from
+/// the run's start, so a run can be replayed into the TUI (see examples/tui-replay).
+struct Recorder {
+    file: std::fs::File,
+    start: std::time::Instant,
+}
+
+impl Recorder {
+    fn record(&mut self, event: &Event) {
+        let elapsed_ms = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let record = RecordedEvent {
+            elapsed_ms,
+            event: event.clone(),
+        };
+        if let Ok(line) = serde_json::to_string(&record) {
+            let _ = writeln!(self.file, "{line}");
+        }
+    }
+}
+
+/// Prints each node-state transition, reduces the stream so the run's per-host
+/// work-share can be reported when it finishes, and (when `RAYONET_EVENT_LOG` is
+/// set) records the full event stream for TUI replay.
 struct ConsoleSink {
     state: Mutex<RunState>,
+    recorder: Option<Mutex<Recorder>>,
+}
+
+impl ConsoleSink {
+    fn new() -> Self {
+        let recorder = std::env::var_os("RAYONET_EVENT_LOG").map(|path| {
+            let file = std::fs::File::create(&path).expect("cannot create RAYONET_EVENT_LOG file");
+            Mutex::new(Recorder {
+                file,
+                start: std::time::Instant::now(),
+            })
+        });
+        Self {
+            state: Mutex::new(RunState::default()),
+            recorder,
+        }
+    }
 }
 
 impl EventSink for ConsoleSink {
@@ -53,6 +91,9 @@ impl EventSink for ConsoleSink {
         self.state.lock().unwrap().apply(&event);
         if let Event::Node { host, state } = &event {
             println!("state {host} {state:?}");
+        }
+        if let Some(recorder) = &self.recorder {
+            recorder.lock().unwrap().record(&event);
         }
     }
 }
@@ -87,7 +128,7 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
 
-    let sink = Arc::new(ConsoleSink::default());
+    let sink = Arc::new(ConsoleSink::new());
     let launchers: Vec<Ssh> = leaves
         .split(',')
         .map(str::trim)

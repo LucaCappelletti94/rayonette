@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 rayonet = { path = "../../../rayonet" }
 tokio = { version = "1", features = ["full"] }
+serde_json = "1"
 
 [build-dependencies]
 rayonet-build = { path = "../../../rayonet-build" }

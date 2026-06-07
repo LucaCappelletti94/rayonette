@@ -131,6 +131,20 @@ impl Event {
     }
 }
 
+/// One line of a recorded event stream: an [`Event`] plus the time it was emitted.
+///
+/// A run can append these to a file (the docker consumer does, behind
+/// `RAYONET_EVENT_LOG`), and a viewer can replay them, pacing playback by
+/// `elapsed_ms` (milliseconds since the run started), to watch the run unfold. The
+/// timestamp lives here rather than on [`Event`] so the live protocol is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedEvent {
+    /// Milliseconds from the start of the run to when this event was emitted.
+    pub elapsed_ms: u64,
+    /// The event itself.
+    pub event: Event,
+}
+
 /// A consumer of the observability event stream.
 pub trait EventSink: Send + Sync {
     /// Record one event. Must not block the run.
@@ -604,6 +618,19 @@ mod tests {
             let back: Event = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(&back, event);
         }
+    }
+
+    #[test]
+    fn recorded_event_round_trips() {
+        use super::RecordedEvent;
+        let record = RecordedEvent {
+            elapsed_ms: 1234,
+            event: Event::node("relay/leaf", NodeState::Working),
+        };
+        let bytes = postcard::to_allocvec(&record).unwrap();
+        let back: RecordedEvent = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, record);
+        assert!(format!("{record:?}").contains("RecordedEvent"));
     }
 
     #[test]
