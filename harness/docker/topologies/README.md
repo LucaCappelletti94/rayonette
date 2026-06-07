@@ -90,7 +90,13 @@ done, or later agent runs on that host will try to relay.
 The consumer records its full event stream when `RAYONET_EVENT_LOG` is set, and
 `topo_drive` forwards it, so any scenario can be captured or watched. The
 `tui-replay` example (`examples/tui-replay`) renders a recording through the same
-`rayonet::tui::draw` the live run uses.
+interactive `rayonet::tui` dashboard the live run uses: the relay tree drawn as a
+node-link graph (nodes coloured by state, active versus standby links, single
+points of failure flagged), a progress header, a per-node table, an event log,
+and an info panel. Tab or the arrow keys (and the mouse) select a node to see its
+detail, including live CPU, memory, and GPU use that agents self-report; hovering
+a link shows its latency and whether it is the primary or a standby. Esc clears,
+`p` pauses, `q` quits.
 
 Watch a finished trace (a committed capstone recording lives at
 `rayonet/tests/fixtures/capstone.jsonl`), paced by its own timestamps at 4x:

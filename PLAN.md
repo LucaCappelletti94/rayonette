@@ -113,6 +113,8 @@ CI runs all four (decision 29).
 
 **Done when:** multi-host runs are correct and observable through at least two renderers, and observers provably cannot slow the compute.
 
+**Delivered, then redesigned.** The original deliverables (concurrent agents, the run-state model, the lossy broadcast, the plain renderer, and a first TUI) shipped in Phase 5 and grew through the relay-tree epic (the tree view, role and state per node, single-point-of-failure flagging). The bare TUI was then redesigned into a rich, interactive, graph-first dashboard: the relay tree drawn as a node-link graph (a deterministic `ForceAtlas2` layout that stays in the golden), nodes coloured by state, active versus standby links distinguished, single points of failure flagged, with a progress header, a per-node table, an event log, and an info panel. A node or link is selected or hovered by keyboard or mouse (a hit map resolves the pointer), opening its detail or link info. Agents self-report live CPU, memory, and GPU utilisation up the existing observability uplink, throttled so sampling never burdens the task hot path, and the detail panel shows it. Two display defects were fixed: full-path disambiguation of two paths to one node, and drawing a node stranded behind a dead relay rather than leaving it at a stale state. The view is a pure function of a small `App`, driven the same way from an in-process subscription or a recorded trace followed live by the replay viewer.
+
 ---
 
 ## Phase 6 - Fault tolerance
