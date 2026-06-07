@@ -18,6 +18,7 @@ node online mid-run (the fleet grows and absorbs it).
 | `articulation`      | diamond plus a solo leaf under relayA   | kill relayA: solo's work reroutes onto the surviving compute           |
 | `require_redundancy`| line2 (no redundancy) and diamond       | refuse a non-redundant topology, admit a redundant one                 |
 | `elastic`           | coordinator -> two leaves               | start with one leaf, bring the second up mid-run, the rejoin driver absorbs it |
+| `relay-grow`        | coordinator -> relay -> two leaves      | add a leaf to the relay's children file mid-run, the relay re-reads and absorbs it |
 
 ## Usage
 

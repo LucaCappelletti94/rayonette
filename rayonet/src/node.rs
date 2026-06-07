@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::agent::{serve, Registry};
+use crate::fleet::Launch;
 use crate::framing::Connection;
 use crate::process::agent_connection;
-use crate::relay::relay;
+use crate::relay::{relay_with_source, ChildSource};
 use crate::ssh::{parse_host_list, Ssh, SshConfig};
 
 /// What a node needs at boot.
@@ -71,7 +72,40 @@ fn child_launchers(children: Vec<SshConfig>, config: &NodeConfig) -> Vec<Ssh> {
         .collect()
 }
 
+/// A [`ChildSource`] backed by the node's children file: each poll re-reads the
+/// file and yields ssh launchers for entries not already in the subtree, so a
+/// relay picks up children added to its file after it started (R6 elastic
+/// membership). An absent path (no `$HOME`) simply never grows.
+struct FileChildSource {
+    path: Option<PathBuf>,
+    source: Vec<u8>,
+    toolchain: String,
+    binary_name: String,
+}
+
+impl ChildSource<Ssh> for FileChildSource {
+    fn poll(&mut self, present: &[String]) -> Vec<Ssh> {
+        let Some(path) = &self.path else {
+            return Vec::new();
+        };
+        read_children_file(path)
+            .into_iter()
+            .map(|child| {
+                Ssh::build(
+                    child,
+                    self.source.clone(),
+                    self.toolchain.clone(),
+                    self.binary_name.clone(),
+                )
+            })
+            .filter(|ssh| !present.contains(&ssh.label()))
+            .collect()
+    }
+}
+
 /// Run over `parent` as a leaf (no children) or a relay (cascading to children).
+/// A relay re-reads its children file as it runs, so it absorbs children added to
+/// the file after it started.
 async fn dispatch<P>(
     parent: Connection<P>,
     children: Vec<SshConfig>,
@@ -81,10 +115,16 @@ where
     P: AsyncRead + AsyncWrite + Unpin + Send,
 {
     if children.is_empty() {
-        serve(parent, config.registry).await
-    } else {
-        relay(parent, child_launchers(children, &config)).await
+        return serve(parent, config.registry).await;
     }
+    let launchers = child_launchers(children, &config);
+    let source = FileChildSource {
+        path: children_path(),
+        source: config.source,
+        toolchain: config.toolchain,
+        binary_name: config.binary_name,
+    };
+    relay_with_source(parent, launchers, source).await
 }
 
 /// Run this node in agent mode over its stdio.
@@ -136,11 +176,46 @@ pub async fn agent_main(config: NodeConfig) -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::{child_launchers, children_path, dispatch, load_children, NodeConfig};
+    use super::{
+        child_launchers, children_path, dispatch, load_children, FileChildSource, NodeConfig,
+    };
     use crate::agent::{handler, Registry};
+    use crate::fleet::Launch;
     use crate::protocol::{FromAgent, ToAgent, PROTOCOL_VERSION};
+    use crate::relay::ChildSource;
     use crate::ssh::{parse_host_list, SshConfig};
     use crate::testing::connection_pair;
+
+    #[test]
+    fn file_child_source_yields_only_children_not_already_present() {
+        let dir = std::env::temp_dir();
+        let file = dir.join("rayonet-childsource-test");
+        std::fs::write(&file, "alpha\nbeta\n").unwrap();
+        let mut source = FileChildSource {
+            path: Some(file.clone()),
+            source: Vec::new(),
+            toolchain: "stable".to_string(),
+            binary_name: "consumer".to_string(),
+        };
+        // alpha is already in the subtree, so only beta is new.
+        let new = source.poll(&["alpha".to_string()]);
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].label(), "beta");
+        // With both present the re-read adds nothing.
+        assert!(source
+            .poll(&["alpha".to_string(), "beta".to_string()])
+            .is_empty());
+        std::fs::remove_file(&file).ok();
+
+        // No path (no $HOME) means a relay that never grows.
+        let mut rootless = FileChildSource {
+            path: None,
+            source: Vec::new(),
+            toolchain: "stable".to_string(),
+            binary_name: "consumer".to_string(),
+        };
+        assert!(rootless.poll(&[]).is_empty());
+    }
 
     fn config(registry: Registry) -> NodeConfig {
         NodeConfig {

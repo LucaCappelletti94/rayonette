@@ -1,0 +1,32 @@
+# relay-grow: coordinator -> relay -> {leaf-a, leaf-b}. The relay starts with
+# leaf-a; leaf-b is added to the relay's children file and started mid-run, and
+# the relay re-reads its file, launches leaf-b, and splices it into the subtree
+# (R6 elastic membership one level below the coordinator's rejoin).
+name: rayonet-relay-grow
+
+volumes:
+  rayonet-topo-cache:
+    external: true
+
+networks:
+  inner: {}
+
+x-agent: &agent
+  init: true
+  image: rayonet-harness-base:latest
+  volumes:
+    - ../../secrets:/secrets:ro
+    - rayonet-topo-cache:/home/rayonet/.cache
+
+services:
+  relay:
+    <<: *agent
+    networks: [inner]
+    ports:
+      - "2230:22"
+  leaf-a:
+    <<: *agent
+    networks: [inner]
+  leaf-b:
+    <<: *agent
+    networks: [inner]

@@ -29,7 +29,7 @@ pub(crate) enum Event {
     Lost(usize),
 }
 
-fn spawn_reader<S>(
+pub(crate) fn spawn_reader<S>(
     mut rx: Receiver<S>,
     agent: usize,
     events: mpsc::UnboundedSender<Event>,

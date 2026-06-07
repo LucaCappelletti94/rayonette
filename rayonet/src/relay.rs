@@ -16,11 +16,40 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
 use crate::agent::recv_hello;
-use crate::coordinator::{connect_agents, ActivationPolicy, Agents, Event as ChildEvent};
+use crate::coordinator::{
+    connect_agents, handshake_join, spawn_reader, ActivationPolicy, Agents, Event as ChildEvent,
+};
 use crate::fleet::{launch_all, Launch, Launched};
 use crate::framing::{Connection, Receiver, Sender};
 use crate::observability::{Event, EventSink, NodeState};
 use crate::protocol::{ChildAd, FromAgent, TaskId, ToAgent};
+
+/// How often a relay re-reads its children file to pick up newly listed children
+/// (R6 elastic membership, one level below the coordinator's rejoin). Reading a
+/// small local file is cheap, so a tight interval is fine.
+const RESCAN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// A source of children a relay can gain after it started.
+///
+/// Re-reading its children file yields launchers for entries not yet present,
+/// which the relay launches and splices in. The file-backed source lives in
+/// `crate::node`; tests supply their own. A relay with a fixed child set uses
+/// [`NoChildSource`].
+pub(crate) trait ChildSource<L: Launch>: Send {
+    /// Return launchers for children that should join now and are not among
+    /// `present` (the labels already in the subtree). Cheap and synchronous: the
+    /// relay does the slow launch and handshake.
+    fn poll(&mut self, present: &[String]) -> Vec<L>;
+}
+
+/// The default source for a relay with a fixed child set: it never grows.
+pub(crate) struct NoChildSource;
+
+impl<L: Launch> ChildSource<L> for NoChildSource {
+    fn poll(&mut self, _present: &[String]) -> Vec<L> {
+        Vec::new()
+    }
+}
 
 /// An [`EventSink`] that forwards each event onto the relay's uplink channel, so
 /// a child's observability (its `Profiled` and provisioning ladder) can be sent
@@ -163,22 +192,29 @@ where
         self.report(child, NodeState::Lost);
     }
 
+    /// Whether any child is still up to take work. The relay holds its child-event
+    /// sender open (to splice late children in), so it cannot rely on the channel
+    /// closing to learn the subtree is gone; it counts live children instead.
+    fn any_alive_child(&self) -> bool {
+        self.alive.iter().any(|alive| *alive)
+    }
+
     /// Handle one event from a child, forwarding its task lifecycle and
     /// observability up to `parent_tx` and keeping the schedule fed. Returns
     /// `false` when the subtree is gone and the relay should tear down.
     async fn handle_child<P>(
         &mut self,
         parent_tx: &mut Sender<P>,
-        event: Option<ChildEvent>,
+        event: ChildEvent,
     ) -> io::Result<bool>
     where
         P: AsyncRead + AsyncWrite + Unpin,
     {
         match event {
-            Some(ChildEvent::Message(_, FromAgent::Started { task_id })) => {
+            ChildEvent::Message(_, FromAgent::Started { task_id }) => {
                 parent_tx.send(&FromAgent::Started { task_id }).await?;
             }
-            Some(ChildEvent::Message(_, FromAgent::Completed { task_id, output })) => {
+            ChildEvent::Message(_, FromAgent::Completed { task_id, output }) => {
                 if let Some(child) = self.on_terminal(task_id) {
                     parent_tx
                         .send(&FromAgent::Completed { task_id, output })
@@ -189,7 +225,7 @@ where
                     }
                 }
             }
-            Some(ChildEvent::Message(_, FromAgent::Failed { task_id, error })) => {
+            ChildEvent::Message(_, FromAgent::Failed { task_id, error }) => {
                 if let Some(child) = self.on_terminal(task_id) {
                     parent_tx
                         .send(&FromAgent::Failed { task_id, error })
@@ -202,13 +238,13 @@ where
             }
             // A grandchild's observability event: prefix its host with this
             // child's label so it carries a path, then pass it further up.
-            Some(ChildEvent::Message(child, FromAgent::Observe(mut event))) => {
+            ChildEvent::Message(child, FromAgent::Observe(mut event)) => {
                 event.prefix_host(&self.labels[child]);
                 parent_tx.send(&FromAgent::Observe(event)).await?;
             }
             // A grandchild relay promoted a standby of its own, so its capacity
             // grew: fold it into this child's and report the larger subtree up.
-            Some(ChildEvent::Message(child, FromAgent::Capacity { slots })) => {
+            ChildEvent::Message(child, FromAgent::Capacity { slots }) => {
                 self.capacity[child] = slots;
                 parent_tx
                     .send(&FromAgent::Capacity {
@@ -219,23 +255,23 @@ where
             }
             // A child readies or describes itself only during the handshake in
             // `connect_agents`, never again on the live channel.
-            Some(ChildEvent::Message(
-                _,
-                FromAgent::Ready { .. } | FromAgent::Discovered { .. },
-            )) => {
+            ChildEvent::Message(_, FromAgent::Ready { .. } | FromAgent::Discovered { .. }) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "a child sent a handshake message on the live channel",
                 ));
             }
-            // A dropped child: requeue its in-flight tasks onto the survivors.
-            Some(ChildEvent::Lost(child)) => {
+            // A dropped child: requeue its in-flight tasks onto the survivors. With
+            // no child left the subtree is gone, so tear down and let the parent
+            // requeue (unless a re-read could bring one back; that is the source's
+            // job while a child is still alive, not after the subtree has died).
+            ChildEvent::Lost(child) => {
                 self.on_lost(child);
                 self.dispatch().await?;
+                if !self.any_alive_child() {
+                    return Ok(false);
+                }
             }
-            // Every child reader has ended (each emits one `Lost` first), so the
-            // subtree is gone: tear down and let the parent requeue.
-            None => return Ok(false),
         }
         Ok(true)
     }
@@ -308,7 +344,7 @@ where
     ))
 }
 
-/// Run as a relay over `parent`, coordinating `children`.
+/// Run as a relay over `parent`, coordinating a fixed set of `children`.
 ///
 /// A relay is an agent to its parent and a coordinator to its children: it
 /// handshakes the parent (learning the job's `fn_key`), launches and handshakes
@@ -332,6 +368,31 @@ where
     P: AsyncRead + AsyncWrite + Unpin + Send,
     L: Launch + Send + Sync,
 {
+    relay_with_source(parent, children, NoChildSource).await
+}
+
+/// Run as a relay that can also gain children after it started (R6 elastic
+/// membership).
+///
+/// On a backoff it polls `source` for children added to its file and splices each
+/// new one in, advertising the larger capacity up. Otherwise it is [`relay`]. The
+/// relay holds its child-event sender open so it can spawn a reader for a late
+/// child, so it tears down on the count of live children reaching zero rather than
+/// on that channel closing.
+///
+/// # Errors
+/// Returns an error on a protocol violation or a transport failure on either side.
+#[allow(clippy::too_many_lines)] // the splice is inlined to avoid an uncovered per-stream helper
+pub(crate) async fn relay_with_source<P, L, C>(
+    parent: Connection<P>,
+    children: Vec<L>,
+    mut source: C,
+) -> io::Result<()>
+where
+    P: AsyncRead + AsyncWrite + Unpin + Send,
+    L: Launch + Send + Sync,
+    C: ChildSource<L>,
+{
     let (mut parent_tx, mut parent_rx) = parent.split();
 
     // Parent handshake: learn the job's function key (a leaf does the same in
@@ -353,7 +414,7 @@ where
         agents,
         ids,
         latencies,
-        guards,
+        mut guards,
         failures,
     } = launch_all(&children, None, None, &uplink_sink).await;
     let (child_events_tx, mut child_events_rx) = mpsc::unbounded_channel();
@@ -361,7 +422,7 @@ where
         senders,
         labels,
         capacity,
-        readers,
+        mut readers,
         ..
     } = connect_agents(
         agents,
@@ -372,7 +433,6 @@ where
         &ActivationPolicy::ApproveAll,
     )
     .await?;
-    drop(child_events_tx); // the channel ends when every child reader does
 
     // A relay whose children all failed to launch has nothing to offer. It errors
     // (naming why each child dropped) rather than reporting an empty subtree, so
@@ -405,6 +465,7 @@ where
             slots: sched.active_capacity(),
         })
         .await?;
+    let mut rescan = tokio::time::interval(RESCAN_INTERVAL);
     loop {
         tokio::select! {
             from_parent = parent_rx.recv::<ToAgent>() => match from_parent? {
@@ -435,7 +496,9 @@ where
                 }
             },
             from_child = child_events_rx.recv() => {
-                if !sched.handle_child(&mut parent_tx, from_child).await? {
+                let event = from_child
+                    .expect("the relay holds a child events sender for the loop's lifetime");
+                if !sched.handle_child(&mut parent_tx, event).await? {
                     break;
                 }
             },
@@ -443,9 +506,42 @@ where
             Some(event) = uplink_rx.recv() => {
                 parent_tx.send(&FromAgent::Observe(event)).await?;
             }
+            // Re-read the children file: launch, handshake, and splice in any child
+            // that has been added (a new index appended to every per-child vector),
+            // then advertise the larger capacity up and feed it pending work.
+            _ = rescan.tick() => {
+                for launcher in source.poll(&sched.labels) {
+                    let Launched { agents, guards: new_guards, .. } =
+                        launch_all(std::slice::from_ref(&launcher), None, None, &uplink_sink).await;
+                    guards.extend(new_guards);
+                    for (label, conn) in agents {
+                        let Ok(joiner) = handshake_join(label, conn, &fn_key).await else {
+                            continue;
+                        };
+                        let child = sched.senders.len();
+                        sched.senders.push(joiner.tx);
+                        sched.labels.push(joiner.label);
+                        sched.capacity.push(joiner.capacity);
+                        sched.active.push(true);
+                        sched.alive.push(true);
+                        sched.load.push(0);
+                        readers.push(spawn_reader(joiner.rx, child, child_events_tx.clone()));
+                        sched.report(child, NodeState::Idle);
+                        parent_tx
+                            .send(&FromAgent::Capacity {
+                                slots: sched.active_capacity(),
+                            })
+                            .await?;
+                        sched.dispatch().await?;
+                    }
+                }
+            }
         }
     }
 
+    // Release the held child-event sender so the reader joins below can complete,
+    // then shut the live children down and finish the tree view.
+    drop(child_events_tx);
     sched.shutdown().await;
     flush_uplink(&mut uplink_rx, &mut parent_tx).await;
     for reader in readers {
@@ -946,6 +1042,83 @@ mod tests {
         assert!(
             result.is_err(),
             "stranding the leaf behind a dead interior relay must fail the run"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relay_absorbs_a_child_added_mid_run() {
+        use super::{relay_with_source, ChildSource};
+        use crate::observability::{Event, NodeState, RunState};
+        use crate::testing::EventRecorder;
+
+        fn slow(x: u32) -> u32 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            x
+        }
+
+        // A source that yields a second child after the first poll, modelling a
+        // children file that gains an entry while the relay is running.
+        struct GrowOnce {
+            polls: usize,
+            extra: Option<(String, Registry)>,
+        }
+        impl ChildSource<LocalAgent> for GrowOnce {
+            fn poll(&mut self, present: &[String]) -> Vec<LocalAgent> {
+                self.polls += 1;
+                if self.polls <= 1 {
+                    return Vec::new(); // not listed at first
+                }
+                match self.extra.take() {
+                    Some((label, registry)) if !present.contains(&label) => {
+                        vec![LocalAgent::new(&label, registry)]
+                    }
+                    other => {
+                        self.extra = other;
+                        Vec::new()
+                    }
+                }
+            }
+        }
+
+        let children = vec![LocalAgent::new(
+            "leaf-a",
+            Registry::new().with("id", handler(slow)),
+        )];
+        let source = GrowOnce {
+            polls: 0,
+            extra: Some((
+                "leaf-b".to_string(),
+                Registry::new().with("id", handler(slow)),
+            )),
+        };
+
+        let (coord_side, relay_side) = connection_pair(4096);
+        let relay_fut = relay_with_source(relay_side, children, source);
+        let recorder = EventRecorder::default();
+        let coord_fut = run_job::<_, u32, u32>(
+            vec![("relay".to_string(), coord_side)],
+            "id",
+            (0..40u32).collect(),
+            &recorder,
+        );
+        let (relay_res, out) = tokio::join!(relay_fut, coord_fut);
+        relay_res.unwrap();
+        assert_eq!(out.unwrap(), (0..40u32).map(Ok).collect::<Vec<_>>());
+
+        let mut state = RunState::default();
+        for event in &recorder.events() {
+            state.apply(event);
+        }
+        assert!(
+            state.nodes.contains_key("relay/leaf-b"),
+            "the added child joined the subtree"
+        );
+        assert!(
+            recorder.events().iter().any(|event| matches!(
+                event,
+                Event::Node { host, state } if host == "relay/leaf-b" && *state == NodeState::Working
+            )),
+            "the added child ran at least one task"
         );
     }
 
