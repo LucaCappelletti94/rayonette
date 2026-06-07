@@ -167,13 +167,11 @@ pub(crate) struct Joiner<S> {
 /// spliced in. Mirrors the per-agent steps of [`connect_agents`] for a single
 /// connection: greet it, learn its capacity, and (if it is a relay) activate all
 /// of its own children, since a single late joiner has no layer to dedup against.
-///
-/// Used by the R6.1 splice test today; the R6.2 rejoin driver becomes its
-/// production caller (which is when the `cfg(test)` gate comes off).
+/// Called by the rejoin driver (`crate::fleet`) for each host that comes online
+/// mid-run.
 ///
 /// # Errors
 /// Returns an error on a handshake or transport failure.
-#[cfg(test)]
 pub(crate) async fn handshake_join<S>(
     label: String,
     conn: Connection<S>,
@@ -1437,6 +1435,55 @@ mod tests {
         let (raw, ()) = tokio::join!(run, driver);
         // Every task completes (the splice ran a relay joiner end to end).
         assert_eq!(raw.unwrap().len(), 20);
+    }
+
+    #[tokio::test]
+    async fn handshake_join_rejects_a_bad_first_reply() {
+        // The joiner's first reply must be Ready or Discovered; anything else is
+        // a protocol error the handshake surfaces rather than splicing a bad node.
+        let (client, server) = connection_pair(256);
+        tokio::spawn(async move {
+            let (mut tx, mut rx) = server.split();
+            let _hello = rx.recv::<ToAgent>().await;
+            tx.send(&FromAgent::Completed {
+                task_id: 0,
+                output: Vec::new(),
+            })
+            .await
+            .unwrap();
+        });
+        let Err(err) = super::handshake_join("bad".to_string(), client, "id").await else {
+            panic!("a bad first reply must be rejected");
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn handshake_join_rejects_a_relay_that_does_not_ready_after_activate() {
+        use crate::protocol::ChildAd;
+        // A joining relay that, after being told to activate, replies with
+        // something other than Ready is rejected.
+        let (client, server) = connection_pair(256);
+        tokio::spawn(async move {
+            let (mut tx, mut rx) = server.split();
+            let _hello = rx.recv::<ToAgent>().await;
+            tx.send(&FromAgent::Discovered {
+                children: vec![ChildAd {
+                    label: "c".to_string(),
+                    id: "c".to_string(),
+                    slots: 1,
+                    latency_us: 0,
+                }],
+            })
+            .await
+            .unwrap();
+            let _activate = rx.recv::<ToAgent>().await;
+            tx.send(&FromAgent::Started { task_id: 0 }).await.unwrap();
+        });
+        let Err(err) = super::handshake_join("relay".to_string(), client, "id").await else {
+            panic!("a relay that does not ready after activate must be rejected");
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]

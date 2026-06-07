@@ -10,15 +10,35 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc;
 
 use crate::agent::fn_key;
 use crate::capability::{pred::Predicate, Filter, NodeProfile, Role};
-use crate::coordinator::{decode_output, run_job_raw, serialize_inputs};
+use crate::coordinator::{
+    decode_output, handshake_join, run_job_raw_with_joins, serialize_inputs, Joiner,
+};
 use crate::framing::Connection;
 use crate::observability::{Event, EventSink, NoopSink};
+
+/// How the rejoin driver retries a host that was unreachable at launch: how long
+/// to wait between attempts, and how many attempts before giving that host up.
+/// Bounded attempts, no wall clock: the run errors only when no agent is alive and
+/// every candidate is exhausted.
+#[derive(Clone, Copy)]
+struct RejoinPolicy {
+    backoff: Duration,
+    max_attempts: usize,
+}
+
+/// The production rejoin tuning. Tests pass a tighter policy for speed.
+const REJOIN_POLICY: RejoinPolicy = RejoinPolicy {
+    backoff: Duration::from_millis(200),
+    max_attempts: 150,
+};
 
 /// Launches one agent in three phases so a host's capabilities can be probed and
 /// filtered before the expensive provisioning step: connect, then probe, then
@@ -170,22 +190,26 @@ struct Discovered<'a, L: Launch> {
 /// `Profiled` fact, and return those eligible to run (assigned [`Role::Compute`]
 /// and meeting the job `requires`) holding their open sessions. A host that fails
 /// to connect or probe is dropped with its error kept (for the no-eligible-host
-/// message). A filtered or unneeded host is dropped without error. No host is
-/// activated here: identity precedes provisioning.
+/// message) and returned as a retry candidate: it may yet come online, so the
+/// rejoin driver retries it (R6 elastic membership). A filtered or unneeded host
+/// is dropped without error and is not retried: its exclusion is permanent. No
+/// host is activated here: identity precedes provisioning.
 async fn discover_all<'a, L: Launch + Send + Sync>(
     launchers: &'a [L],
     filter: Option<&Filter>,
     requires: Option<&Predicate>,
     events: &dyn EventSink,
-) -> (Vec<Discovered<'a, L>>, Vec<std::io::Error>) {
+) -> (Vec<Discovered<'a, L>>, Vec<std::io::Error>, Vec<&'a L>) {
     let mut eligible = Vec::with_capacity(launchers.len());
     let mut failures = Vec::new();
+    let mut retry = Vec::new();
     for launcher in launchers {
         let label = launcher.label();
         let session = match launcher.connect().await {
             Ok(session) => session,
             Err(failure) => {
                 failures.push(failure);
+                retry.push(launcher);
                 continue;
             }
         };
@@ -196,6 +220,7 @@ async fn discover_all<'a, L: Launch + Send + Sync>(
             Ok(profile) => profile,
             Err(failure) => {
                 failures.push(failure);
+                retry.push(launcher);
                 continue;
             }
         };
@@ -218,7 +243,7 @@ async fn discover_all<'a, L: Launch + Send + Sync>(
             session,
         });
     }
-    (eligible, failures)
+    (eligible, failures, retry)
 }
 
 /// Provisioning: activate and spawn the agent on each discovered host, consuming
@@ -266,8 +291,97 @@ pub(crate) async fn launch_all<L: Launch + Send + Sync>(
     requires: Option<&Predicate>,
     events: &dyn EventSink,
 ) -> Launched<L> {
-    let (discovered, failures) = discover_all(launchers, filter, requires, events).await;
+    // The relay launches a fixed child set, so it does not retry: the rejoin
+    // candidates are for the coordinator's re-entrant discovery only.
+    let (discovered, failures, _retry) = discover_all(launchers, filter, requires, events).await;
     provision_all(discovered, failures, events).await
+}
+
+/// One attempt to bring a candidate that was unreachable at launch into a running
+/// job: `Joined` if it came online and handshaked, `Retry` if it is still down
+/// (try again later), or `GiveUp` if it is now permanently excluded (the filter
+/// or the job requirement rules it out on this attempt).
+enum JoinAttempt<L: Launch> {
+    Joined(Joiner<L::Stream>, L::Guard),
+    Retry,
+    GiveUp,
+}
+
+/// Re-entrant discovery (R6 elastic membership): retry every candidate that was
+/// unreachable at launch on a backoff, feeding each one that comes online into
+/// the run's `joins_tx`, and hold the guards that keep them alive. A candidate is
+/// retried up to `policy.max_attempts` times, then given up; one ruled out by the
+/// filter or requirement is given up at once. Returns when no candidate remains
+/// (or the run ended), dropping `joins_tx` so the run learns no node can join.
+///
+/// The per-attempt handshake (connect, probe, identify, filter, provision,
+/// handshake) is inlined rather than a helper, so it does not monomorphize into a
+/// separate function per launcher type that a fixed fleet would never exercise.
+async fn rejoin_driver<L: Launch + Send + Sync>(
+    candidates: Vec<&L>,
+    fn_key: &str,
+    filter: Option<&Filter>,
+    requires: Option<&Predicate>,
+    joins_tx: mpsc::UnboundedSender<Joiner<L::Stream>>,
+    policy: RejoinPolicy,
+    events: &dyn EventSink,
+) -> Vec<L::Guard> {
+    let mut guards = Vec::new();
+    // Each candidate carries how many attempts it has left.
+    let mut pending: Vec<(&L, usize)> = candidates
+        .into_iter()
+        .map(|launcher| (launcher, policy.max_attempts))
+        .collect();
+    while !pending.is_empty() && !joins_tx.is_closed() {
+        let mut still = Vec::new();
+        for (launcher, remaining) in pending {
+            // Transport hiccups (connect, probe, activate, handshake) are
+            // retryable; a filter or requirement exclusion is permanent.
+            let attempt: JoinAttempt<L> = 'attempt: {
+                let label = launcher.label();
+                let Ok(session) = launcher.connect().await else {
+                    break 'attempt JoinAttempt::Retry;
+                };
+                let probe_started = std::time::Instant::now();
+                let Ok(profile) = launcher.probe(&session).await else {
+                    break 'attempt JoinAttempt::Retry;
+                };
+                let latency_us =
+                    u64::try_from(probe_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                let role = filter.map_or(Role::Compute, |filter| filter.role_of(&profile));
+                let meets_requirement = requires.is_none_or(|predicate| predicate.eval(&profile));
+                let id = launcher.node_id(&session).await;
+                events.emit(Event::profiled(&label, &id, profile, role, latency_us));
+                if role != Role::Compute || !meets_requirement {
+                    break 'attempt JoinAttempt::GiveUp;
+                }
+                let Ok((connection, guard)) = launcher.activate(session, events).await else {
+                    break 'attempt JoinAttempt::Retry;
+                };
+                handshake_join(label, connection, fn_key)
+                    .await
+                    .map_or(JoinAttempt::Retry, |joiner| {
+                        JoinAttempt::Joined(joiner, guard)
+                    })
+            };
+            match attempt {
+                JoinAttempt::Joined(joiner, guard) => {
+                    // A send error means the run already ended; drop the agent.
+                    if joins_tx.send(joiner).is_ok() {
+                        guards.push(guard);
+                    }
+                }
+                JoinAttempt::Retry if remaining > 1 => still.push((launcher, remaining - 1)),
+                JoinAttempt::Retry | JoinAttempt::GiveUp => {}
+            }
+        }
+        pending = still;
+        if pending.is_empty() || joins_tx.is_closed() {
+            break;
+        }
+        tokio::time::sleep(policy.backoff).await;
+    }
+    guards
 }
 
 /// The no-eligible-host error message from a [`launch_all`] pass that left no
@@ -311,29 +425,64 @@ impl<L: Launch + Send + Sync> ErasedFleet for Fleet<L> {
     ) -> Pin<Box<dyn Future<Output = RawResults> + Send + 'a>> {
         Box::pin(async move {
             let events = self.events.as_ref();
-            // A host that fails to launch (a cold host that cannot install the
-            // toolchain) or that the filter/requirement excludes is dropped; its
-            // tasks are simply scheduled onto the survivors by the pull scheduler.
+            let filter = self.filter.as_ref();
+            // Discover the layer, then provision the eligible hosts. A host that
+            // fails to launch or that the filter/requirement excludes is dropped;
+            // one that was merely unreachable becomes a rejoin candidate.
+            let (eligible, failures, retry) =
+                discover_all(&self.launchers, filter, requires, events).await;
             let Launched {
                 agents,
                 latencies,
                 guards,
                 failures,
                 ..
-            } = launch_all(&self.launchers, self.filter.as_ref(), requires, events).await;
+            } = provision_all(eligible, failures, events).await;
+            // A run needs at least one live host to start; with none, no node
+            // could have joined a run that never began, so this is a hard failure.
             if agents.is_empty() {
                 return Err(no_eligible_host(&failures));
             }
-            let result = run_job_raw(
+
+            // Run the job while a rejoin driver retries the unreachable candidates
+            // and feeds any that come online into the live run. The two run
+            // concurrently in one task (so the driver may borrow the launchers);
+            // the job's result returns as soon as it completes, and the driver's
+            // guards (the agents it joined) are held until then.
+            let (joins_tx, joins_rx) = mpsc::unbounded_channel();
+            let job = run_job_raw_with_joins(
                 agents,
                 fn_key,
                 payloads,
                 &latencies,
                 require_redundancy,
+                joins_rx,
                 events,
-            )
-            .await;
+            );
+            let driver = rejoin_driver(
+                retry,
+                fn_key,
+                filter,
+                requires,
+                joins_tx,
+                REJOIN_POLICY,
+                events,
+            );
+            tokio::pin!(job);
+            tokio::pin!(driver);
+            let mut driver_done = false;
+            let mut joiner_guards = Vec::new();
+            let result = loop {
+                tokio::select! {
+                    job_result = &mut job => break job_result,
+                    driver_guards = &mut driver, if !driver_done => {
+                        joiner_guards = driver_guards;
+                        driver_done = true;
+                    }
+                }
+            };
             drop(guards); // agents already shut down via the job's `Shutdown`
+            drop(joiner_guards);
             result
         })
     }
@@ -722,6 +871,13 @@ mod tests {
         label: String,
         profile: Option<NodeProfile>,
         probe_fails: bool,
+        /// A shared counter and a threshold: `connect` fails while the count is
+        /// below the threshold, then succeeds, simulating a host unreachable at
+        /// launch that comes online after a few attempts.
+        connect_gate: Option<(std::sync::Arc<std::sync::atomic::AtomicUsize>, usize)>,
+        /// When set, `activate` fails, simulating a host that connects and probes
+        /// but cannot be provisioned (a cold host whose build never finishes).
+        activate_fails: bool,
     }
 
     impl InProcess {
@@ -732,6 +888,8 @@ mod tests {
                 label: "in-process".to_string(),
                 profile: None,
                 probe_fails: false,
+                connect_gate: None,
+                activate_fails: false,
             }
         }
 
@@ -741,7 +899,28 @@ mod tests {
                 label: "in-process".to_string(),
                 profile: None,
                 probe_fails: false,
+                connect_gate: None,
+                activate_fails: false,
             }
+        }
+
+        /// Make `connect` fail until it has been called `fail_below` times (sharing
+        /// `counter`), then succeed: a host that is unreachable at launch and the
+        /// first few rejoin attempts, then comes online.
+        fn flaky_connect(
+            mut self,
+            counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            fail_below: usize,
+        ) -> Self {
+            self.connect_gate = Some((counter, fail_below));
+            self
+        }
+
+        /// Make `activate` fail: a host that connects and probes but cannot be
+        /// provisioned, so it is dropped before it can run anything.
+        fn activate_failing(mut self) -> Self {
+            self.activate_fails = true;
+            self
         }
 
         /// Override the host label, so a multi-host fleet has distinct nodes.
@@ -776,6 +955,11 @@ mod tests {
         }
 
         async fn connect(&self) -> std::io::Result<Registry> {
+            if let Some((counter, fail_below)) = &self.connect_gate {
+                if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < *fail_below {
+                    return Err(std::io::Error::other("simulated unreachable host"));
+                }
+            }
             self.registry
                 .clone()
                 .ok_or_else(|| std::io::Error::other("simulated launch failure"))
@@ -793,6 +977,9 @@ mod tests {
             registry: Registry,
             _events: &dyn EventSink,
         ) -> std::io::Result<(Connection<DuplexStream>, Self::Guard)> {
+            if self.activate_fails {
+                return Err(std::io::Error::other("simulated activation failure"));
+            }
             let (client, server) = connection_pair(256);
             let task = tokio::spawn(serve(server, registry));
             Ok((client, task))
@@ -1262,6 +1449,156 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("every host failed"), "{error}");
+    }
+
+    /// A handler slow enough that work is still pending when a late host joins.
+    fn slow_double(x: u32) -> u32 {
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        x * 2
+    }
+
+    #[tokio::test]
+    async fn a_host_unreachable_at_start_joins_on_a_later_attempt() {
+        use crate::observability::RunState;
+        use crate::testing::EventRecorder;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        // A healthy host runs from the start; a second host's first two connects
+        // fail (it is unreachable at launch), so the rejoin driver retries it and
+        // it joins mid-run, taking pending tasks. Every result is still correct.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let launchers = vec![
+            InProcess::serving_registry(Registry::new().with_fn(slow_double)).named("healthy"),
+            InProcess::serving_registry(Registry::new().with_fn(slow_double))
+                .named("late")
+                .flaky_connect(counter, 2),
+        ];
+        let sink = Arc::new(EventRecorder::default());
+        let fleet = Fleet::observed(launchers, sink.clone());
+
+        let out: Vec<Result<u32, String>> = (0..40u32)
+            .net_map_with_fleet(slow_double, &fleet)
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(out, (0..40u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+
+        let mut state = RunState::default();
+        for event in &sink.events() {
+            state.apply(event);
+        }
+        assert!(
+            state.nodes.contains_key("late"),
+            "the late host should have joined the run"
+        );
+        assert!(
+            state.nodes["late"].completed >= 1,
+            "the late host should have run pending tasks once it joined"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_rejoin_driver_gives_up_on_a_permanently_unreachable_candidate() {
+        use tokio::sync::mpsc;
+
+        // A candidate whose connect never succeeds is retried up to the attempt
+        // cap, then given up: the driver returns no guards and closes the joins
+        // channel without ever sending a joiner.
+        let bad = InProcess::serving(false).named("never");
+        let (joins_tx, mut joins_rx) =
+            mpsc::unbounded_channel::<crate::coordinator::Joiner<DuplexStream>>();
+        let guards = super::rejoin_driver(
+            vec![&bad],
+            "double",
+            None,
+            None,
+            joins_tx,
+            super::RejoinPolicy {
+                backoff: std::time::Duration::from_millis(1),
+                max_attempts: 3,
+            },
+            &super::NoopSink,
+        )
+        .await;
+        assert!(
+            guards.is_empty(),
+            "a permanently dead candidate yields nothing"
+        );
+        assert!(
+            joins_rx.recv().await.is_none(),
+            "no joiner was sent and the channel is closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_rejoin_driver_drops_unprobeable_excluded_and_unprovisionable_candidates() {
+        use crate::capability::{pred, Filter, NodeProfile, Os};
+        use tokio::sync::mpsc;
+
+        let linux = NodeProfile {
+            os: Os::Linux,
+            ..NodeProfile::unknown()
+        };
+        let mac = NodeProfile {
+            os: Os::MacOs,
+            ..NodeProfile::unknown()
+        };
+        // Three candidates, each exercising one non-join outcome: one that cannot
+        // be probed (retry then give up), one the filter excludes (give up at
+        // once), and one that probes fine but cannot be provisioned (retry then
+        // give up). None joins.
+        let unprobeable = InProcess::serving(true)
+            .named("unprobeable")
+            .probe_failing();
+        let excluded = InProcess::serving(true).named("excluded").with_profile(mac);
+        let unprovisionable = InProcess::serving(true)
+            .named("unprovisionable")
+            .with_profile(linux)
+            .activate_failing();
+        let filter = Filter::new().compute(pred::os_is(Os::Linux));
+        // A job requirement the surviving Linux candidate satisfies, so the
+        // requirement check runs (the unprovisionable host passes it, then fails
+        // to activate).
+        let requires = pred::os_is(Os::Linux);
+        let (joins_tx, mut joins_rx) =
+            mpsc::unbounded_channel::<crate::coordinator::Joiner<DuplexStream>>();
+        let guards = super::rejoin_driver(
+            vec![&unprobeable, &excluded, &unprovisionable],
+            "double",
+            Some(&filter),
+            Some(&requires),
+            joins_tx,
+            super::RejoinPolicy {
+                backoff: std::time::Duration::from_millis(1),
+                max_attempts: 2,
+            },
+            &super::NoopSink,
+        )
+        .await;
+        assert!(guards.is_empty());
+        assert!(joins_rx.recv().await.is_none(), "no candidate joined");
+    }
+
+    #[tokio::test]
+    async fn a_host_that_cannot_be_provisioned_is_dropped_at_launch() {
+        // A host connects and probes but fails to activate (a cold host whose
+        // build never finishes): it is dropped at launch and the survivor runs
+        // every task. A provisioning failure is not an unreachable host, so it is
+        // not retried.
+        let launchers = vec![
+            InProcess::serving(true).named("healthy"),
+            InProcess::serving(true)
+                .named("unprovisionable")
+                .activate_failing(),
+        ];
+        let fleet = Fleet::new(launchers);
+        let out: Vec<Result<u32, String>> = (0..8u32)
+            .net_map_with_fleet(double, &fleet)
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(out, (0..8u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
     }
 
     #[cfg(feature = "rayon")]

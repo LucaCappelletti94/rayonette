@@ -899,9 +899,20 @@ mod tests {
             ("A".to_string(), primary_link),
             ("B".to_string(), standby_link),
         ];
-        let out: Vec<Result<u32, String>> = run_job(agents, "id", (0..30u32).collect(), &NoopSink)
-            .await
-            .unwrap();
+        // A advertises the faster link, so the coordinator deterministically makes
+        // A the primary path to the shared leaf and holds B as the standby. When
+        // A's reads are cut mid-run it drops, and the coordinator promotes B, whose
+        // relay then activates the shared leaf and finishes the run.
+        let payloads =
+            crate::coordinator::serialize_inputs(&(0..30u32).collect::<Vec<_>>()).unwrap();
+        let raw =
+            crate::coordinator::run_job_raw(agents, "id", payloads, &[0, 1000], false, &NoopSink)
+                .await
+                .unwrap();
+        let out: Vec<Result<u32, String>> = raw
+            .into_iter()
+            .map(crate::coordinator::decode_output::<u32>)
+            .collect();
 
         assert_eq!(out, (0..30u32).map(Ok).collect::<Vec<_>>());
         let _ = primary.await; // The primary errors once its coordinator read is cut.
