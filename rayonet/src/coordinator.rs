@@ -148,6 +148,66 @@ pub(crate) struct Agents<S> {
     pub(crate) readers: Vec<JoinHandle<()>>,
 }
 
+/// A single handshaked agent ready to be spliced into a live run (R6 elastic
+/// membership). A node that comes online after the run started is handshaked on
+/// its own (with [`handshake_join`]) and handed to the central loop, which
+/// appends it to the [`Job`] and starts feeding it pending work.
+pub(crate) struct Joiner<S> {
+    /// The host's label, used to attribute its observability events.
+    pub(crate) label: String,
+    /// The send half, for issuing `Assign`/`Shutdown`.
+    pub(crate) tx: Sender<S>,
+    /// The receive half, drained by a reader once the agent is spliced in.
+    pub(crate) rx: Receiver<S>,
+    /// The agent's advertised concurrency (its `slots`).
+    pub(crate) capacity: usize,
+}
+
+/// Handshake one agent that is joining a run already in progress, so it can be
+/// spliced in. Mirrors the per-agent steps of [`connect_agents`] for a single
+/// connection: greet it, learn its capacity, and (if it is a relay) activate all
+/// of its own children, since a single late joiner has no layer to dedup against.
+///
+/// Used by the R6.1 splice test today; the R6.2 rejoin driver becomes its
+/// production caller (which is when the `cfg(test)` gate comes off).
+///
+/// # Errors
+/// Returns an error on a handshake or transport failure.
+#[cfg(test)]
+pub(crate) async fn handshake_join<S>(
+    label: String,
+    conn: Connection<S>,
+    fn_key: &str,
+) -> std::io::Result<Joiner<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut tx, mut rx) = conn.split();
+    tx.send(&ToAgent::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        fn_key: fn_key.to_string(),
+    })
+    .await?;
+    let capacity = match rx.recv::<FromAgent>().await? {
+        Some(FromAgent::Ready { slots }) => slots,
+        Some(FromAgent::Discovered { children }) => {
+            let active = children.iter().map(|child| child.label.clone()).collect();
+            tx.send(&ToAgent::Activate { active }).await?;
+            match rx.recv::<FromAgent>().await? {
+                Some(FromAgent::Ready { slots }) => slots,
+                other => return Err(unexpected("Ready after Activate", other.as_ref())),
+            }
+        }
+        other => return Err(unexpected("Ready or Discovered", other.as_ref())),
+    };
+    Ok(Joiner {
+        label,
+        tx,
+        rx,
+        capacity,
+    })
+}
+
 /// Handshake with every agent and spawn its reader task. A leaf replies `Ready`;
 /// a relay replies `Discovered`, is told which children to `Activate` by `policy`,
 /// then replies `Ready` with its active capacity. Children a relay does not
@@ -237,6 +297,12 @@ where
 /// Mutable scheduling state for one run.
 struct Job<S> {
     senders: Vec<Sender<S>>,
+    /// Each agent's label, used to attribute its observability events. Grows in
+    /// lockstep with the other per-agent vectors when a node joins mid-run.
+    labels: Vec<String>,
+    /// One reader task per agent, draining its receive half into the central
+    /// event channel. A joining agent appends its reader here too.
+    readers: Vec<JoinHandle<()>>,
     /// How many tasks each agent is currently running (kept below `capacity`).
     in_flight: Vec<usize>,
     /// How many tasks each agent may hold in flight at once (its advertised
@@ -341,16 +407,15 @@ where
 
     /// Fold one event from the central channel into the run: record a terminal,
     /// surface a task or subtree event, fold in a promoted relay's larger
-    /// capacity, or react to a lost agent by rerouting onto standbys. Returns an
-    /// error on a protocol violation or when no agent is left to make progress.
-    async fn on_event(
-        &mut self,
-        event: Option<Event>,
-        labels: &[String],
-        events: &dyn EventSink,
-    ) -> std::io::Result<()> {
+    /// capacity, or react to a lost agent by rerouting onto standbys. The caller
+    /// decides when to give up (no survivor and no node still able to join), so
+    /// this only requeues and reroutes a lost agent's work.
+    ///
+    /// # Errors
+    /// Returns an error on a protocol violation or a transport failure.
+    async fn on_event(&mut self, event: Event, events: &dyn EventSink) -> std::io::Result<()> {
         match event {
-            Some(Event::Message(_, FromAgent::Ready { .. } | FromAgent::Discovered { .. })) => {
+            Event::Message(_, FromAgent::Ready { .. } | FromAgent::Discovered { .. }) => {
                 // Ready and Discovered are handshake messages, so seeing one on
                 // the live channel is a protocol error.
                 return Err(std::io::Error::new(
@@ -360,61 +425,46 @@ where
             }
             // A promoted relay reports its larger capacity after reroute: fold it
             // in and feed it the requeued work, marking it working if it took any.
-            Some(Event::Message(agent, FromAgent::Capacity { slots })) => {
+            Event::Message(agent, FromAgent::Capacity { slots }) => {
                 self.capacity[agent] = slots;
                 self.assign_up_to_capacity(agent).await?;
                 if self.in_flight[agent] > 0 {
-                    events.emit(Obs::node(&labels[agent], NodeState::Working));
+                    events.emit(Obs::node(&self.labels[agent], NodeState::Working));
                 }
             }
-            Some(Event::Message(_, FromAgent::Started { task_id })) => {
+            Event::Message(_, FromAgent::Started { task_id }) => {
                 if let Some((agent, _)) = self.assigned.get(&task_id) {
                     events.emit(Obs::TaskStarted {
-                        host: labels[*agent].clone(),
+                        host: self.labels[*agent].clone(),
                         task: task_id,
                     });
                 }
             }
-            Some(Event::Message(_, FromAgent::Completed { task_id, output })) => {
+            Event::Message(_, FromAgent::Completed { task_id, output }) => {
                 // The raw bytes are kept as-is; decoding happens in the typed
                 // layer, so a `Completed` is `ok` at the protocol level here.
-                self.finish(task_id, Ok(output), true, labels, events)
-                    .await?;
+                self.finish(task_id, Ok(output), true, events).await?;
             }
-            Some(Event::Message(_, FromAgent::Failed { task_id, error })) => {
-                self.finish(task_id, Err(error), false, labels, events)
-                    .await?;
+            Event::Message(_, FromAgent::Failed { task_id, error }) => {
+                self.finish(task_id, Err(error), false, events).await?;
             }
             // A subtree event from a relay child: prefix its host with that
             // child's label so it carries a full path from the root, then
             // re-emit it so the whole tree surfaces in the run's event stream.
-            Some(Event::Message(agent, FromAgent::Observe(mut event))) => {
-                event.prefix_host(&labels[agent]);
+            Event::Message(agent, FromAgent::Observe(mut event)) => {
+                event.prefix_host(&self.labels[agent]);
                 events.emit(event);
             }
             // A dropped or erroring agent is abandoned: mark it lost, requeue its
             // in-flight tasks, promote standbys so a survivor takes over the
-            // orphaned subtree, and feed the survivors. The run fails only when no
-            // agent is left.
-            Some(Event::Lost(agent)) => {
-                events.emit(Obs::node(&labels[agent], NodeState::Lost));
+            // orphaned subtree, and feed the survivors.
+            Event::Lost(agent) => {
+                events.emit(Obs::node(&self.labels[agent], NodeState::Lost));
                 self.requeue_lost(agent);
-                if !self.any_alive() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionReset,
-                        "every agent was lost before the job completed",
-                    ));
-                }
                 self.reroute().await?;
                 for survivor in 0..self.senders.len() {
                     self.assign_up_to_capacity(survivor).await?;
                 }
-            }
-            None => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionReset,
-                    "all agents gone before completion",
-                ));
             }
         }
         Ok(())
@@ -427,18 +477,17 @@ where
         task_id: TaskId,
         result: Result<Vec<u8>, String>,
         ok: bool,
-        labels: &[String],
         events: &dyn EventSink,
     ) -> std::io::Result<()> {
         if let Some(agent) = self.record(task_id, result) {
             events.emit(Obs::TaskFinished {
-                host: labels[agent].clone(),
+                host: self.labels[agent].clone(),
                 task: task_id,
                 ok,
             });
             self.assign_up_to_capacity(agent).await?;
             if self.in_flight[agent] == 0 {
-                events.emit(Obs::node(&labels[agent], NodeState::Idle));
+                events.emit(Obs::node(&self.labels[agent], NodeState::Idle));
             }
         }
         Ok(())
@@ -475,6 +524,8 @@ pub(crate) fn decode_output<O: DeserializeOwned>(
 ///
 /// The byte-level core: agnostic to the input and output types, so a type-erased
 /// fleet (see [`crate::fleet`]) can drive it. [`run_job`] is the typed wrapper.
+/// This is the static-membership form: it runs with the agents it starts with
+/// and never absorbs a new one. [`run_job_raw_with_joins`] is the elastic core.
 ///
 /// # Errors
 /// Returns an error on a handshake or transport failure, or if every agent is
@@ -485,6 +536,44 @@ pub(crate) async fn run_job_raw<S>(
     payloads: Vec<Vec<u8>>,
     agent_latencies: &[u64],
     require_redundancy: bool,
+    events: &dyn EventSink,
+) -> std::io::Result<Vec<Result<Vec<u8>, String>>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    // No node can join: an immediately-closed channel makes the elastic core
+    // behave exactly like the static run.
+    let (joins_tx, joins_rx) = mpsc::unbounded_channel::<Joiner<S>>();
+    drop(joins_tx);
+    run_job_raw_with_joins(
+        agents,
+        fn_key,
+        payloads,
+        agent_latencies,
+        require_redundancy,
+        joins_rx,
+        events,
+    )
+    .await
+}
+
+/// Run one job to completion, absorbing nodes that join mid-run (R6 elastic
+/// membership). Identical to [`run_job_raw`] but for the `joins` channel: each
+/// [`Joiner`] sent on it (by the rejoin driver, or a test) is spliced into the
+/// live schedule and starts pulling pending work. The run ends successfully when
+/// every task is done, and fails only when no agent is alive AND the joins
+/// channel has closed (no node can still join).
+///
+/// # Errors
+/// Returns an error on a handshake or transport failure, or if every agent is
+/// lost with no node left able to join before the job completes.
+pub(crate) async fn run_job_raw_with_joins<S>(
+    agents: Vec<(String, Connection<S>)>,
+    fn_key: &str,
+    payloads: Vec<Vec<u8>>,
+    agent_latencies: &[u64],
+    require_redundancy: bool,
+    mut joins: mpsc::UnboundedReceiver<Joiner<S>>,
     events: &dyn EventSink,
 ) -> std::io::Result<Vec<Result<Vec<u8>, String>>>
 where
@@ -508,11 +597,12 @@ where
         &ActivationPolicy::DedupById,
     )
     .await?;
-    drop(events_tx); // the channel ends when every reader does
 
     let agent_count = senders.len();
     let mut job: Job<S> = Job {
         senders,
+        labels,
+        readers,
         in_flight: vec![0; agent_count],
         capacity,
         standbys,
@@ -525,24 +615,67 @@ where
     };
 
     events.emit(Obs::RunStarted { tasks: num_tasks });
-    for (agent, label) in labels.iter().enumerate() {
+    for agent in 0..job.senders.len() {
         job.assign_up_to_capacity(agent).await?;
         if job.in_flight[agent] > 0 {
-            events.emit(Obs::node(label, NodeState::Working));
+            events.emit(Obs::node(&job.labels[agent], NodeState::Working));
         }
     }
 
-    while job.remaining > 0 {
-        let event = events_rx.recv().await;
-        job.on_event(event, &labels, events).await?;
+    // The loop holds `events_tx` so it can spawn a reader for any node that joins;
+    // a closed `joins` channel means no more nodes can join, which is how a run
+    // with no rejoin driver (and the static [`run_job_raw`]) behaves.
+    let mut joins_open = true;
+    loop {
+        if job.remaining == 0 {
+            break;
+        }
+        if !job.any_alive() && !joins_open {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "every agent was lost and no node could join before the job completed",
+            ));
+        }
+        tokio::select! {
+            maybe_event = events_rx.recv() => {
+                let event = maybe_event
+                    .expect("the loop holds an events sender, so the channel stays open");
+                job.on_event(event, events).await?;
+            }
+            maybe_join = joins.recv(), if joins_open => match maybe_join {
+                // Splice a node that joined mid-run into the live schedule: append
+                // it to every per-agent vector (agents are only appended, never
+                // removed, so existing indices stay valid), spawn its reader, then
+                // feed it pending work and mark it working if it took any.
+                Some(joiner) => {
+                    let agent = job.senders.len();
+                    job.senders.push(joiner.tx);
+                    job.labels.push(joiner.label);
+                    job.capacity.push(joiner.capacity);
+                    // A late joiner activates all its own children, so none standby.
+                    job.standbys.push(Vec::new());
+                    job.alive.push(true);
+                    job.in_flight.push(0);
+                    job.readers
+                        .push(spawn_reader(joiner.rx, agent, events_tx.clone()));
+                    job.assign_up_to_capacity(agent).await?;
+                    if job.in_flight[agent] > 0 {
+                        events.emit(Obs::node(&job.labels[agent], NodeState::Working));
+                    }
+                }
+                None => joins_open = false,
+            },
+        }
     }
 
-    for (agent, label) in labels.iter().enumerate() {
+    // Release the loop's events sender so the trailing drain ends once the readers
+    // do, then shut the live agents down and complete the tree view.
+    drop(events_tx);
+    for agent in 0..job.senders.len() {
         if job.alive[agent] {
-            events.emit(Obs::node(label, NodeState::Done));
+            events.emit(Obs::node(&job.labels[agent], NodeState::Done));
         }
     }
-
     for agent in 0..job.senders.len() {
         if job.alive[agent] {
             let _ = job.senders[agent].send(&ToAgent::Shutdown).await;
@@ -553,11 +686,11 @@ where
     // re-emitting these completes the tree view. Other late messages are ignored.
     while let Some(event) = events_rx.recv().await {
         if let Event::Message(agent, FromAgent::Observe(mut observed)) = event {
-            observed.prefix_host(&labels[agent]);
+            observed.prefix_host(&job.labels[agent]);
             events.emit(observed);
         }
     }
-    for reader in readers {
+    for reader in std::mem::take(&mut job.readers) {
         let _ = reader.await;
     }
 
@@ -1168,5 +1301,173 @@ mod tests {
         )
         .await;
         assert!(res.is_err());
+    }
+
+    /// A handler slow enough that work is still pending when a node joins, so the
+    /// join lands mid-run rather than after the original agent has drained it all.
+    fn slow_double(x: u32) -> u32 {
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        x * 2
+    }
+
+    #[tokio::test]
+    async fn a_node_joining_mid_run_takes_pending_work() {
+        use crate::observability::RunState;
+        use crate::testing::EventRecorder;
+        use tokio::sync::mpsc;
+
+        // One slow agent starts the run; a second node is spliced in over the
+        // joins channel partway through and must pull some of the pending tasks,
+        // with every result still produced exactly once and in input order.
+        let (joins_tx, joins_rx) = mpsc::unbounded_channel();
+        let (orig_client, orig_server) = connection_pair(256);
+        tokio::spawn(serve(
+            orig_server,
+            Registry::new().with("slow", handler(slow_double)),
+        ));
+        let recorder = EventRecorder::default();
+        let agents = vec![("orig".to_string(), orig_client)];
+        let payloads = super::serialize_inputs(&(0..30u32).collect::<Vec<_>>()).unwrap();
+
+        let run = super::run_job_raw_with_joins(
+            agents,
+            "slow",
+            payloads,
+            &[],
+            false,
+            joins_rx,
+            &recorder,
+        );
+        let driver = async {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let (join_client, join_server) = connection_pair(256);
+            tokio::spawn(serve(
+                join_server,
+                Registry::new().with("slow", handler(slow_double)),
+            ));
+            let joiner = super::handshake_join("joiner".to_string(), join_client, "slow")
+                .await
+                .unwrap();
+            joins_tx.send(joiner).unwrap();
+            drop(joins_tx);
+        };
+        let (raw, ()) = tokio::join!(run, driver);
+
+        let outs: Vec<Result<u32, String>> = raw
+            .unwrap()
+            .into_iter()
+            .map(super::decode_output::<u32>)
+            .collect();
+        assert_eq!(outs, (0..30u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+
+        let mut state = RunState::default();
+        for event in &recorder.events() {
+            state.apply(event);
+        }
+        assert!(
+            state.nodes["joiner"].completed >= 1,
+            "the joined node should have run at least one task"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relay_node_can_join_mid_run() {
+        use crate::protocol::ChildAd;
+        use tokio::sync::mpsc;
+
+        // A joining node may itself be a relay: it replies `Discovered`, is told to
+        // activate all of its own children, then readies. handshake_join must drive
+        // that two-step handshake, and the spliced relay must run pending tasks.
+        let (joins_tx, joins_rx) = mpsc::unbounded_channel();
+        let (orig_client, orig_server) = connection_pair(256);
+        tokio::spawn(serve(
+            orig_server,
+            Registry::new().with("slow", handler(slow_double)),
+        ));
+        let agents = vec![("orig".to_string(), orig_client)];
+        let payloads = super::serialize_inputs(&(0..20u32).collect::<Vec<_>>()).unwrap();
+
+        let run = super::run_job_raw_with_joins(
+            agents,
+            "slow",
+            payloads,
+            &[],
+            false,
+            joins_rx,
+            &NoopSink,
+        );
+        let driver = async {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let (relay_client, relay_server) = connection_pair(256);
+            // A fake relay: describes one child, accepts the activate, readies, then
+            // completes every task it is assigned until shut down.
+            tokio::spawn(async move {
+                let (mut tx, mut rx) = relay_server.split();
+                let _hello = rx.recv::<ToAgent>().await;
+                tx.send(&FromAgent::Discovered {
+                    children: vec![ChildAd {
+                        label: "child".to_string(),
+                        id: "child".to_string(),
+                        slots: 1,
+                        latency_us: 0,
+                    }],
+                })
+                .await
+                .unwrap();
+                let _activate = rx.recv::<ToAgent>().await; // Activate all children
+                tx.send(&FromAgent::Ready { slots: 1 }).await.unwrap();
+                // Complete each assigned task; anything else (Shutdown, a clean
+                // end, or a read error) stops the relay, dropping its connection
+                // so the coordinator's drain ends.
+                while let Ok(Some(ToAgent::Assign { task_id, .. })) = rx.recv::<ToAgent>().await {
+                    tx.send(&FromAgent::Completed {
+                        task_id,
+                        output: postcard::to_allocvec(&0u32).unwrap(),
+                    })
+                    .await
+                    .unwrap();
+                }
+            });
+            let joiner = super::handshake_join("relay".to_string(), relay_client, "slow")
+                .await
+                .unwrap();
+            joins_tx.send(joiner).unwrap();
+            drop(joins_tx);
+        };
+        let (raw, ()) = tokio::join!(run, driver);
+        // Every task completes (the splice ran a relay joiner end to end).
+        assert_eq!(raw.unwrap().len(), 20);
+    }
+
+    #[tokio::test]
+    async fn a_run_waits_for_a_join_then_errors_when_the_channel_closes_with_no_survivor() {
+        use tokio::sync::mpsc;
+
+        // The only agent readies, then dies leaving work pending. With the joins
+        // channel still open the run must wait (a node might yet join), and only
+        // once the channel closes with no survivor does it give up.
+        let (joins_tx, joins_rx) =
+            mpsc::unbounded_channel::<super::Joiner<tokio::io::DuplexStream>>();
+        let (client, server) = connection_pair(256);
+        tokio::spawn(async move {
+            let (mut tx, mut rx) = server.split();
+            let _hello = rx.recv::<ToAgent>().await;
+            tx.send(&FromAgent::Ready { slots: 1 }).await.unwrap();
+            // Accept the first task, then drop: the agent dies mid-task, leaving
+            // work pending and no survivor.
+            let _assign = rx.recv::<ToAgent>().await;
+        });
+        let agents = vec![("dies".to_string(), client)];
+        let payloads = super::serialize_inputs(&(0..4u32).collect::<Vec<_>>()).unwrap();
+
+        let run =
+            super::run_job_raw_with_joins(agents, "id", payloads, &[], false, joins_rx, &NoopSink);
+        let driver = async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            drop(joins_tx); // no node ever joins; closing the channel ends the wait
+        };
+        let (res, ()) = tokio::join!(run, driver);
+        let err = res.unwrap_err();
+        assert!(err.to_string().contains("no node could join"), "{err}");
     }
 }
