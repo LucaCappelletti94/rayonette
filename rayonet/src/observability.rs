@@ -38,6 +38,25 @@ pub enum NodeState {
     Lost,
 }
 
+/// A point-in-time sample of a node's live resource use, reported by the agent.
+///
+/// Percentages are whole numbers in `0..=100` so the type stays `Eq` (and small on
+/// the wire), matching how the rest of the event stream avoids floats. GPU fields
+/// are absent when the host has no GPU (or no `nvidia-smi`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeTelemetry {
+    /// CPU utilisation since the previous sample, as a percentage.
+    pub cpu_pct: u8,
+    /// Memory in use, as a percentage of total.
+    pub mem_pct: u8,
+    /// GPU compute utilisation, if a GPU was sampled.
+    pub gpu_pct: Option<u8>,
+    /// GPU memory utilisation, if a GPU was sampled.
+    pub gpu_mem_pct: Option<u8>,
+    /// Tasks running on the node at the moment of the sample.
+    pub in_flight: usize,
+}
+
 /// One observability event. The stream carries node lifecycle and task
 /// lifecycle; log lines and richer progress are deferred.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +104,15 @@ pub enum Event {
         /// Whether the task completed successfully.
         ok: bool,
     },
+    /// A live resource sample an agent reported about itself. The agent sends it
+    /// with an empty host; each hop up the tree prefixes the sender's label, so it
+    /// arrives carrying the node's path (see [`Event::prefix_host`]).
+    Telemetry {
+        /// The host the sample is about (its path id, once prefixed).
+        host: String,
+        /// The sampled utilisation.
+        telemetry: NodeTelemetry,
+    },
 }
 
 impl Event {
@@ -124,10 +152,17 @@ impl Event {
             Self::Node { host, .. }
             | Self::Profiled { host, .. }
             | Self::TaskStarted { host, .. }
-            | Self::TaskFinished { host, .. } => host,
+            | Self::TaskFinished { host, .. }
+            | Self::Telemetry { host, .. } => host,
             Self::RunStarted { .. } => return,
         };
-        *host = format!("{prefix}/{host}");
+        // An agent reports its own telemetry with an empty host, so the first hop's
+        // prefix becomes the whole label rather than leaving a leading slash.
+        *host = if host.is_empty() {
+            prefix.to_string()
+        } else {
+            format!("{prefix}/{host}")
+        };
     }
 }
 
@@ -242,6 +277,8 @@ pub struct NodeView {
     /// The measured latency (microseconds) of the link from this node's parent,
     /// once profiled.
     pub latency_us: Option<u64>,
+    /// The node's most recent live resource sample, once it has reported one.
+    pub telemetry: Option<NodeTelemetry>,
 }
 
 impl RunState {
@@ -267,6 +304,9 @@ impl RunState {
             }
             Event::TaskStarted { host, .. } => {
                 self.node(host);
+            }
+            Event::Telemetry { host, telemetry } => {
+                self.node(host).telemetry = Some(*telemetry);
             }
             Event::TaskFinished { host, ok, .. } => {
                 self.node(host).completed += 1;
@@ -346,6 +386,7 @@ impl RunState {
             role: None,
             id: None,
             latency_us: None,
+            telemetry: None,
         })
     }
 }
@@ -388,7 +429,7 @@ impl PlainRenderer {
                 profile.ram_mb,
                 profile.gpus.len()
             )),
-            Event::TaskStarted { .. } => None,
+            Event::TaskStarted { .. } | Event::Telemetry { .. } => None,
             Event::TaskFinished { .. } => Some(format!(
                 "progress: {}/{}",
                 self.state.completed + self.state.failed,
@@ -664,6 +705,43 @@ mod tests {
             let back: Event = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(&back, event);
         }
+    }
+
+    #[test]
+    fn telemetry_reduces_and_prefixes() {
+        use super::NodeTelemetry;
+        let sample = NodeTelemetry {
+            cpu_pct: 73,
+            mem_pct: 41,
+            gpu_pct: Some(88),
+            gpu_mem_pct: Some(50),
+            in_flight: 2,
+        };
+
+        // A node's latest sample lands on its view.
+        let mut state = RunState::default();
+        state.apply(&Event::Telemetry {
+            host: "relay/leaf".to_string(),
+            telemetry: sample,
+        });
+        assert_eq!(state.nodes["relay/leaf"].telemetry, Some(sample));
+
+        // A relay prefixes an agent's self-reported (empty-host) telemetry into a
+        // path rather than leaving a leading slash, then the next hop extends it.
+        let mut event = Event::Telemetry {
+            host: String::new(),
+            telemetry: sample,
+        };
+        event.prefix_host("leaf");
+        event.prefix_host("relay");
+        let Event::Telemetry { host, .. } = &event else {
+            unreachable!("still a telemetry event")
+        };
+        assert_eq!(host, "relay/leaf");
+
+        // It round-trips on the wire.
+        let bytes = postcard::to_allocvec(&event).unwrap();
+        assert_eq!(postcard::from_bytes::<Event>(&bytes).unwrap(), event);
     }
 
     #[test]

@@ -9,12 +9,36 @@
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::framing::{Connection, Receiver};
+use crate::observability::{Event, NodeTelemetry};
 use crate::protocol::{FromAgent, ToAgent, PROTOCOL_VERSION};
+use crate::telemetry::Sampler;
+
+/// Minimum gap between an agent's self-reported telemetry samples. Sampling can
+/// spawn `nvidia-smi`, so it is throttled rather than run on every task, which
+/// would add latency to the task hot path and distort scheduling.
+const TELEMETRY_INTERVAL: Duration = Duration::from_millis(250);
+
+/// A fresh telemetry sample if at least [`TELEMETRY_INTERVAL`] has passed since
+/// `last` (advancing it to `now`), else `None`. Keeping the clock a parameter
+/// makes the throttle deterministic to test.
+fn due_sample(
+    sampler: &mut Sampler,
+    last: &mut Instant,
+    now: Instant,
+    in_flight: usize,
+) -> Option<NodeTelemetry> {
+    if now.duration_since(*last) < TELEMETRY_INTERVAL {
+        return None;
+    }
+    *last = now;
+    Some(sampler.sample(in_flight))
+}
 
 /// A type-erased task: a postcard-encoded input in, a postcard-encoded output
 /// out, or an error string (a decode failure or a captured panic message).
@@ -165,12 +189,28 @@ where
     // A leaf runs one task at a time, so it advertises a single slot.
     tx.send(&FromAgent::Ready { slots: 1 }).await?;
 
+    let mut sampler = Sampler::new();
+    let mut last_sample = Instant::now();
+
     // One task at a time: read an assignment, run it on the blocking pool, and
     // report its outcome before reading the next message.
     while let Some(message) = rx.recv::<ToAgent>().await? {
         match message {
             ToAgent::Assign { task_id, payload } => {
                 tx.send(&FromAgent::Started { task_id }).await?;
+                // Report a throttled sample while the task runs and once it ends, so
+                // the viewer sees the node busy and the CPU delta the task drove
+                // without sampling (which can spawn nvidia-smi) on every task. The
+                // send is inlined rather than a helper: a generic send wrapper would
+                // monomorphize per stream and its unexercised instances would fail
+                // the function-coverage gate.
+                if let Some(telemetry) =
+                    due_sample(&mut sampler, &mut last_sample, Instant::now(), 1)
+                {
+                    let host = String::new();
+                    tx.send(&FromAgent::Observe(Event::Telemetry { host, telemetry }))
+                        .await?;
+                }
                 let handler = handler.clone();
                 // The handler catches panics internally, so the blocking task
                 // never panics and its join cannot fail.
@@ -180,6 +220,13 @@ where
                 match outcome {
                     Ok(output) => tx.send(&FromAgent::Completed { task_id, output }).await?,
                     Err(error) => tx.send(&FromAgent::Failed { task_id, error }).await?,
+                }
+                if let Some(telemetry) =
+                    due_sample(&mut sampler, &mut last_sample, Instant::now(), 0)
+                {
+                    let host = String::new();
+                    tx.send(&FromAgent::Observe(Event::Telemetry { host, telemetry }))
+                        .await?;
                 }
             }
             ToAgent::Shutdown => break,
@@ -200,9 +247,83 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{handler, serve, Registry};
+    use super::{due_sample, handler, serve, Registry, Sampler, TELEMETRY_INTERVAL};
+    use crate::framing::Receiver;
+    use crate::observability::Event;
     use crate::protocol::{FromAgent, ToAgent, PROTOCOL_VERSION};
     use crate::testing::connection_pair;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncRead, AsyncWrite};
+
+    /// Read the next message that is not a self-reported telemetry sample, which a
+    /// serving agent now interleaves around each task. `None` at end of stream.
+    async fn next_report<R>(rx: &mut Receiver<R>) -> Option<FromAgent>
+    where
+        R: AsyncRead + AsyncWrite + Unpin,
+    {
+        loop {
+            match rx.recv::<FromAgent>().await.unwrap() {
+                Some(FromAgent::Observe(_)) => {}
+                other => return other,
+            }
+        }
+    }
+
+    #[test]
+    fn telemetry_sampling_is_throttled() {
+        let mut sampler = Sampler::new();
+        let base = Instant::now();
+        let mut last = base;
+        // Just sampled: another sample at the same instant is throttled away.
+        assert!(due_sample(&mut sampler, &mut last, base, 1).is_none());
+        // Once the interval has elapsed a sample is due, and the clock advances.
+        let later = base + TELEMETRY_INTERVAL;
+        assert!(due_sample(&mut sampler, &mut last, later, 0).is_some());
+        assert_eq!(last, later);
+    }
+
+    #[tokio::test]
+    async fn serve_reports_throttled_telemetry_around_a_long_task() {
+        let (client, server) = connection_pair(256);
+        let registry = Registry::new().with(
+            "slow",
+            handler(|x: u32| {
+                std::thread::sleep(Duration::from_millis(300));
+                x
+            }),
+        );
+        let agent = serve(server, registry);
+        let driver = async {
+            let (mut tx, mut rx) = client.split();
+            tx.send(&ToAgent::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                fn_key: "slow".to_string(),
+            })
+            .await
+            .unwrap();
+            let _ready: FromAgent = rx.recv().await.unwrap().unwrap();
+            tx.send(&ToAgent::Assign {
+                task_id: 0,
+                payload: postcard::to_allocvec(&5u32).unwrap(),
+            })
+            .await
+            .unwrap();
+            // The task runs longer than the throttle interval, so a telemetry
+            // sample is reported once it finishes.
+            let mut saw_telemetry = false;
+            for _ in 0..4 {
+                let message = rx.recv::<FromAgent>().await.unwrap().unwrap();
+                if matches!(message, FromAgent::Observe(Event::Telemetry { .. })) {
+                    saw_telemetry = true;
+                    break;
+                }
+            }
+            assert!(saw_telemetry, "a long task triggers a telemetry sample");
+            tx.send(&ToAgent::Shutdown).await.unwrap();
+        };
+        let (agent_res, ()) = tokio::join!(agent, driver);
+        agent_res.unwrap();
+    }
 
     #[tokio::test]
     async fn runs_a_task_and_reports_completion() {
@@ -230,10 +351,10 @@ mod tests {
             .await
             .unwrap();
 
-            let started: FromAgent = rx.recv().await.unwrap().unwrap();
+            let started = next_report(&mut rx).await.unwrap();
             assert_eq!(started, FromAgent::Started { task_id: 0 });
 
-            let completed: FromAgent = rx.recv().await.unwrap().unwrap();
+            let completed = next_report(&mut rx).await.unwrap();
             assert_eq!(
                 completed,
                 FromAgent::Completed {
@@ -287,7 +408,7 @@ mod tests {
             let mut terminals: Vec<FromAgent> = Vec::new();
             while terminals.len() < 2 {
                 let msg = rx.recv::<FromAgent>().await.unwrap().unwrap();
-                if !matches!(msg, FromAgent::Started { .. }) {
+                if !matches!(msg, FromAgent::Started { .. } | FromAgent::Observe(_)) {
                     terminals.push(msg);
                 }
             }
@@ -313,7 +434,7 @@ mod tests {
         let registry = Registry::new().with(
             "slow",
             handler(|x: u32| {
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::thread::sleep(Duration::from_millis(20));
                 x + 1
             }),
         );
@@ -339,9 +460,9 @@ mod tests {
             tx.send(&ToAgent::Shutdown).await.unwrap();
 
             // The in-flight task must still complete before the agent exits.
-            let started: FromAgent = rx.recv().await.unwrap().unwrap();
+            let started = next_report(&mut rx).await.unwrap();
             assert_eq!(started, FromAgent::Started { task_id: 0 });
-            let completed: FromAgent = rx.recv().await.unwrap().unwrap();
+            let completed = next_report(&mut rx).await.unwrap();
             assert_eq!(
                 completed,
                 FromAgent::Completed {
@@ -349,8 +470,8 @@ mod tests {
                     output: postcard::to_allocvec(&42u32).unwrap(),
                 }
             );
-            // Then a clean end-of-stream.
-            assert!(rx.recv::<FromAgent>().await.unwrap().is_none());
+            // Then a clean end-of-stream, past the final telemetry sample.
+            assert!(next_report(&mut rx).await.is_none());
         };
 
         let (agent_res, ()) = tokio::join!(agent, driver);

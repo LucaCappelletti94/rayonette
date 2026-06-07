@@ -17,7 +17,7 @@ use ratatui::Frame;
 
 use crate::graph::{Metric, Topology};
 use crate::layout::positions;
-use crate::observability::{leaf_of, parent_of, Event, NodeState, RunState};
+use crate::observability::{leaf_of, parent_of, Event, NodeState, NodeTelemetry, RunState};
 
 /// The most recent event-log lines [`App`] keeps for the log panel.
 const LOG_CAPACITY: usize = 256;
@@ -182,7 +182,8 @@ fn log_line(event: &Event, state: &RunState) -> Option<String> {
         Event::RunStarted { tasks } => Some(format!("run started: {tasks} tasks")),
         Event::Node { host, state } => Some(format!("{}: {state:?}", leaf_of(host))),
         Event::Profiled { host, role, .. } => Some(format!("{}: {role:?}", leaf_of(host))),
-        Event::TaskStarted { .. } => None,
+        // Telemetry and task starts update panels, not the rolling log.
+        Event::TaskStarted { .. } | Event::Telemetry { .. } => None,
         Event::TaskFinished { .. } => Some(format!(
             "progress {}/{}",
             state.completed + state.failed,
@@ -387,33 +388,48 @@ fn node_detail_lines(state: &RunState, id: &str) -> Vec<Line<'static>> {
         .map(|view| view.completed)
         .sum();
 
-    vec![
+    let role = view.role.expect("a profiled node has a role");
+    let node_state = vertex_state(state, id).expect("a selected vertex has a state");
+    let latency = microseconds_to_millis(view.latency_us.expect("a profiled node has a latency"));
+    // Pairs of fields share a line, so the static detail leaves room below for the
+    // live telemetry within the panel's height.
+    let mut lines = vec![
         Line::from(format!("node  {label}")),
         Line::from(format!("id    {id:.8}")),
+        Line::from(format!("role  {role:?}  state {node_state:?}")),
         Line::from(format!(
-            "role  {:?}",
-            view.role.expect("a profiled node has a role")
+            "spof  {}  redund {}",
+            yes_no(topology.single_points_of_failure().contains(id)),
+            yes_no(topology.is_redundant(id)),
         )),
+        Line::from(format!("done  {completed}  lat {latency:.1} ms")),
+        Line::from(format!("os    {:?}  arch {}", profile.os, profile.arch.isa)),
         Line::from(format!(
-            "state {:?}",
-            vertex_state(state, id).expect("a selected vertex has a state")
+            "cores {}  ram {} MB  gpus {}",
+            profile.cores,
+            profile.ram_mb,
+            profile.gpus.len(),
         )),
-        Line::from(format!(
-            "spof  {}",
-            yes_no(topology.single_points_of_failure().contains(id))
-        )),
-        Line::from(format!("redund {}", yes_no(topology.is_redundant(id)))),
-        Line::from(format!("done  {completed}")),
-        Line::from(format!(
-            "lat   {:.1} ms",
-            microseconds_to_millis(view.latency_us.expect("a profiled node has a latency"))
-        )),
-        Line::from(format!("os    {:?}", profile.os)),
-        Line::from(format!("arch  {}", profile.arch.isa)),
-        Line::from(format!("cores {}", profile.cores)),
-        Line::from(format!("ram   {} MB", profile.ram_mb)),
-        Line::from(format!("gpus  {}", profile.gpus.len())),
-    ]
+    ];
+    lines.extend(telemetry_lines(view.telemetry.as_ref()));
+    lines
+}
+
+/// The live-utilisation lines for the detail panel, or a single "not available"
+/// line for a node that has not reported a sample (or cannot, off Linux).
+fn telemetry_lines(telemetry: Option<&NodeTelemetry>) -> Vec<Line<'static>> {
+    let Some(sample) = telemetry else {
+        return vec![Line::from("util  n/a")];
+    };
+    let mut lines = vec![
+        Line::from(format!("cpu   {}%", sample.cpu_pct)),
+        Line::from(format!("mem   {}%", sample.mem_pct)),
+    ];
+    if let Some(gpu) = sample.gpu_pct {
+        lines.push(Line::from(format!("gpu   {gpu}%")));
+    }
+    lines.push(Line::from(format!("tasks {} running", sample.in_flight)));
+    lines
 }
 
 /// The detail lines for the hovered link: its endpoints, measured latency, and
@@ -1277,7 +1293,47 @@ mod tests {
         assert!(text.contains("node  gatewayA"), "{text}");
         assert!(text.contains("Compute"), "{text}");
         assert!(text.contains("cores 8"), "{text}");
-        assert!(text.contains("arch  x86_64"), "{text}");
+        assert!(text.contains("arch x86_64"), "{text}");
+    }
+
+    #[test]
+    fn the_detail_panel_shows_live_telemetry() {
+        use crate::observability::NodeTelemetry;
+        // Without a sample the panel says utilisation is unavailable.
+        let mut app = diamond();
+        app.selected = Some("idA".to_string());
+        assert!(render(&app).join("\n").contains("util  n/a"));
+
+        // A sample with a GPU shows CPU, memory, GPU, and the running task count.
+        app.apply(&Event::Telemetry {
+            host: "gatewayA".to_string(),
+            telemetry: NodeTelemetry {
+                cpu_pct: 64,
+                mem_pct: 30,
+                gpu_pct: Some(91),
+                gpu_mem_pct: Some(45),
+                in_flight: 1,
+            },
+        });
+        let with_gpu = render(&app).join("\n");
+        assert!(with_gpu.contains("cpu   64%"), "{with_gpu}");
+        assert!(with_gpu.contains("gpu   91%"), "{with_gpu}");
+        assert!(with_gpu.contains("tasks 1 running"), "{with_gpu}");
+
+        // A sample without a GPU omits the GPU line.
+        app.apply(&Event::Telemetry {
+            host: "gatewayA".to_string(),
+            telemetry: NodeTelemetry {
+                cpu_pct: 10,
+                mem_pct: 20,
+                gpu_pct: None,
+                gpu_mem_pct: None,
+                in_flight: 0,
+            },
+        });
+        let no_gpu = render(&app).join("\n");
+        assert!(no_gpu.contains("cpu   10%"), "{no_gpu}");
+        assert!(!no_gpu.contains("gpu  "), "{no_gpu}");
     }
 
     #[test]

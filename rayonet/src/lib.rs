@@ -19,6 +19,7 @@ pub mod protocol;
 pub mod provisioning;
 pub mod relay;
 pub mod ssh;
+pub mod telemetry;
 pub mod testing;
 #[cfg(feature = "tui")]
 pub mod tui;
