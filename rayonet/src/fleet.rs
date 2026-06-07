@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 use crate::agent::fn_key;
 use crate::capability::{pred::Predicate, Filter, NodeProfile, Role};
 use crate::coordinator::{
-    decode_output, handshake_join, run_job_raw_with_joins, serialize_inputs, Joiner,
+    decode_output, handshake_join, run_job_raw_with_joins, serialize_inputs, Joiner, RunOptions,
 };
 use crate::framing::Connection;
 use crate::observability::{Event, EventSink, NoopSink};
@@ -411,7 +411,7 @@ trait ErasedFleet: Send + Sync {
         fn_key: &'a str,
         payloads: Vec<Vec<u8>>,
         requires: Option<&'a Predicate>,
-        require_redundancy: bool,
+        options: RunOptions,
     ) -> Pin<Box<dyn Future<Output = RawResults> + Send + 'a>>;
 }
 
@@ -421,7 +421,7 @@ impl<L: Launch + Send + Sync> ErasedFleet for Fleet<L> {
         fn_key: &'a str,
         payloads: Vec<Vec<u8>>,
         requires: Option<&'a Predicate>,
-        require_redundancy: bool,
+        options: RunOptions,
     ) -> Pin<Box<dyn Future<Output = RawResults> + Send + 'a>> {
         Box::pin(async move {
             let events = self.events.as_ref();
@@ -451,13 +451,7 @@ impl<L: Launch + Send + Sync> ErasedFleet for Fleet<L> {
             // guards (the agents it joined) are held until then.
             let (joins_tx, joins_rx) = mpsc::unbounded_channel();
             let job = run_job_raw_with_joins(
-                agents,
-                fn_key,
-                payloads,
-                &latencies,
-                require_redundancy,
-                joins_rx,
-                events,
+                agents, fn_key, payloads, &latencies, options, joins_rx, events,
             );
             let driver = rejoin_driver(
                 retry,
@@ -530,6 +524,7 @@ pub struct NetMap<'a, F, I> {
     inputs: Vec<I>,
     requires: Option<Predicate>,
     require_redundancy: bool,
+    speculative: bool,
 }
 
 impl<F, I> std::fmt::Debug for NetMap<'_, F, I> {
@@ -559,6 +554,15 @@ impl<F, I> NetMap<'_, F, I> {
         self.require_redundancy = true;
         self
     }
+
+    /// Race the tail of the run: when no task is pending but some are still in
+    /// flight, let an idle node re-run a straggler, first result winning (deduped).
+    /// Off by default; it trades extra compute for a shorter tail when a node
+    /// lags. Safe by the same idempotency contract reruns already rely on.
+    pub const fn speculative(mut self) -> Self {
+        self.speculative = true;
+        self
+    }
 }
 
 impl<F, I> NetMap<'_, F, I>
@@ -575,11 +579,14 @@ where
         let key = fn_key(&self.map);
         let payloads = serialize_inputs(&self.inputs)?;
         let requires = self.requires;
-        let redundancy = self.require_redundancy;
+        let options = RunOptions {
+            require_redundancy: self.require_redundancy,
+            speculative: self.speculative,
+        };
         let raw = match self.runner {
             RunnerRef::Borrowed(fleet) => {
                 fleet
-                    .run_erased(key, payloads, requires.as_ref(), redundancy)
+                    .run_erased(key, payloads, requires.as_ref(), options)
                     .await?
             }
             RunnerRef::Global => {
@@ -589,7 +596,7 @@ where
                     )
                 })?;
                 fleet
-                    .run_erased(key, payloads, requires.as_ref(), redundancy)
+                    .run_erased(key, payloads, requires.as_ref(), options)
                     .await?
             }
         };
@@ -698,6 +705,7 @@ pub trait NetMapExt: IntoIterator + Sized {
             inputs: self.into_iter().collect(),
             requires: None,
             require_redundancy: false,
+            speculative: false,
         }
     }
 
@@ -720,6 +728,7 @@ pub trait NetMapExt: IntoIterator + Sized {
             inputs: self.into_iter().collect(),
             requires: None,
             require_redundancy: false,
+            speculative: false,
         }
     }
 }
@@ -1578,6 +1587,20 @@ mod tests {
         .await;
         assert!(guards.is_empty());
         assert!(joins_rx.recv().await.is_none(), "no candidate joined");
+    }
+
+    #[tokio::test]
+    async fn a_speculative_run_returns_correct_results() {
+        // Speculation is opt-in via .speculative(); with healthy hosts the run is
+        // unchanged (it just permits racing a straggler), so results are correct.
+        let fleet = Fleet::new((0..2).map(|_| InProcess::serving(true)).collect());
+        let out: Vec<Result<u32, String>> = (0..12u32)
+            .net_map_with_fleet(double, &fleet)
+            .speculative()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(out, (0..12u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
     }
 
     #[tokio::test]

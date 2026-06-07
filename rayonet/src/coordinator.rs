@@ -292,6 +292,17 @@ where
     Ok(out)
 }
 
+/// Per-run policy flags, bundled so the run entry points stay within a sane
+/// argument count.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RunOptions {
+    /// Refuse to start unless every compute node has a redundant path.
+    pub(crate) require_redundancy: bool,
+    /// When no task is pending but some are still in flight, let an idle node
+    /// re-run a straggler and race it (first result wins, deduped). Off by default.
+    pub(crate) speculative: bool,
+}
+
 /// Mutable scheduling state for one run.
 struct Job<S> {
     senders: Vec<Sender<S>>,
@@ -313,20 +324,34 @@ struct Job<S> {
     /// Whether each agent's connection is still up; a lost one takes no tasks.
     alive: Vec<bool>,
     pending: VecDeque<usize>,
-    /// `task_id` -> (agent, input index), for reassignment and dedup on completion.
-    assigned: HashMap<TaskId, (usize, usize)>,
+    /// `task_id` -> (input index, the agents running it). Usually one agent; with
+    /// speculation a straggler is raced on a second, so the first terminal frees
+    /// every agent that held it and the rest are deduped.
+    assigned: HashMap<TaskId, (usize, Vec<usize>)>,
     results: Vec<Option<Result<Vec<u8>, String>>>,
     remaining: usize,
     payloads: Vec<Vec<u8>>,
+    /// Whether an idle node may re-run a straggler (R6 speculative re-execution).
+    speculative: bool,
 }
 
 impl<S> Job<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    /// Fill an agent up to its capacity from the pending pool, so a relay
-    /// fronting many slots is kept fed while a leaf still holds one task. A lost
+    /// Fill an agent: hand it pending tasks up to its capacity, then, if
+    /// speculation is on and nothing is pending, let it race a straggler. A relay
+    /// fronting many slots is kept fed while a leaf still holds one task; a lost
     /// agent takes nothing.
+    async fn fill(&mut self, agent: usize) -> std::io::Result<()> {
+        self.assign_up_to_capacity(agent).await?;
+        if self.speculative {
+            self.speculate(agent).await?;
+        }
+        Ok(())
+    }
+
+    /// Hand `agent` pending tasks up to its capacity. A lost agent takes nothing.
     async fn assign_up_to_capacity(&mut self, agent: usize) -> std::io::Result<()> {
         while self.alive[agent] && self.in_flight[agent] < self.capacity[agent] {
             let Some(idx) = self.pending.pop_front() else {
@@ -339,22 +364,53 @@ where
                     payload: self.payloads[idx].clone(),
                 })
                 .await?;
-            self.assigned.insert(task_id, (agent, idx));
+            self.assigned.insert(task_id, (idx, vec![agent]));
             self.in_flight[agent] += 1;
         }
         Ok(())
     }
 
-    /// Record a terminal outcome. Returns the freed agent, or `None` if the
-    /// `task_id` was unknown or already resolved (dedup of a re-run task).
-    fn record(&mut self, task_id: TaskId, result: Result<Vec<u8>, String>) -> Option<usize> {
-        // `assigned` holds each task_id at most once (removed on first record),
-        // so a duplicate returns `None` here and this runs exactly once per task.
-        let (agent, idx) = self.assigned.remove(&task_id)?;
-        self.in_flight[agent] -= 1;
+    /// With nothing pending, fill `agent`'s free slots by re-running stragglers:
+    /// the oldest in-flight tasks running on exactly one other agent, so each is
+    /// raced at most twice and the idle node helps drain the tail. The first
+    /// terminal wins; the rest dedup.
+    async fn speculate(&mut self, agent: usize) -> std::io::Result<()> {
+        while self.alive[agent] && self.in_flight[agent] < self.capacity[agent] {
+            let Some(task_id) = self
+                .assigned
+                .iter()
+                .filter(|(_, (_, agents))| agents.len() == 1 && !agents.contains(&agent))
+                .map(|(task, _)| *task)
+                .min()
+            else {
+                return Ok(());
+            };
+            let (idx, agents) = self.assigned.get_mut(&task_id).expect("task is assigned");
+            agents.push(agent);
+            let payload = self.payloads[*idx].clone();
+            self.in_flight[agent] += 1;
+            self.senders[agent]
+                .send(&ToAgent::Assign { task_id, payload })
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Record a terminal outcome. Returns the agents freed (the one that finished
+    /// plus any that were racing the same task), or an empty list if the `task_id`
+    /// was already resolved (a duplicate, deduped here so it runs once per task).
+    fn record(&mut self, task_id: TaskId, result: Result<Vec<u8>, String>) -> Vec<usize> {
+        // `assigned` holds each task_id at most once (removed on first record), so a
+        // duplicate finds nothing and returns empty, running exactly once per task.
+        let Some((idx, agents)) = self.assigned.remove(&task_id) else {
+            return Vec::new();
+        };
+        for &agent in &agents {
+            self.in_flight[agent] -= 1;
+        }
         self.results[idx] = Some(result);
         self.remaining -= 1;
-        Some(agent)
+        agents
     }
 
     /// Mark `agent` lost and return its in-flight tasks to the pending pool so
@@ -364,14 +420,15 @@ where
     /// completion by `record`.
     fn requeue_lost(&mut self, agent: usize) {
         self.alive[agent] = false;
-        let lost: Vec<TaskId> = self
-            .assigned
-            .iter()
-            .filter(|(_, (owner, _))| *owner == agent)
-            .map(|(task, _)| *task)
-            .collect();
-        for task in lost {
-            if let Some((_, idx)) = self.assigned.remove(&task) {
+        let tasks: Vec<TaskId> = self.assigned.keys().copied().collect();
+        for task in tasks {
+            let (idx, agents) = self.assigned.get_mut(&task).expect("task is assigned");
+            agents.retain(|other| *other != agent);
+            // A task still running on another agent (a speculative replica) is not
+            // lost; only one with no runner left is requeued for the survivors.
+            if agents.is_empty() {
+                let idx = *idx;
+                self.assigned.remove(&task);
                 self.pending.push_back(idx);
             }
         }
@@ -425,26 +482,30 @@ where
             // in and feed it the requeued work, marking it working if it took any.
             Event::Message(agent, FromAgent::Capacity { slots }) => {
                 self.capacity[agent] = slots;
-                self.assign_up_to_capacity(agent).await?;
+                self.fill(agent).await?;
                 if self.in_flight[agent] > 0 {
                     events.emit(Obs::node(&self.labels[agent], NodeState::Working));
                 }
             }
-            Event::Message(_, FromAgent::Started { task_id }) => {
-                if let Some((agent, _)) = self.assigned.get(&task_id) {
+            Event::Message(agent, FromAgent::Started { task_id }) => {
+                // Attribute the start to the agent that reported it (a speculative
+                // replica reports its own start), only if the task is still live.
+                if self.assigned.contains_key(&task_id) {
                     events.emit(Obs::TaskStarted {
-                        host: self.labels[*agent].clone(),
+                        host: self.labels[agent].clone(),
                         task: task_id,
                     });
                 }
             }
-            Event::Message(_, FromAgent::Completed { task_id, output }) => {
+            Event::Message(agent, FromAgent::Completed { task_id, output }) => {
                 // The raw bytes are kept as-is; decoding happens in the typed
                 // layer, so a `Completed` is `ok` at the protocol level here.
-                self.finish(task_id, Ok(output), true, events).await?;
+                self.finish(task_id, Ok(output), true, agent, events)
+                    .await?;
             }
-            Event::Message(_, FromAgent::Failed { task_id, error }) => {
-                self.finish(task_id, Err(error), false, events).await?;
+            Event::Message(agent, FromAgent::Failed { task_id, error }) => {
+                self.finish(task_id, Err(error), false, agent, events)
+                    .await?;
             }
             // A subtree event from a relay child: prefix its host with that
             // child's label so it carries a full path from the root, then
@@ -461,29 +522,35 @@ where
                 self.requeue_lost(agent);
                 self.reroute().await?;
                 for survivor in 0..self.senders.len() {
-                    self.assign_up_to_capacity(survivor).await?;
+                    self.fill(survivor).await?;
                 }
             }
         }
         Ok(())
     }
 
-    /// Record a terminal outcome, emit its task event, and hand the freed agent
-    /// its next task. Emits an `Idle` node event when no work is left for it.
+    /// Record a terminal outcome, emit its task event, and refill every agent it
+    /// freed (the finisher plus any that were racing the same task). Emits an
+    /// `Idle` node event for a freed agent left with no work.
     async fn finish(
         &mut self,
         task_id: TaskId,
         result: Result<Vec<u8>, String>,
         ok: bool,
+        completer: usize,
         events: &dyn EventSink,
     ) -> std::io::Result<()> {
-        if let Some(agent) = self.record(task_id, result) {
-            events.emit(Obs::TaskFinished {
-                host: self.labels[agent].clone(),
-                task: task_id,
-                ok,
-            });
-            self.assign_up_to_capacity(agent).await?;
+        let freed = self.record(task_id, result);
+        if freed.is_empty() {
+            return Ok(());
+        }
+        events.emit(Obs::TaskFinished {
+            host: self.labels[completer].clone(),
+            task: task_id,
+            ok,
+        });
+        for agent in freed {
+            self.fill(agent).await?;
             if self.in_flight[agent] == 0 {
                 events.emit(Obs::node(&self.labels[agent], NodeState::Idle));
             }
@@ -533,7 +600,7 @@ pub(crate) async fn run_job_raw<S>(
     fn_key: &str,
     payloads: Vec<Vec<u8>>,
     agent_latencies: &[u64],
-    require_redundancy: bool,
+    options: RunOptions,
     events: &dyn EventSink,
 ) -> std::io::Result<Vec<Result<Vec<u8>, String>>>
 where
@@ -548,7 +615,7 @@ where
         fn_key,
         payloads,
         agent_latencies,
-        require_redundancy,
+        options,
         joins_rx,
         events,
     )
@@ -570,7 +637,7 @@ pub(crate) async fn run_job_raw_with_joins<S>(
     fn_key: &str,
     payloads: Vec<Vec<u8>>,
     agent_latencies: &[u64],
-    require_redundancy: bool,
+    options: RunOptions,
     mut joins: mpsc::UnboundedReceiver<Joiner<S>>,
     events: &dyn EventSink,
 ) -> std::io::Result<Vec<Result<Vec<u8>, String>>>
@@ -591,7 +658,7 @@ where
         fn_key,
         &events_tx,
         agent_latencies,
-        require_redundancy,
+        options.require_redundancy,
         &ActivationPolicy::DedupById,
     )
     .await?;
@@ -610,11 +677,12 @@ where
         results: (0..num_tasks).map(|_| None).collect(),
         remaining: num_tasks,
         payloads,
+        speculative: options.speculative,
     };
 
     events.emit(Obs::RunStarted { tasks: num_tasks });
     for agent in 0..job.senders.len() {
-        job.assign_up_to_capacity(agent).await?;
+        job.fill(agent).await?;
         if job.in_flight[agent] > 0 {
             events.emit(Obs::node(&job.labels[agent], NodeState::Working));
         }
@@ -656,7 +724,7 @@ where
                     job.in_flight.push(0);
                     job.readers
                         .push(spawn_reader(joiner.rx, agent, events_tx.clone()));
-                    job.assign_up_to_capacity(agent).await?;
+                    job.fill(agent).await?;
                     if job.in_flight[agent] > 0 {
                         events.emit(Obs::node(&job.labels[agent], NodeState::Working));
                     }
@@ -714,10 +782,9 @@ where
     O: DeserializeOwned,
 {
     let payloads = serialize_inputs(&inputs)?;
-    // The typed entry carries no measured latencies, so redundant paths dedup by
-    // id order, and it does not enforce redundancy. The fleet's real path supplies
-    // both.
-    let raw = run_job_raw(agents, fn_key, payloads, &[], false, events).await?;
+    // The typed entry carries no measured latencies and uses default options (no
+    // redundancy requirement, no speculation). The fleet's real path supplies both.
+    let raw = run_job_raw(agents, fn_key, payloads, &[], RunOptions::default(), events).await?;
     Ok(raw.into_iter().map(decode_output::<O>).collect())
 }
 
@@ -1309,6 +1376,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn speculation_reruns_a_straggler_on_an_idle_node() {
+        use crate::observability::RunState;
+        use crate::testing::EventRecorder;
+        use tokio::sync::mpsc;
+
+        fn slow(x: u32) -> u32 {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            x
+        }
+        fn fast(x: u32) -> u32 {
+            x
+        }
+
+        // The first agent is assigned the lone task and runs it slowly; the second
+        // is idle with nothing pending. With speculation on, the idle agent re-runs
+        // the straggler and wins, so the run finishes without waiting on the slow
+        // one, and the result is recorded exactly once.
+        let (slow_client, slow_server) = connection_pair(256);
+        let (fast_client, fast_server) = connection_pair(256);
+        tokio::spawn(serve(slow_server, Registry::new().with("k", handler(slow))));
+        tokio::spawn(serve(fast_server, Registry::new().with("k", handler(fast))));
+        let recorder = EventRecorder::default();
+        let (joins_tx, joins_rx) = mpsc::unbounded_channel();
+        drop(joins_tx);
+        let agents = vec![
+            ("slow".to_string(), slow_client),
+            ("fast".to_string(), fast_client),
+        ];
+        let payloads = super::serialize_inputs(&[7u32]).unwrap();
+        let raw = super::run_job_raw_with_joins(
+            agents,
+            "k",
+            payloads,
+            &[],
+            super::RunOptions {
+                require_redundancy: false,
+                speculative: true,
+            },
+            joins_rx,
+            &recorder,
+        )
+        .await
+        .unwrap();
+        let outs: Vec<Result<u32, String>> =
+            raw.into_iter().map(super::decode_output::<u32>).collect();
+        assert_eq!(outs, vec![Ok(7)], "exactly one result, no duplicate");
+
+        let mut state = RunState::default();
+        for event in &recorder.events() {
+            state.apply(event);
+        }
+        assert_eq!(
+            state.nodes["fast"].completed, 1,
+            "the idle agent re-ran the straggler and won"
+        );
+    }
+
+    #[tokio::test]
     async fn a_node_joining_mid_run_takes_pending_work() {
         use crate::observability::RunState;
         use crate::testing::EventRecorder;
@@ -1332,7 +1457,7 @@ mod tests {
             "slow",
             payloads,
             &[],
-            false,
+            super::RunOptions::default(),
             joins_rx,
             &recorder,
         );
@@ -1390,7 +1515,7 @@ mod tests {
             "slow",
             payloads,
             &[],
-            false,
+            super::RunOptions::default(),
             joins_rx,
             &NoopSink,
         );
@@ -1507,8 +1632,15 @@ mod tests {
         let agents = vec![("dies".to_string(), client)];
         let payloads = super::serialize_inputs(&(0..4u32).collect::<Vec<_>>()).unwrap();
 
-        let run =
-            super::run_job_raw_with_joins(agents, "id", payloads, &[], false, joins_rx, &NoopSink);
+        let run = super::run_job_raw_with_joins(
+            agents,
+            "id",
+            payloads,
+            &[],
+            super::RunOptions::default(),
+            joins_rx,
+            &NoopSink,
+        );
         let driver = async {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             drop(joins_tx); // no node ever joins; closing the channel ends the wait

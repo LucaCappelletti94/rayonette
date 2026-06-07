@@ -905,10 +905,16 @@ mod tests {
         // relay then activates the shared leaf and finishes the run.
         let payloads =
             crate::coordinator::serialize_inputs(&(0..30u32).collect::<Vec<_>>()).unwrap();
-        let raw =
-            crate::coordinator::run_job_raw(agents, "id", payloads, &[0, 1000], false, &NoopSink)
-                .await
-                .unwrap();
+        let raw = crate::coordinator::run_job_raw(
+            agents,
+            "id",
+            payloads,
+            &[0, 1000],
+            crate::coordinator::RunOptions::default(),
+            &NoopSink,
+        )
+        .await
+        .unwrap();
         let out: Vec<Result<u32, String>> = raw
             .into_iter()
             .map(crate::coordinator::decode_output::<u32>)
@@ -1001,7 +1007,7 @@ mod tests {
 
     #[tokio::test]
     async fn require_redundancy_refuses_compute_behind_a_lone_relay() {
-        use crate::coordinator::{run_job_raw, serialize_inputs};
+        use crate::coordinator::{run_job_raw, serialize_inputs, RunOptions};
         // One relay with a single leaf has no redundant path, so a run that
         // requires redundancy refuses before any task is scheduled.
         let (coord, relay_side) = connection_pair(4096);
@@ -1018,7 +1024,10 @@ mod tests {
             "id",
             payloads,
             &[],
-            true,
+            RunOptions {
+                require_redundancy: true,
+                speculative: false,
+            },
             &NoopSink,
         )
         .await
@@ -1029,7 +1038,7 @@ mod tests {
 
     #[tokio::test]
     async fn require_redundancy_admits_a_node_reached_through_two_relays() {
-        use crate::coordinator::{run_job_raw, serialize_inputs};
+        use crate::coordinator::{run_job_raw, serialize_inputs, RunOptions};
         // Two relays reach a leaf with the same id, so the leaf is redundant and a
         // redundancy-required run proceeds, scheduling on its primary path.
         let reg = || Registry::new().with("id", handler(|x: u32| x));
@@ -1044,7 +1053,10 @@ mod tests {
             "id",
             payloads,
             &[],
-            true,
+            RunOptions {
+                require_redundancy: true,
+                speculative: false,
+            },
             &NoopSink,
         )
         .await
