@@ -20,6 +20,7 @@ node online mid-run (the fleet grows and absorbs it).
 | `elastic`           | coordinator -> two leaves               | start with one leaf, bring the second up mid-run, the rejoin driver absorbs it |
 | `relay-grow`        | coordinator -> relay -> two leaves      | add a leaf to the relay's children file mid-run, the relay re-reads and absorbs it |
 | `capstone`          | two gateways -> shared private leaf + a leaf joining mid-run | segmented, multi-level, redundant, and elastic at once: a node joins the standby gateway mid-run, then the primary gateway is killed and reroutes, all deduped |
+| `metropolis`        | two gateways (each with a leaf) -> redundant shared, plus a third compute node joining mid-run | a richer, growing network: watch it scale up as gw3 joins the fleet, then the primary gateway is killed and shared reroutes. Demo topology, run with a high task count so the growth and kill land mid-run; not part of `run-all` (its timing needs the longer run) |
 
 ## Usage
 
@@ -112,6 +113,15 @@ cold recording, where the relay was built from scratch:
 
 ```sh
 cargo run -p tui-replay -- rayonet/tests/fixtures/cold-provisioning.jsonl 1
+```
+
+To watch a richer network grow, replay the metropolis recording: two gateways
+front a redundant shared leaf and a leaf each, a third compute node joins the
+fleet mid-run, and then the primary gateway is killed so the shared leaf
+reroutes. Re-record it with `RAYONET_EVENT_LOG=/tmp/m.jsonl RAYONET_HEAVY_COUNT=600 ./metropolis/run.sh`.
+
+```sh
+cargo run -p tui-replay -- rayonet/tests/fixtures/metropolis.jsonl 4
 ```
 
 Watch a run live: set the log, run the scenario, and follow the log from another
