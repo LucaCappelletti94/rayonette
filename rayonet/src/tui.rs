@@ -6,12 +6,14 @@
 //! centrepiece, a node-link diagram of the relay tree), a per-node table, and an
 //! event log. It is one of the pluggable views over the event stream.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::Line;
+use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
 use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table};
 use ratatui::Frame;
 
@@ -263,15 +265,17 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 ///
 /// Vertices are physical nodes (a machine reached through two relays is one
 /// vertex), positioned by the deterministic [`positions`] layout and coloured by
-/// state. Parent links are drawn as lines, the active (primary) path bright and a
-/// deduped standby path dim. A relay that is a single point of failure is marked,
-/// the selected vertex is reversed, and the hovered link is brightened. The cells
-/// each vertex and link occupy are recorded in `app`'s hit map for pointer input.
+/// state. Parent links are drawn as smooth braille lines on a [`Canvas`] (giving
+/// sub-cell resolution), the active (primary) path bright and a deduped standby
+/// path dim, with the hovered link brightened. Node labels are written on top of
+/// the lines: a single point of failure is flagged, and the selected vertex is
+/// reversed. The cells each vertex and link occupy are recorded in `app`'s hit map
+/// for pointer input.
 fn render_graph(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let block = Block::default().borders(Borders::ALL).title(" topology ");
     let inner = block.inner(area);
-    frame.render_widget(block, area);
     if inner.width < 2 || inner.height < 2 {
+        frame.render_widget(block, area);
         app.hit = HitMap::default();
         return;
     }
@@ -279,29 +283,70 @@ fn render_graph(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let geometry = graph_geometry(inner, app);
     let selected = app.selected.clone();
     let hovered = app.hovered.clone();
-    let occupied: BTreeSet<(u16, u16)> = geometry.nodes.iter().map(|node| node.cell).collect();
     let mut hit = HitMap::default();
-    let buffer = frame.buffer_mut();
 
-    // Edges first, so the node labels drawn next sit on top of them.
+    // Record the cells each link passes through for hover hit-testing, matching
+    // the endpoints the braille line is drawn between.
     for edge in &geometry.edges {
-        let is_hovered = hovered
-            .as_ref()
-            .is_some_and(|(parent, child)| *parent == edge.parent && *child == edge.child);
-        let style = edge_style(edge.active, is_hovered);
-        let glyph = edge_char(edge.from, edge.to);
         for cell in line_cells(edge.from, edge.to) {
-            if occupied.contains(&cell) {
-                continue;
-            }
             hit.edges
                 .insert(cell, (edge.parent.clone(), edge.child.clone()));
-            if let Some(slot) = buffer.cell_mut(cell) {
-                slot.set_char(glyph).set_style(style);
-            }
         }
     }
 
+    // Draw the links as braille lines between node cell centres, in a coordinate
+    // space of one unit per cell so the lines land on the same cells the labels do.
+    let edges: Vec<(CanvasLine, bool)> = geometry
+        .edges
+        .iter()
+        .map(|edge| {
+            let (x1, y1) = canvas_point(inner, edge.from);
+            let (x2, y2) = canvas_point(inner, edge.to);
+            let hovered = hovered
+                .as_ref()
+                .is_some_and(|(parent, child)| *parent == edge.parent && *child == edge.child);
+            let color = edge_color(edge.active, hovered);
+            (
+                CanvasLine {
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    color,
+                },
+                hovered,
+            )
+        })
+        .collect();
+    let canvas = Canvas::default()
+        .block(block)
+        .marker(Marker::Braille)
+        .x_bounds([0.0, f64::from(inner.width)])
+        .y_bounds([0.0, f64::from(inner.height)])
+        .paint(move |ctx| {
+            // Standbys first, then active, then the hovered link, so the brighter
+            // lines win where they overlap.
+            for (line, _) in edges
+                .iter()
+                .filter(|(line, hov)| !hov && line.color == Color::DarkGray)
+            {
+                ctx.draw(line);
+            }
+            for (line, hov) in &edges {
+                if !hov && line.color == Color::Green {
+                    ctx.draw(line);
+                }
+            }
+            for (line, hov) in &edges {
+                if *hov {
+                    ctx.draw(line);
+                }
+            }
+        });
+    frame.render_widget(canvas, area);
+
+    // Node labels on top of the lines.
+    let buffer = frame.buffer_mut();
     for node in &geometry.nodes {
         // A single point of failure is flagged with a leading marker so the graph
         // shows it even without colour.
@@ -329,19 +374,24 @@ fn render_graph(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     app.hit = hit;
 }
 
-/// The style a link is drawn in: brightened white when hovered, otherwise green
-/// for the active primary path and dim grey for a deduped standby.
-fn edge_style(active: bool, hovered: bool) -> Style {
+/// The colour a link is drawn in: white when hovered, green for the active primary
+/// path, dim grey for a deduped standby.
+const fn edge_color(active: bool, hovered: bool) -> Color {
     if hovered {
-        return Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD);
-    }
-    if active {
-        Style::default().fg(Color::Green)
+        Color::White
+    } else if active {
+        Color::Green
     } else {
-        Style::default().fg(Color::DarkGray)
+        Color::DarkGray
     }
+}
+
+/// The canvas coordinate of a cell's centre, in the panel's one-unit-per-cell space
+/// with the y axis pointing up (so a link drawn between two cells lands on them).
+fn canvas_point(inner: Rect, cell: (u16, u16)) -> (f64, f64) {
+    let local_x = f64::from(cell.0.saturating_sub(inner.x)) + 0.5;
+    let local_y = f64::from(cell.1.saturating_sub(inner.y)) + 0.5;
+    (local_x, f64::from(inner.height) - local_y)
 }
 
 /// The info panel beside the graph: the hovered link's detail, else the selected
@@ -656,21 +706,6 @@ fn project(area: Rect, x: f64, y: f64) -> (u16, u16) {
     let col = area.x + (x * f64::from(area.width.saturating_sub(1))).round() as u16;
     let row = area.y + ((1.0 - y) * f64::from(area.height.saturating_sub(1))).round() as u16;
     (col, row)
-}
-
-/// The line glyph for an edge, chosen from its dominant direction on screen.
-fn edge_char(from: (u16, u16), to: (u16, u16)) -> char {
-    let dcol = i32::from(to.0) - i32::from(from.0);
-    let drow = i32::from(to.1) - i32::from(from.1);
-    if dcol.abs() >= drow.abs() * 2 {
-        '─'
-    } else if drow.abs() >= dcol.abs() * 2 {
-        '│'
-    } else if (dcol > 0) == (drow > 0) {
-        '╲'
-    } else {
-        '╱'
-    }
 }
 
 /// The cells a straight line from `from` to `to` passes through (Bresenham).
@@ -1077,10 +1112,10 @@ mod tests {
     #[test]
     fn the_graph_draws_active_and_standby_links_distinctly() {
         // The shared leaf's primary link (through the faster gatewayA) is active and
-        // green; the deduped standby link is dim. Look for a line glyph of each
-        // colour in the topology panel.
+        // green; the deduped standby link is dim. The links are braille lines, so
+        // look for a braille cell of each colour in the topology panel.
         let buffer = render_buffer(&diamond());
-        let line_glyphs = ['\u{2500}', '\u{2502}', '\u{2572}', '\u{2571}'];
+        let is_braille = |symbol: char| ('\u{2800}'..='\u{28ff}').contains(&symbol);
         let mut active = false;
         let mut standby = false;
         let area = buffer.area();
@@ -1088,7 +1123,7 @@ mod tests {
             for x in 0..area.width {
                 let cell = buffer.cell((x, y)).unwrap();
                 let symbol = cell.symbol().chars().next().unwrap_or(' ');
-                if !line_glyphs.contains(&symbol) {
+                if !is_braille(symbol) {
                     continue;
                 }
                 match cell.style().fg {
@@ -1173,13 +1208,8 @@ mod tests {
     }
 
     #[test]
-    fn edge_glyphs_and_cells_follow_direction() {
-        use super::{edge_char, line_cells};
-        // A horizontal, vertical, and both diagonal runs pick distinct glyphs.
-        assert_eq!(edge_char((0, 5), (10, 5)), '\u{2500}');
-        assert_eq!(edge_char((5, 0), (5, 10)), '\u{2502}');
-        assert_eq!(edge_char((0, 0), (10, 10)), '\u{2572}');
-        assert_eq!(edge_char((10, 0), (0, 10)), '\u{2571}');
+    fn line_cells_trace_between_endpoints() {
+        use super::line_cells;
         // Bresenham includes both endpoints and is contiguous.
         let cells = line_cells((2, 2), (5, 4));
         assert_eq!(cells.first(), Some(&(2, 2)));
