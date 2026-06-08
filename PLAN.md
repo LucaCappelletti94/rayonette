@@ -233,7 +233,7 @@ Builds the relay tree of `DECISIONS.md` 32-43. The cross-phase criteria above st
 - The TUI and the plain renderer indent each node by its depth, showing the leaf label, role, and live state.
 
 **Scoped out (deferred):**
-- Per-task attribution to the exact deep leaf (the flat-star tally stays at the coordinator's direct children); a later refinement.
+- Per-task attribution to the exact deep leaf (the flat-star tally stayed at the coordinator's direct children). Delivered later: a completion carries a `via` sub-path so the coordinator credits the deep leaf, with a subtree roll-up for relay-level views.
 - The `geometric-traits` CSR graph and roots/sinks layout: the path-id tree renders directly, and the CSR graph lands in R5 where redundancy/articulation analysis consume it.
 
 **Tests**
