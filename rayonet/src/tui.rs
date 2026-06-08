@@ -869,14 +869,23 @@ fn label_bounds(inner: Rect, cell: (u16, u16), label: &str) -> (u16, u16) {
     (start, count)
 }
 
+/// A live-usage table cell from a percentage, or a dash when there is no figure
+/// (a relay that reports no telemetry, or a leaf yet to sample).
+fn pct_cell(value: Option<u8>) -> String {
+    value.map_or_else(|| "-".to_string(), |pct| format!("{pct}%"))
+}
+
 /// The per-node table: full path (so two paths to one node stay distinct), role,
-/// effective state, finished count, link latency, architecture, and a SPOF flag.
+/// effective state, finished count, live CPU/memory/GPU use, link latency,
+/// architecture, and a SPOF flag.
 fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let state = &app.state;
     let spofs = Topology::from_run_state(state).single_points_of_failure();
 
-    let header = Row::new(["node", "role", "state", "done", "lat ms", "arch", "flag"])
-        .style(Style::default().add_modifier(Modifier::BOLD));
+    let header = Row::new([
+        "node", "role", "state", "done", "cpu", "mem", "gpu", "lat ms", "arch", "flag",
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
 
     let rows = state.nodes.iter().map(|(path, view)| {
         let effective = state.effective_state(path);
@@ -895,11 +904,19 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             ""
         };
+        // Live utilisation from the node's latest telemetry sample, if any.
+        let telemetry = view.telemetry.as_ref();
+        let cpu = pct_cell(telemetry.map(|t| t.cpu_pct));
+        let mem = pct_cell(telemetry.map(|t| t.mem_pct));
+        let gpu = pct_cell(telemetry.and_then(|t| t.gpu_pct));
         Row::new([
             Cell::from(path.clone()),
             Cell::from(role),
             Cell::from(state_label(effective)).style(state_style(effective)),
             Cell::from(state.subtree_completed(path).to_string()),
+            Cell::from(cpu),
+            Cell::from(mem),
+            Cell::from(gpu),
             Cell::from(latency),
             Cell::from(arch),
             Cell::from(flag).style(Style::default().fg(Color::Red)),
@@ -910,6 +927,9 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Constraint::Min(16),
         Constraint::Length(10),
         Constraint::Length(16),
+        Constraint::Length(5),
+        Constraint::Length(5),
+        Constraint::Length(5),
         Constraint::Length(5),
         Constraint::Length(7),
         Constraint::Length(14),
@@ -1139,6 +1159,35 @@ mod tests {
         assert!(text.contains("leaf: Building"), "{text}");
         assert!(text.contains("leaf: Compute"), "{text}");
         assert!(text.contains("progress 1/1"), "{text}");
+    }
+
+    #[test]
+    fn the_table_shows_live_usage_columns() {
+        use crate::observability::NodeTelemetry;
+        let mut app = App::new();
+        app.apply(&Event::node("leaf", NodeState::Working));
+        app.apply(&Event::Telemetry {
+            host: "leaf".to_string(),
+            telemetry: NodeTelemetry {
+                cpu_pct: 55,
+                mem_pct: 22,
+                gpu_pct: Some(80),
+                gpu_mem_pct: Some(40),
+                in_flight: 1,
+                interfaces: Vec::new(),
+            },
+        });
+        app.apply(&Event::node("bare", NodeState::Ready));
+        let rows = render(&app);
+        // A node with a sample shows its CPU, memory, and GPU use.
+        let leaf = rows.iter().find(|r| r.contains("leaf")).expect("leaf row");
+        assert!(
+            leaf.contains("55%") && leaf.contains("22%") && leaf.contains("80%"),
+            "{leaf}"
+        );
+        // A node with no telemetry (a relay, or not yet sampled) shows dashes.
+        let bare = rows.iter().find(|r| r.contains("bare")).expect("bare row");
+        assert!(bare.contains('-'), "{bare}");
     }
 
     #[test]
@@ -1692,7 +1741,9 @@ mod tests {
         });
         let no_gpu = render(&app).join("\n");
         assert!(no_gpu.contains("cpu 10%"), "{no_gpu}");
-        assert!(!no_gpu.contains("gpu "), "{no_gpu}");
+        // The detail's utilisation line has no GPU figure after the cpu/mem pair
+        // (the bare "gpu" in the table header is a column title, not a reading).
+        assert!(!no_gpu.contains("mem 20%  gpu"), "{no_gpu}");
     }
 
     #[test]

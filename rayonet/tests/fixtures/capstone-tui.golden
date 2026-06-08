@@ -20,11 +20,11 @@
 │                                            ○ gatewayB                              ││                                │
 └────────────────────────────────────────────────────────────────────────────────────┘└────────────────────────────────┘
 ┌ nodes ───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│node                                                    role       state            done  lat ms  arch           flag │
-│gatewayA                                                Compute    Working          28    138.6   x86_64              │
-│gatewayA/shared                                         Compute    Working          28    171.5   x86_64              │
-│gatewayB                                                Compute    Ready            0     162.2   x86_64              │
-│gatewayB/shared                                         Compute    Ready            0     165.1   x86_64              │
+│node                                  role       state            done  cpu   mem   gpu   lat ms  arch           flag │
+│gatewayA                              Compute    Working          28    -     -     -     138.6   x86_64              │
+│gatewayA/shared                       Compute    Working          28    76%   13%   -     171.5   x86_64              │
+│gatewayB                              Compute    Ready            0     -     -     -     162.2   x86_64              │
+│gatewayB/shared                       Compute    Ready            0     -     -     -     165.1   x86_64              │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
@@ -62,11 +62,11 @@
 │                                            ○ gatewayB                              ││                                │
 └────────────────────────────────────────────────────────────────────────────────────┘└────────────────────────────────┘
 ┌ nodes ───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│node                                                    role       state            done  lat ms  arch           flag │
-│gatewayA                                                Compute    Working          60    138.6   x86_64              │
-│gatewayA/shared                                         Compute    Working          60    171.5   x86_64              │
-│gatewayB                                                Compute    Ready            0     162.2   x86_64              │
-│gatewayB/shared                                         Compute    Ready            0     165.1   x86_64              │
+│node                                  role       state            done  cpu   mem   gpu   lat ms  arch           flag │
+│gatewayA                              Compute    Working          60    -     -     -     138.6   x86_64              │
+│gatewayA/shared                       Compute    Working          60    74%   13%   -     171.5   x86_64              │
+│gatewayB                              Compute    Ready            0     -     -     -     162.2   x86_64              │
+│gatewayB/shared                       Compute    Ready            0     -     -     -     165.1   x86_64              │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
@@ -104,12 +104,12 @@
 │                                                                  ⠉⠉⠉⠉⠉⠉⠉⠉● gatewayA││                                │
 └────────────────────────────────────────────────────────────────────────────────────┘└────────────────────────────────┘
 ┌ nodes ───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│node                                                    role       state            done  lat ms  arch           flag │
-│gatewayA                                                Compute    Working          81    138.6   x86_64              │
-│gatewayA/shared                                         Compute    Working          81    171.5   x86_64              │
-│gatewayB                                                Compute    Working          9     162.2   x86_64         SPOF │
-│gatewayB/extra                                          Compute    Working          9     178.4   x86_64              │
-│gatewayB/shared                                         Compute    Ready            0     165.1   x86_64              │
+│node                                  role       state            done  cpu   mem   gpu   lat ms  arch           flag │
+│gatewayA                              Compute    Working          81    -     -     -     138.6   x86_64              │
+│gatewayA/shared                       Compute    Working          81    75%   13%   -     171.5   x86_64              │
+│gatewayB                              Compute    Working          9     -     -     -     162.2   x86_64         SPOF │
+│gatewayB/extra                        Compute    Working          9     0%    13%   -     178.4   x86_64              │
+│gatewayB/shared                       Compute    Ready            0     -     -     -     165.1   x86_64              │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
@@ -146,12 +146,12 @@
 │                                                                  ⠉⠉⠉⠉⠉⠉⠉⠉✗ gatewayA││                                │
 └────────────────────────────────────────────────────────────────────────────────────┘└────────────────────────────────┘
 ┌ nodes ───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│node                                                    role       state            done  lat ms  arch           flag │
-│gatewayA                                                Compute    Lost             86    138.6   x86_64              │
-│gatewayA/shared                                         Compute    Lost             86    171.5   x86_64              │
-│gatewayB                                                Compute    Done             34    162.2   x86_64         SPOF │
-│gatewayB/extra                                          Compute    Done             24    178.4   x86_64              │
-│gatewayB/shared                                         Compute    Done             10    165.1   x86_64              │
+│node                                  role       state            done  cpu   mem   gpu   lat ms  arch           flag │
+│gatewayA                              Compute    Lost             86    -     -     -     138.6   x86_64              │
+│gatewayA/shared                       Compute    Lost             86    75%   13%   -     171.5   x86_64              │
+│gatewayB                              Compute    Done             34    -     -     -     162.2   x86_64         SPOF │
+│gatewayB/extra                        Compute    Done             24    75%   13%   -     178.4   x86_64              │
+│gatewayB/shared                       Compute    Done             10    75%   13%   -     165.1   x86_64              │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
