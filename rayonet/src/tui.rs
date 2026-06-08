@@ -73,6 +73,16 @@ pub enum Action {
     Quit,
 }
 
+/// What the viewer has pinned for the detail panel. A click or a key sets it and
+/// it stays until changed, unlike the transient hover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selection {
+    /// A vertex, by its physical node id.
+    Node(String),
+    /// A link, by its `(parent id, child id)`.
+    Edge(String, String),
+}
+
 /// The live dashboard state a renderer draws.
 ///
 /// Folds the event stream into a [`RunState`] and a rolling human-readable log.
@@ -88,9 +98,12 @@ pub struct App {
     pub log: VecDeque<String>,
     /// Time since the run started, set by the driver.
     pub elapsed: Duration,
-    /// The physical id of the currently selected vertex, if any.
-    pub selected: Option<String>,
-    /// The `(parent id, child id)` of the currently hovered link, if any.
+    /// The pinned vertex or link whose detail the panel shows, if any. Sticky: a
+    /// click or a key sets it and it stays until changed.
+    pub selected: Option<Selection>,
+    /// The `(parent id, child id)` of the link under the pointer, if any. Transient:
+    /// it highlights the link in the graph and previews its info when nothing is
+    /// pinned.
     pub hovered: Option<(String, String)>,
     /// Whether the driver has been asked to pause.
     pub paused: bool,
@@ -129,19 +142,19 @@ impl App {
         let Some(last) = ids.len().checked_sub(1) else {
             return;
         };
-        let current = self
-            .selected
-            .as_ref()
-            .and_then(|id| ids.iter().position(|candidate| candidate == id));
+        let current = match &self.selected {
+            Some(Selection::Node(id)) => ids.iter().position(|candidate| candidate == id),
+            _ => None,
+        };
         let next = match current {
             Some(index) if forward => (index + 1) % ids.len(),
             Some(0) => last,
             Some(index) => index - 1,
-            // No selection yet: forward lands on the first, backward on the last.
+            // No node selected yet: forward lands on the first, backward on the last.
             None if forward => 0,
             None => last,
         };
-        self.selected = Some(ids[next].clone());
+        self.selected = Some(Selection::Node(ids[next].clone()));
         self.hovered = None;
     }
 
@@ -161,10 +174,17 @@ impl App {
                 self.hovered = self.hit.edges.get(&(col, row)).cloned();
             }
             Input::Click { col, row } => {
-                if let Some(id) = self.hit.nodes.get(&(col, row)) {
-                    self.selected = Some(id.clone());
-                    self.hovered = None;
-                }
+                // Pin whatever is under the pointer: a vertex, else a link, else
+                // clear the pin by clicking empty space. The pin is sticky.
+                self.selected = if let Some(id) = self.hit.nodes.get(&(col, row)) {
+                    Some(Selection::Node(id.clone()))
+                } else {
+                    self.hit
+                        .edges
+                        .get(&(col, row))
+                        .map(|(parent, child)| Selection::Edge(parent.clone(), child.clone()))
+                };
+                self.hovered = None;
             }
         }
         Action::Continue
@@ -296,6 +316,7 @@ fn render_graph(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     // Draw the links as braille lines between node cell centres, in a coordinate
     // space of one unit per cell so the lines land on the same cells the labels do.
+    // A link is emphasised (drawn white) when it is hovered or is the pinned link.
     let edges: Vec<(CanvasLine, bool)> = geometry
         .edges
         .iter()
@@ -305,7 +326,12 @@ fn render_graph(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             let hovered = hovered
                 .as_ref()
                 .is_some_and(|(parent, child)| *parent == edge.parent && *child == edge.child);
-            let color = edge_color(edge.active, hovered);
+            let pinned = matches!(
+                &selected,
+                Some(Selection::Edge(parent, child)) if *parent == edge.parent && *child == edge.child
+            );
+            let emphasized = hovered || pinned;
+            let color = edge_color(edge.active, emphasized);
             (
                 CanvasLine {
                     x1,
@@ -314,7 +340,7 @@ fn render_graph(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     y2,
                     color,
                 },
-                hovered,
+                emphasized,
             )
         })
         .collect();
@@ -324,21 +350,20 @@ fn render_graph(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .x_bounds([0.0, f64::from(inner.width)])
         .y_bounds([0.0, f64::from(inner.height)])
         .paint(move |ctx| {
-            // Standbys first, then active, then the hovered link, so the brighter
+            // Standbys first, then active, then the emphasised link, so the brighter
             // lines win where they overlap.
-            for (line, _) in edges
-                .iter()
-                .filter(|(line, hov)| !hov && line.color == Color::DarkGray)
-            {
-                ctx.draw(line);
-            }
-            for (line, hov) in &edges {
-                if !hov && line.color == Color::Green {
+            for (line, emphasized) in &edges {
+                if !emphasized && line.color == Color::DarkGray {
                     ctx.draw(line);
                 }
             }
-            for (line, hov) in &edges {
-                if *hov {
+            for (line, emphasized) in &edges {
+                if !emphasized && line.color == Color::Green {
+                    ctx.draw(line);
+                }
+            }
+            for (line, emphasized) in &edges {
+                if *emphasized {
                     ctx.draw(line);
                 }
             }
@@ -356,7 +381,7 @@ fn render_graph(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             node.label.clone()
         };
         let mut style = node_style(node.state).add_modifier(Modifier::BOLD);
-        if selected.as_deref() == Some(node.id.as_str()) {
+        if matches!(&selected, Some(Selection::Node(id)) if *id == node.id) {
             style = style.add_modifier(Modifier::REVERSED);
         }
         let (start, count) = label_bounds(inner, node.cell, &label);
@@ -397,12 +422,15 @@ fn canvas_point(inner: Rect, cell: (u16, u16)) -> (f64, f64) {
 /// The info panel beside the graph: the hovered link's detail, else the selected
 /// vertex's detail, else a legend of keys and colours.
 fn render_info(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let (title, lines) = if let Some((parent, child)) = &app.hovered {
-        (" link ", edge_info_lines(&app.state, parent, child))
-    } else if let Some(id) = &app.selected {
-        (" details ", node_detail_lines(&app.state, id))
-    } else {
-        (" keys ", legend_lines())
+    // A pin wins: a click or key keeps its detail up regardless of the pointer.
+    // Only with nothing pinned does a hover preview the link under the pointer.
+    let (title, lines) = match (&app.selected, &app.hovered) {
+        (Some(Selection::Node(id)), _) => (" details ", node_detail_lines(&app.state, id)),
+        (Some(Selection::Edge(parent, child)), _) => {
+            (" link ", edge_info_lines(&app.state, parent, child))
+        }
+        (None, Some((parent, child))) => (" link ", edge_info_lines(&app.state, parent, child)),
+        (None, None) => (" keys ", legend_lines()),
     };
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
@@ -836,7 +864,7 @@ fn state_style(state: NodeState) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{draw, Action, App, Input};
+    use super::{draw, Action, App, Input, Selection};
     use crate::capability::{CpuArch, NodeProfile, Os, Role};
     use crate::graph::Topology;
     use crate::observability::{Event, NodeState};
@@ -1223,19 +1251,19 @@ mod tests {
         // Selectable ids in order: idA, idB, idS.
         let mut app = diamond();
         assert_eq!(app.on_input(Input::SelectNext), Action::Continue);
-        assert_eq!(app.selected.as_deref(), Some("idA"));
+        assert_eq!(app.selected, Some(Selection::Node("idA".to_string())));
         app.on_input(Input::SelectNext);
-        assert_eq!(app.selected.as_deref(), Some("idB"));
+        assert_eq!(app.selected, Some(Selection::Node("idB".to_string())));
         app.on_input(Input::SelectPrev);
-        assert_eq!(app.selected.as_deref(), Some("idA"));
+        assert_eq!(app.selected, Some(Selection::Node("idA".to_string())));
         // Stepping back past the first wraps to the last.
         app.on_input(Input::SelectPrev);
-        assert_eq!(app.selected.as_deref(), Some("idS"));
+        assert_eq!(app.selected, Some(Selection::Node("idS".to_string())));
         app.on_input(Input::Clear);
         assert_eq!(app.selected, None);
         // With nothing selected, a backward step lands on the last.
         app.on_input(Input::SelectPrev);
-        assert_eq!(app.selected.as_deref(), Some("idS"));
+        assert_eq!(app.selected, Some(Selection::Node("idS".to_string())));
     }
 
     #[test]
@@ -1267,7 +1295,7 @@ mod tests {
             .find(|(_, id)| id.as_str() == "idA")
             .expect("gatewayA is hittable after a draw");
         assert_eq!(app.on_input(Input::Click { col, row }), Action::Continue);
-        assert_eq!(app.selected.as_deref(), Some("idA"));
+        assert_eq!(app.selected, Some(Selection::Node("idA".to_string())));
     }
 
     #[test]
@@ -1286,6 +1314,55 @@ mod tests {
         by_click.on_input(Input::Click { col, row });
 
         assert_eq!(by_key.selected, by_click.selected);
+    }
+
+    #[test]
+    fn a_click_pins_the_link_under_the_pointer() {
+        let mut app = diamond();
+        draw_into(&mut app);
+        // A link's endpoint cells coincide with node labels (where nodes win), so
+        // pick a mid-link cell that belongs to no node.
+        let (&(col, row), edge) = app
+            .hit
+            .edges
+            .iter()
+            .find(|(cell, _)| !app.hit.nodes.contains_key(*cell))
+            .expect("a link has a cell of its own after a draw");
+        let (parent, child) = edge.clone();
+        app.on_input(Input::Click { col, row });
+        assert_eq!(app.selected, Some(Selection::Edge(parent, child)));
+    }
+
+    #[test]
+    fn clicking_empty_space_clears_the_pin() {
+        let mut app = diamond();
+        app.selected = Some(Selection::Node("idA".to_string()));
+        draw_into(&mut app);
+        // The top-left corner is a border cell, neither a node nor a link.
+        app.on_input(Input::Click { col: 0, row: 0 });
+        assert_eq!(app.selected, None);
+    }
+
+    #[test]
+    fn a_pin_outranks_a_hover_in_the_panel() {
+        // Clicking a node and then moving the pointer over a link must keep the
+        // node's detail up: the pin is sticky, the hover only previews when nothing
+        // is pinned.
+        let mut app = diamond();
+        app.selected = Some(Selection::Node("idA".to_string()));
+        app.hovered = Some(("idB".to_string(), "idS".to_string()));
+        let text = render(&app).join("\n");
+        assert!(text.contains("node  gatewayA"), "{text}");
+        assert!(!text.contains("path  standby"), "{text}");
+    }
+
+    #[test]
+    fn a_pinned_link_shows_its_info() {
+        let mut app = diamond();
+        app.selected = Some(Selection::Edge("idB".to_string(), "idS".to_string()));
+        let text = render(&app).join("\n");
+        assert!(text.contains("gatewayB -> shared"), "{text}");
+        assert!(text.contains("standby"), "{text}");
     }
 
     #[test]
@@ -1317,7 +1394,7 @@ mod tests {
     #[test]
     fn the_detail_panel_describes_the_selected_node() {
         let mut app = diamond();
-        app.selected = Some("idA".to_string());
+        app.selected = Some(Selection::Node("idA".to_string()));
         let text = render(&app).join("\n");
         assert!(text.contains("details"), "{text}");
         assert!(text.contains("node  gatewayA"), "{text}");
@@ -1331,7 +1408,7 @@ mod tests {
         use crate::observability::NodeTelemetry;
         // Without a sample the panel says utilisation is unavailable.
         let mut app = diamond();
-        app.selected = Some("idA".to_string());
+        app.selected = Some(Selection::Node("idA".to_string()));
         assert!(render(&app).join("\n").contains("util  n/a"));
 
         // A sample with a GPU shows CPU, memory, GPU, and the running task count.
