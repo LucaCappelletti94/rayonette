@@ -105,6 +105,15 @@ Watch a finished trace (a committed capstone recording lives at
 cargo run -p tui-replay -- rayonet/tests/fixtures/capstone.jsonl 4
 ```
 
+The capstone trace is recorded with the build cache warm, so every node provisions
+by cache hit and jumps straight to Ready. To watch the full provisioning ladder
+(probe, install the toolchain, ship the source, compile the agent), replay the
+cold recording, where the relay was built from scratch:
+
+```sh
+cargo run -p tui-replay -- rayonet/tests/fixtures/cold-provisioning.jsonl 1
+```
+
 Watch a run live: set the log, run the scenario, and follow the log from another
 terminal (it renders events as they are written):
 
