@@ -132,6 +132,17 @@ RAYONET_EVENT_LOG=/tmp/run.jsonl KEEP=1 ./capstone/run.sh    # one terminal
 cargo run -p tui-replay -- --follow /tmp/run.jsonl           # another terminal
 ```
 
+Steer a run live: also set a control socket, then attach the viewer with
+`--control`. Select a node (Tab / click) and press `space` to pause or resume a
+compute leaf, `k` to kill a node now, or `d` to kill it after its current tasks
+drain. The coordinator runs on the host, so the socket is a host path:
+
+```sh
+RAYONET_EVENT_LOG=/tmp/run.jsonl RAYONET_CONTROL_SOCKET=/tmp/run.sock \
+  RAYONET_HEAVY_COUNT=1400 KEEP=1 ./metropolis/run.sh                  # one terminal
+cargo run -p tui-replay -- --follow /tmp/run.jsonl --control /tmp/run.sock  # another
+```
+
 Refine the TUI against a real run: edit `rayonet/src/tui.rs`, run the snapshot
 test, read the text diff of how the captured capstone now renders at 25 / 50 / 75
 / 100% of the run, and re-bless the golden when the change is intended:

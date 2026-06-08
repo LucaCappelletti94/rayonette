@@ -6,16 +6,22 @@
 //! watch the run unfold and refine the view against a real, evolving topology.
 //!
 //! ```text
-//! tui-replay <trace.jsonl> [speed]   replay a finished trace (speed x, default 1)
-//! tui-replay --follow <trace.jsonl>  watch a trace as it is written (live)
+//! tui-replay <trace.jsonl> [speed]            replay a finished trace (speed x)
+//! tui-replay --follow <trace.jsonl>           watch a trace as it is written
+//! tui-replay --follow --control <sock> <log>  watch live and steer the run
 //! ```
 //!
 //! Controls: Tab / Shift-Tab (or the arrow keys) select a node, the mouse selects
 //! a node or hovers a link, Esc clears the selection, `p` pauses playback, and `q`
-//! quits. The terminal is restored on exit.
+//! quits. With a control socket attached (`--control <path>`, or the
+//! `RAYONET_CONTROL_SOCKET` env var) the selected node can be steered live:
+//! `space` pauses or resumes a compute leaf, `k` kills the node now, and `d` kills
+//! it after its current tasks drain. Without a socket those keys do nothing. The
+//! terminal is restored on exit.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Stdout};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ratatui::backend::CrosstermBackend;
@@ -28,34 +34,78 @@ use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::Terminal;
+use rayonet::control::{Control, ControlClient};
 use rayonet::observability::RecordedEvent;
 use rayonet::tui::{Action, App, Input};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
+/// Forwards the dashboard's control commands to a running coordinator over its
+/// Unix control socket. A small current-thread runtime drives the async client
+/// from this otherwise-synchronous viewer; sends are rare (one per keypress), so
+/// blocking on each is fine. With no socket configured the commands are dropped.
+struct Controller {
+    runtime: tokio::runtime::Runtime,
+    socket: Option<PathBuf>,
+    client: Option<ControlClient>,
+}
+
+impl Controller {
+    /// A controller targeting `socket` (none disables control).
+    fn new(socket: Option<PathBuf>) -> io::Result<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        Ok(Self {
+            runtime,
+            socket,
+            client: None,
+        })
+    }
+
+    /// Forward `control` to the coordinator, connecting (or reconnecting) lazily.
+    /// A configured-but-unreachable socket is simply retried on the next command.
+    fn send(&mut self, control: &Control) {
+        let Some(socket) = self.socket.clone() else {
+            return;
+        };
+        if self.client.is_none() {
+            self.client = self.runtime.block_on(ControlClient::connect(&socket)).ok();
+        }
+        if let Some(client) = self.client.as_mut() {
+            if self.runtime.block_on(client.send(control)).is_err() {
+                self.client = None; // dropped; reconnect on the next command
+            }
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
     let mut follow = false;
     let mut path: Option<String> = None;
     let mut speed = 1.0_f64;
-    for arg in std::env::args().skip(1) {
-        if arg == "--follow" {
-            follow = true;
-        } else if path.is_none() {
-            path = Some(arg);
-        } else {
-            speed = arg.parse().unwrap_or(1.0);
+    // The control socket: a `--control <path>` flag, else `RAYONET_CONTROL_SOCKET`.
+    let mut control = std::env::var_os("RAYONET_CONTROL_SOCKET").map(PathBuf::from);
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--follow" => follow = true,
+            "--control" => control = args.next().map(PathBuf::from),
+            _ if path.is_none() => path = Some(arg),
+            _ => speed = arg.parse().unwrap_or(1.0),
         }
     }
     let Some(path) = path else {
-        eprintln!("usage: tui-replay [--follow] <trace.jsonl> [speed]");
+        eprintln!("usage: tui-replay [--follow] [--control <socket>] <trace.jsonl> [speed]");
         std::process::exit(2);
     };
+    let mut controller = Controller::new(control)?;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    let outcome = replay(&mut terminal, &path, speed, follow);
+    let outcome = replay(&mut terminal, &path, speed, follow, &mut controller);
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -73,6 +123,9 @@ fn to_input(event: CtEvent) -> Option<Input> {
         CtEvent::Key(key) => match key.code {
             KeyCode::Char('q') => Some(Input::Quit),
             KeyCode::Char('p') => Some(Input::TogglePause),
+            KeyCode::Char(' ') => Some(Input::PauseNode),
+            KeyCode::Char('k') => Some(Input::KillNode),
+            KeyCode::Char('d') => Some(Input::DrainNode),
             KeyCode::Tab | KeyCode::Down => Some(Input::SelectNext),
             KeyCode::BackTab | KeyCode::Up => Some(Input::SelectPrev),
             KeyCode::Esc => Some(Input::Clear),
@@ -95,11 +148,13 @@ fn to_input(event: CtEvent) -> Option<Input> {
 
 /// Drain pending terminal events into `app`, returning [`Action::Quit`] if any of
 /// them asked to quit.
-fn pump_input(app: &mut App) -> io::Result<Action> {
+fn pump_input(app: &mut App, controller: &mut Controller) -> io::Result<Action> {
     while event::poll(Duration::from_millis(0))? {
         if let Some(input) = to_input(event::read()?) {
-            if app.on_input(input) == Action::Quit {
-                return Ok(Action::Quit);
+            match app.on_input(input) {
+                Action::Quit => return Ok(Action::Quit),
+                Action::Control(control) => controller.send(&control),
+                Action::Continue => {}
             }
         }
     }
@@ -108,13 +163,19 @@ fn pump_input(app: &mut App) -> io::Result<Action> {
 
 /// Open the trace (waiting for it in follow mode), then apply and draw each event,
 /// pacing playback and handling input, until the trace ends or the viewer quits.
-fn replay(terminal: &mut Term, path: &str, speed: f64, follow: bool) -> io::Result<()> {
+fn replay(
+    terminal: &mut Term,
+    path: &str,
+    speed: f64,
+    follow: bool,
+    controller: &mut Controller,
+) -> io::Result<()> {
     let mut app = App::new();
     let mut reader = loop {
         match File::open(path) {
             Ok(file) => break BufReader::new(file),
             Err(_) if follow => {
-                if pump_input(&mut app)? == Action::Quit {
+                if pump_input(&mut app, controller)? == Action::Quit {
                     return Ok(());
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -137,7 +198,7 @@ fn replay(terminal: &mut Term, path: &str, speed: f64, follow: bool) -> io::Resu
     let mut last_applied = Instant::now();
     let mut line = String::new();
     loop {
-        if pump_input(&mut app)? == Action::Quit {
+        if pump_input(&mut app, controller)? == Action::Quit {
             return Ok(());
         }
         terminal.draw(|frame| rayonet::tui::draw(frame, &mut app))?;
@@ -166,7 +227,7 @@ fn replay(terminal: &mut Term, path: &str, speed: f64, follow: bool) -> io::Resu
                 .max(last_applied + min_dwell)
         };
         while Instant::now() < target {
-            if pump_input(&mut app)? == Action::Quit {
+            if pump_input(&mut app, controller)? == Action::Quit {
                 return Ok(());
             }
             terminal.draw(|frame| rayonet::tui::draw(frame, &mut app))?;

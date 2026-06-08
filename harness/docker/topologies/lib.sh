@@ -91,6 +91,10 @@ topo_drive() { # config leaves task count [require]
   # Forward the event-recording path if the caller set one, so a run can be
   # captured for TUI replay (see examples/tui-replay) without changing scenarios.
   [ -n "${RAYONET_EVENT_LOG:-}" ] && vars+=(RAYONET_EVENT_LOG="$RAYONET_EVENT_LOG")
+  # Forward the control socket if set, so a TUI attached with `--control` can
+  # pause or kill nodes in this live run (the coordinator runs on the host, so the
+  # socket is a host path the viewer can connect to).
+  [ -n "${RAYONET_CONTROL_SOCKET:-}" ] && vars+=(RAYONET_CONTROL_SOCKET="$RAYONET_CONTROL_SOCKET")
   # Line-buffer stdout so the per-node state lines reach a piped log promptly,
   # which is what lets a kill scenario detect "Working" and fire mid-run. The
   # timeout is a backstop: a correct run finishes or fails in seconds, so if a

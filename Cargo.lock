@@ -1423,6 +1423,7 @@ dependencies = [
  "ratatui",
  "rayonet",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
