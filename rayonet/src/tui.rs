@@ -12,7 +12,7 @@ use std::time::Duration;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
 use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table};
 use ratatui::Frame;
@@ -202,7 +202,7 @@ fn microseconds_to_millis(microseconds: u64) -> f64 {
 fn log_line(event: &Event, state: &RunState) -> Option<String> {
     match event {
         Event::RunStarted { tasks } => Some(format!("run started: {tasks} tasks")),
-        Event::Node { host, state } => Some(format!("{}: {state:?}", leaf_of(host))),
+        Event::Node { host, state } => Some(format!("{}: {}", leaf_of(host), state_label(*state))),
         Event::Profiled { host, role, .. } => Some(format!("{}: {role:?}", leaf_of(host))),
         // Telemetry and task starts update panels, not the rolling log.
         Event::TaskStarted { .. } | Event::Telemetry { .. } => None,
@@ -480,7 +480,11 @@ fn node_detail_lines(state: &RunState, id: &str) -> Vec<Line<'static>> {
         Line::from(format!("node  {label}")),
         Line::from(format!("id    {id:.8}")),
         Line::from(format!("role  {role:?}")),
-        Line::from(format!("{} {node_state:?}", node_glyph(Some(node_state)))),
+        Line::from(format!(
+            "{} {}",
+            node_glyph(Some(node_state)),
+            state_label(node_state)
+        )),
         Line::from(format!("  {}", state_meaning(node_state))),
         Line::from(format!(
             "reach {}",
@@ -511,14 +515,31 @@ fn node_detail_lines(state: &RunState, id: &str) -> Vec<Line<'static>> {
     lines
 }
 
-/// A plain-English explanation of what a node's state (and so its glyph) means, for
-/// the detail panel.
+/// A short, self-explanatory label for a node state, used wherever the state is
+/// shown (the table, the detail header, the event log). The bare enum names are
+/// ambiguous (does "Installing" mean Rust or the source?), so each says what it is.
+const fn state_label(state: NodeState) -> &'static str {
+    match state {
+        NodeState::Probing => "Probing host",
+        NodeState::Installing => "Installing Rust",
+        NodeState::Syncing => "Shipping source",
+        NodeState::Building => "Building agent",
+        NodeState::Ready => "Ready",
+        NodeState::Idle => "Idle",
+        NodeState::Working => "Working",
+        NodeState::Done => "Done",
+        NodeState::Lost => "Lost",
+    }
+}
+
+/// A fuller sentence explaining a node's state (and so its glyph), for the detail
+/// panel, complementing the short [`state_label`].
 const fn state_meaning(state: NodeState) -> &'static str {
     match state {
         NodeState::Probing => "checking the host responds",
-        NodeState::Installing => "installing the toolchain",
-        NodeState::Syncing => "shipping the crate source",
-        NodeState::Building => "compiling the agent",
+        NodeState::Installing => "the host had no Rust toolchain",
+        NodeState::Syncing => "uploading the crate to build",
+        NodeState::Building => "compiling the agent on the host",
         NodeState::Ready => "built, awaiting work",
         NodeState::Idle => "connected, no task in flight",
         NodeState::Working => "running tasks now",
@@ -573,22 +594,37 @@ fn edge_info_lines(state: &RunState, parent_id: &str, child_id: &str) -> Vec<Lin
     ]
 }
 
-/// The legend shown when nothing is selected or hovered.
+/// The legend shown when nothing is selected or hovered: the keys, then a key of
+/// the graph's glyphs each drawn in its own state colour, so it reads as the
+/// colour-and-glyph legend it describes rather than naming the colours in plain
+/// text.
 fn legend_lines() -> Vec<Line<'static>> {
-    [
-        "keys",
-        "Tab / S-Tab  select",
-        "click        select",
-        "hover edge   link info",
-        "p pause   q quit",
-        "",
-        "green working  blue done",
-        "red lost   cyan ready",
-        "yellow building",
+    // One key entry: the glyph and label drawn in the state's colour, matching the
+    // graph exactly.
+    let key = |state: Option<NodeState>, label: &str| {
+        Line::from(Span::styled(
+            format!("{} {label}", node_glyph(state)),
+            node_style(state),
+        ))
+    };
+    vec![
+        Line::from("keys"),
+        Line::from("Tab / S-Tab  select"),
+        Line::from("click        select"),
+        Line::from("hover edge   link info"),
+        Line::from("p pause   q quit"),
+        Line::from(""),
+        key(None, "coordinator"),
+        key(Some(NodeState::Working), "working"),
+        key(Some(NodeState::Done), "done"),
+        key(Some(NodeState::Ready), "ready / idle"),
+        key(Some(NodeState::Building), "provisioning"),
+        key(Some(NodeState::Lost), "lost"),
+        Line::from(Span::styled(
+            "\u{2691} single point of failure",
+            Style::default().fg(Color::Red),
+        )),
     ]
-    .into_iter()
-    .map(Line::from)
-    .collect()
 }
 
 /// Whether the link from `parent_id` to `child_id` is the active primary path. A
@@ -860,7 +896,7 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Row::new([
             Cell::from(path.clone()),
             Cell::from(role),
-            Cell::from(format!("{effective:?}")).style(state_style(effective)),
+            Cell::from(state_label(effective)).style(state_style(effective)),
             Cell::from(state.subtree_completed(path).to_string()),
             Cell::from(latency),
             Cell::from(arch),
@@ -871,7 +907,7 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let widths = [
         Constraint::Min(16),
         Constraint::Length(10),
-        Constraint::Length(10),
+        Constraint::Length(16),
         Constraint::Length(5),
         Constraint::Length(7),
         Constraint::Length(14),
@@ -1572,8 +1608,8 @@ mod tests {
     }
 
     #[test]
-    fn state_meaning_describes_every_state() {
-        use super::state_meaning;
+    fn state_label_and_meaning_describe_every_state() {
+        use super::{state_label, state_meaning};
         for state in [
             NodeState::Probing,
             NodeState::Installing,
@@ -1585,8 +1621,32 @@ mod tests {
             NodeState::Done,
             NodeState::Lost,
         ] {
+            assert!(!state_label(state).is_empty());
             assert!(!state_meaning(state).is_empty());
         }
+        // The ambiguous states say what they act on.
+        assert_eq!(state_label(NodeState::Installing), "Installing Rust");
+        assert_eq!(state_label(NodeState::Syncing), "Shipping source");
+        assert_eq!(state_label(NodeState::Building), "Building agent");
+    }
+
+    #[test]
+    fn the_legend_colours_its_glyph_key() {
+        // With nothing selected the info panel shows the legend; its entries are
+        // drawn in the state colours, not named in plain text.
+        let buffer = render_buffer(&diamond());
+        let area = buffer.area();
+        let mut greens = 0;
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let cell = buffer.cell((x, y)).unwrap();
+                if cell.symbol() == "\u{25cf}" && cell.style().fg == Some(Color::Green) {
+                    greens += 1;
+                }
+            }
+        }
+        // The working dot in the key (and any working node in the graph) is green.
+        assert!(greens >= 1, "the legend's working glyph is coloured");
     }
 
     #[test]
