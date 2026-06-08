@@ -827,19 +827,20 @@ mod tests {
         }
         // The relay is the coordinator's direct child; its two leaves appear one
         // level deeper, profiled as Compute and finished.
-        assert!(state.nodes.contains_key("relay"));
+        assert!(state.nodes().contains_key("relay"));
         for leaf in ["relay/leaf-a", "relay/leaf-b"] {
-            assert_eq!(state.nodes[leaf].role, Some(Role::Compute), "{leaf}");
-            assert_eq!(state.nodes[leaf].state, NodeState::Done, "{leaf}");
+            assert_eq!(state.nodes()[leaf].role(), Some(Role::Compute), "{leaf}");
+            assert_eq!(state.nodes()[leaf].state(), NodeState::Done, "{leaf}");
         }
         // Completions are credited to the deep leaf that ran them, not to the relay
         // the coordinator heard the result from.
         assert_eq!(
-            state.nodes["relay"].completed, 0,
+            state.nodes()["relay"].completed(),
+            0,
             "the relay computes nothing"
         );
         let on_leaves =
-            state.nodes["relay/leaf-a"].completed + state.nodes["relay/leaf-b"].completed;
+            state.nodes()["relay/leaf-a"].completed() + state.nodes()["relay/leaf-b"].completed();
         assert_eq!(on_leaves, 12, "every completion landed on a leaf");
     }
 
@@ -902,10 +903,10 @@ mod tests {
             state.apply(event);
         }
         // Neither relay computes; the two deepest leaves account for every task.
-        assert_eq!(state.nodes["relay"].completed, 0);
-        assert_eq!(state.nodes["relay/sub-relay"].completed, 0);
-        let on_leaves = state.nodes["relay/sub-relay/leaf-a"].completed
-            + state.nodes["relay/sub-relay/leaf-b"].completed;
+        assert_eq!(state.nodes()["relay"].completed(), 0);
+        assert_eq!(state.nodes()["relay/sub-relay"].completed(), 0);
+        let on_leaves = state.nodes()["relay/sub-relay/leaf-a"].completed()
+            + state.nodes()["relay/sub-relay/leaf-b"].completed();
         assert_eq!(on_leaves, 16, "every completion landed on a deep leaf");
     }
 
@@ -1190,7 +1191,7 @@ mod tests {
             state.apply(event);
         }
         assert!(
-            state.nodes.contains_key("relay/leaf-b"),
+            state.nodes().contains_key("relay/leaf-b"),
             "the added child joined the subtree"
         );
         assert!(

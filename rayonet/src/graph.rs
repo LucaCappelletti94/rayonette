@@ -35,7 +35,7 @@ use geometric_traits::{
 };
 
 use crate::capability::{NodeProfile, Role};
-use crate::observability::{parent_of, Event, RunState};
+use crate::observability::{parent_of, Event, NodeView, RunState};
 use crate::protocol::ChildAd;
 
 /// The synthetic root vertex standing for the coordinator, the parent of every
@@ -204,11 +204,7 @@ impl Topology {
     pub fn from_run_state(state: &RunState) -> Self {
         // Vertex 0 is the coordinator root, then each distinct physical id in
         // sorted order for a deterministic vertex numbering.
-        let physical: BTreeSet<&str> = state
-            .nodes
-            .values()
-            .filter_map(|v| v.id.as_deref())
-            .collect();
+        let physical: BTreeSet<&str> = state.nodes().values().filter_map(NodeView::id).collect();
         let mut ids = Vec::with_capacity(physical.len() + 1);
         let mut index = BTreeMap::new();
         ids.push(ROOT.to_string());
@@ -225,22 +221,22 @@ impl Topology {
         // rejects them and they carry no topology. Link weights start neutral and
         // are filled in as discovery measures them.
         let mut edges = BTreeMap::new();
-        for (path, view) in &state.nodes {
-            let Some(child) = view.id.as_deref() else {
+        for (path, view) in state.nodes() {
+            let Some(child) = view.id() else {
                 continue;
             };
             let parent = parent_of(path).map_or(ROOT, |parent_path| {
                 state
-                    .nodes
+                    .nodes()
                     .get(parent_path)
-                    .and_then(|v| v.id.as_deref())
+                    .and_then(NodeView::id)
                     .unwrap_or(ROOT)
             });
             let (parent, child) = (index[parent], index[child]);
             if parent != child {
                 // This path's last-hop link latency weights its edge. A node on
                 // two paths gets two edges, each with its own latency.
-                let latency_ms = view.latency_us.map_or(0.0, microseconds_to_millis);
+                let latency_ms = view.latency_us().map_or(0.0, microseconds_to_millis);
                 edges.insert(
                     (parent, child),
                     LinkMetric {

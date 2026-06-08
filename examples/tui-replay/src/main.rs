@@ -143,7 +143,7 @@ fn replay(terminal: &mut Term, path: &str, speed: f64, follow: bool) -> io::Resu
         terminal.draw(|frame| rayonet::tui::draw(frame, &mut app))?;
 
         // While paused, keep the view interactive but hold the trace position.
-        if app.paused {
+        if app.paused() {
             std::thread::sleep(Duration::from_millis(30));
             continue;
         }
@@ -162,7 +162,7 @@ fn replay(terminal: &mut Term, path: &str, speed: f64, follow: bool) -> io::Resu
         let target = if follow {
             last_applied + min_dwell
         } else {
-            (start + Duration::from_secs_f64(record.elapsed_ms as f64 / 1000.0 / speed))
+            (start + Duration::from_secs_f64(record.elapsed_ms() as f64 / 1000.0 / speed))
                 .max(last_applied + min_dwell)
         };
         while Instant::now() < target {
@@ -172,8 +172,8 @@ fn replay(terminal: &mut Term, path: &str, speed: f64, follow: bool) -> io::Resu
             terminal.draw(|frame| rayonet::tui::draw(frame, &mut app))?;
             std::thread::sleep(Duration::from_millis(10));
         }
-        app.apply(&record.event);
-        app.elapsed = start.elapsed();
+        app.apply(record.event());
+        app.set_elapsed(start.elapsed());
         last_applied = Instant::now();
     }
 }

@@ -20,7 +20,9 @@ use ratatui::Frame;
 use crate::capability::NodeProfile;
 use crate::graph::{Metric, Topology};
 use crate::layout::positions;
-use crate::observability::{leaf_of, parent_of, Event, NodeState, NodeTelemetry, RunState};
+use crate::observability::{
+    leaf_of, parent_of, Event, NodeState, NodeTelemetry, NodeView, RunState,
+};
 
 /// The most recent event-log lines [`App`] keeps for the log panel.
 const LOG_CAPACITY: usize = 256;
@@ -94,20 +96,20 @@ pub enum Selection {
 #[derive(Debug, Clone, Default)]
 pub struct App {
     /// The reduced per-node and per-task picture.
-    pub state: RunState,
+    state: RunState,
     /// The most recent event-log lines, oldest first, capped at [`LOG_CAPACITY`].
-    pub log: VecDeque<String>,
+    log: VecDeque<String>,
     /// Time since the run started, set by the driver.
-    pub elapsed: Duration,
+    elapsed: Duration,
     /// The pinned vertex or link whose detail the panel shows, if any. Sticky: a
     /// click or a key sets it and it stays until changed.
-    pub selected: Option<Selection>,
+    selected: Option<Selection>,
     /// The `(parent id, child id)` of the link under the pointer, if any. Transient:
     /// it highlights the link in the graph and previews its info when nothing is
     /// pinned.
-    pub hovered: Option<(String, String)>,
+    hovered: Option<(String, String)>,
     /// Whether the driver has been asked to pause.
-    pub paused: bool,
+    paused: bool,
     /// The last graph draw's cell-to-vertex and cell-to-edge map.
     hit: HitMap,
 }
@@ -117,6 +119,20 @@ impl App {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether the driver has been asked to pause (toggled through
+    /// [`on_input`](App::on_input)).
+    #[must_use]
+    pub const fn paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Set the time since the run started. The driver supplies this (wall clock
+    /// for a live run, the recorded timestamp for a replay) so rendering stays a
+    /// pure function of the state.
+    pub const fn set_elapsed(&mut self, elapsed: Duration) {
+        self.elapsed = elapsed;
     }
 
     /// Fold one event into the dashboard: update the run state and, if the event
@@ -209,8 +225,8 @@ fn log_line(event: &Event, state: &RunState) -> Option<String> {
         Event::TaskStarted { .. } | Event::Telemetry { .. } => None,
         Event::TaskFinished { .. } => Some(format!(
             "progress {}/{}",
-            state.completed + state.failed,
-            state.total_tasks
+            state.completed() + state.failed(),
+            state.total_tasks()
         )),
     }
 }
@@ -254,10 +270,10 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let state = &app.state;
     let summary = format!(
         "{}/{} done   {} failed   {} nodes   {:.1}s",
-        state.completed,
-        state.total_tasks,
-        state.failed,
-        state.nodes.len(),
+        state.completed(),
+        state.total_tasks(),
+        state.failed(),
+        state.nodes().len(),
         app.elapsed.as_secs_f64(),
     );
     frame.render_widget(
@@ -265,19 +281,19 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         cells[0],
     );
 
-    let done = state.completed + state.failed;
-    let ratio = if state.total_tasks == 0 {
+    let done = state.completed() + state.failed();
+    let ratio = if state.total_tasks() == 0 {
         0.0
     } else {
         f64::from(u32::try_from(done).unwrap_or(u32::MAX))
-            / f64::from(u32::try_from(state.total_tasks).unwrap_or(u32::MAX))
+            / f64::from(u32::try_from(state.total_tasks()).unwrap_or(u32::MAX))
     };
     frame.render_widget(
         Gauge::default()
             .block(Block::default().borders(Borders::ALL).title(" progress "))
             .gauge_style(Style::default().fg(Color::Green))
             .ratio(ratio.clamp(0.0, 1.0))
-            .label(format!("{done}/{}", state.total_tasks)),
+            .label(format!("{done}/{}", state.total_tasks())),
         cells[1],
     );
 }
@@ -459,20 +475,17 @@ fn node_detail_lines(state: &RunState, id: &str) -> Vec<Line<'static>> {
         .get(id)
         .expect("a selected vertex has at least one path");
     let view = state
-        .nodes
+        .nodes()
         .get(*mine.first().expect("the path list is non-empty"))
         .expect("a discovered path has a view");
-    let profile = view
-        .profile
-        .as_ref()
-        .expect("a profiled node has a profile");
+    let profile = view.profile().expect("a profiled node has a profile");
     // Work done by or under this node, summed across every path that reaches it: a
     // leaf reports its own, a relay rolls its subtree up.
     let completed: usize = mine.iter().map(|path| state.subtree_completed(path)).sum();
 
-    let role = view.role.expect("a profiled node has a role");
+    let role = view.role().expect("a profiled node has a role");
     let node_state = vertex_state(state, id).expect("a selected vertex has a state");
-    let latency = microseconds_to_millis(view.latency_us.expect("a profiled node has a latency"));
+    let latency = microseconds_to_millis(view.latency_us().expect("a profiled node has a latency"));
     let spof = topology.single_points_of_failure().contains(id);
     // The state glyph and the flag the graph shows are spelled out here, so the
     // icon language explains itself. Pairs of fields share a line to leave room for
@@ -487,9 +500,8 @@ fn node_detail_lines(state: &RunState, id: &str) -> Vec<Line<'static>> {
     // reaches it by (its route through the tree). "ip n/a" until it reports a
     // telemetry sample (or off Linux, where the sampler does not read them yet).
     let ips = view
-        .telemetry
-        .as_ref()
-        .map(|telemetry| telemetry.interfaces.join("  "))
+        .telemetry()
+        .map(|telemetry| telemetry.interfaces().join("  "))
         .filter(|joined| !joined.is_empty())
         .unwrap_or_else(|| "n/a".to_string());
     let mut lines = vec![
@@ -517,7 +529,7 @@ fn node_detail_lines(state: &RunState, id: &str) -> Vec<Line<'static>> {
             profile.gpus().len(),
         )),
     ];
-    lines.extend(telemetry_lines(view.telemetry.as_ref()));
+    lines.extend(telemetry_lines(view.telemetry()));
     lines
 }
 
@@ -561,14 +573,15 @@ fn telemetry_lines(telemetry: Option<&NodeTelemetry>) -> Vec<Line<'static>> {
         return vec![Line::from("util  n/a")];
     };
     let gpu = sample
-        .gpu_pct
+        .gpu_pct()
         .map_or_else(String::new, |pct| format!("  gpu {pct}%"));
     vec![
         Line::from(format!(
             "cpu {}%  mem {}%{gpu}",
-            sample.cpu_pct, sample.mem_pct
+            sample.cpu_pct(),
+            sample.mem_pct()
         )),
-        Line::from(format!("tasks {} running", sample.in_flight)),
+        Line::from(format!("tasks {} running", sample.in_flight())),
     ]
 }
 
@@ -649,15 +662,15 @@ fn edge_is_active(state: &RunState, parent_id: &str, child_id: &str) -> bool {
 fn edge_latency(state: &RunState, parent_id: &str, child_id: &str) -> Option<u64> {
     let topology = Topology::from_run_state(state);
     let root = topology.vertices().first()?;
-    for (path, view) in &state.nodes {
-        if view.id.as_deref() != Some(child_id) {
+    for (path, view) in state.nodes() {
+        if view.id() != Some(child_id) {
             continue;
         }
         let resolved_parent = parent_of(path).map_or(Some(root.as_str()), |parent_path| {
-            state.nodes.get(parent_path).and_then(|v| v.id.as_deref())
+            state.nodes().get(parent_path).and_then(NodeView::id)
         });
         if resolved_parent == Some(parent_id) {
-            return view.latency_us;
+            return view.latency_us();
         }
     }
     None
@@ -762,9 +775,9 @@ fn vertex_labels(state: &RunState) -> BTreeMap<String, String> {
         .filter_map(|(id, paths)| {
             let path = *paths.first()?;
             let label = state
-                .nodes
+                .nodes()
                 .get(path)
-                .and_then(|view| view.profile.as_ref())
+                .and_then(NodeView::profile)
                 .map(NodeProfile::hostname)
                 .filter(|hostname| !hostname.is_empty())
                 .unwrap_or_else(|| leaf_of(path))
@@ -905,28 +918,27 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
 
-    let rows = state.nodes.iter().map(|(path, view)| {
+    let rows = state.nodes().iter().map(|(path, view)| {
         let effective = state.effective_state(path);
         let role = view
-            .role
+            .role()
             .map_or_else(String::new, |role| format!("{role:?}"));
-        let latency = view.latency_us.map_or_else(String::new, |us| {
+        let latency = view.latency_us().map_or_else(String::new, |us| {
             format!("{:.1}", microseconds_to_millis(us))
         });
         let arch = view
-            .profile
-            .as_ref()
+            .profile()
             .map_or_else(String::new, |profile| profile.arch().isa().to_string());
-        let flag = if view.id.as_deref().is_some_and(|id| spofs.contains(id)) {
+        let flag = if view.id().is_some_and(|id| spofs.contains(id)) {
             "SPOF"
         } else {
             ""
         };
         // Live utilisation from the node's latest telemetry sample, if any.
-        let telemetry = view.telemetry.as_ref();
-        let cpu = pct_cell(telemetry.map(|t| t.cpu_pct));
-        let mem = pct_cell(telemetry.map(|t| t.mem_pct));
-        let gpu = pct_cell(telemetry.and_then(|t| t.gpu_pct));
+        let telemetry = view.telemetry();
+        let cpu = pct_cell(telemetry.map(NodeTelemetry::cpu_pct));
+        let mem = pct_cell(telemetry.map(NodeTelemetry::mem_pct));
+        let gpu = pct_cell(telemetry.and_then(NodeTelemetry::gpu_pct));
         Row::new([
             Cell::from(path.clone()),
             Cell::from(role),
@@ -1214,14 +1226,7 @@ mod tests {
         app.apply(&Event::node("leaf", NodeState::Working));
         app.apply(&Event::Telemetry {
             host: "leaf".to_string(),
-            telemetry: NodeTelemetry {
-                cpu_pct: 55,
-                mem_pct: 22,
-                gpu_pct: Some(80),
-                gpu_mem_pct: Some(40),
-                in_flight: 1,
-                interfaces: Vec::new(),
-            },
+            telemetry: NodeTelemetry::new(55, 22, Some(80), Some(40), 1, Vec::new()),
         });
         app.apply(&Event::node("bare", NodeState::Ready));
         let rows = render(&app);
@@ -1499,11 +1504,11 @@ mod tests {
     #[test]
     fn pause_toggles_and_quit_signals() {
         let mut app = App::new();
-        assert!(!app.paused);
+        assert!(!app.paused());
         assert_eq!(app.on_input(Input::TogglePause), Action::Continue);
-        assert!(app.paused);
+        assert!(app.paused());
         app.on_input(Input::TogglePause);
-        assert!(!app.paused);
+        assert!(!app.paused());
         assert_eq!(app.on_input(Input::Quit), Action::Quit);
     }
 
@@ -1758,14 +1763,14 @@ mod tests {
         // the node's reported interface IPs.
         app.apply(&Event::Telemetry {
             host: "gatewayA".to_string(),
-            telemetry: NodeTelemetry {
-                cpu_pct: 64,
-                mem_pct: 30,
-                gpu_pct: Some(91),
-                gpu_mem_pct: Some(45),
-                in_flight: 1,
-                interfaces: vec!["100.64.0.7".to_string()],
-            },
+            telemetry: NodeTelemetry::new(
+                64,
+                30,
+                Some(91),
+                Some(45),
+                1,
+                vec!["100.64.0.7".to_string()],
+            ),
         });
         let with_gpu = render(&app).join("\n");
         assert!(with_gpu.contains("cpu 64%"), "{with_gpu}");
@@ -1776,14 +1781,7 @@ mod tests {
         // A sample without a GPU omits the GPU figure.
         app.apply(&Event::Telemetry {
             host: "gatewayA".to_string(),
-            telemetry: NodeTelemetry {
-                cpu_pct: 10,
-                mem_pct: 20,
-                gpu_pct: None,
-                gpu_mem_pct: None,
-                in_flight: 0,
-                interfaces: Vec::new(),
-            },
+            telemetry: NodeTelemetry::new(10, 20, None, None, 0, Vec::new()),
         });
         let no_gpu = render(&app).join("\n");
         assert!(no_gpu.contains("cpu 10%"), "{no_gpu}");

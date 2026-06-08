@@ -1259,9 +1259,9 @@ mod tests {
         for event in &sink.events() {
             state.apply(event);
         }
-        assert_eq!(state.total_tasks, 10);
-        assert_eq!(state.completed, 10);
-        assert_eq!(state.nodes["in-process"].state, NodeState::Done);
+        assert_eq!(state.total_tasks(), 10);
+        assert_eq!(state.completed(), 10);
+        assert_eq!(state.nodes()["in-process"].state(), NodeState::Done);
     }
 
     #[tokio::test]
@@ -1335,13 +1335,13 @@ mod tests {
         }
         // The macOS host was profiled and excluded, never ran a task; the Linux
         // host ran every task to completion.
-        assert_eq!(state.nodes["mac"].role, Some(Role::Excluded));
-        assert_eq!(state.nodes["mac"].completed, 0);
-        assert_eq!(state.nodes["linux"].role, Some(Role::Compute));
-        assert_eq!(state.nodes["linux"].state, NodeState::Done);
+        assert_eq!(state.nodes()["mac"].role(), Some(Role::Excluded));
+        assert_eq!(state.nodes()["mac"].completed(), 0);
+        assert_eq!(state.nodes()["linux"].role(), Some(Role::Compute));
+        assert_eq!(state.nodes()["linux"].state(), NodeState::Done);
         // The node id (the label, for an in-process launcher) flows into the
         // profile event and is recorded per node.
-        assert_eq!(state.nodes["linux"].id.as_deref(), Some("linux"));
+        assert_eq!(state.nodes()["linux"].id(), Some("linux"));
     }
 
     #[tokio::test]
@@ -1396,8 +1396,8 @@ mod tests {
             state.apply(event);
         }
         // The CPU host was profiled but, failing the requirement, ran nothing.
-        assert_eq!(state.nodes["cpu"].completed, 0);
-        assert_eq!(state.nodes["rocm"].state, NodeState::Done);
+        assert_eq!(state.nodes()["cpu"].completed(), 0);
+        assert_eq!(state.nodes()["rocm"].state(), NodeState::Done);
     }
 
     #[tokio::test]
@@ -1502,11 +1502,11 @@ mod tests {
             state.apply(event);
         }
         assert!(
-            state.nodes.contains_key("late"),
+            state.nodes().contains_key("late"),
             "the late host should have joined the run"
         );
         assert!(
-            state.nodes["late"].completed >= 1,
+            state.nodes()["late"].completed() >= 1,
             "the late host should have run pending tasks once it joined"
         );
     }

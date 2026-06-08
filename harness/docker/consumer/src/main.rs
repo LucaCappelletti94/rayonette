@@ -52,10 +52,7 @@ struct Recorder {
 impl Recorder {
     fn record(&mut self, event: &Event) {
         let elapsed_ms = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let record = RecordedEvent {
-            elapsed_ms,
-            event: event.clone(),
-        };
+        let record = RecordedEvent::new(elapsed_ms, event.clone());
         if let Ok(line) = serde_json::to_string(&record) {
             let _ = writeln!(self.file, "{line}");
         }
@@ -192,7 +189,7 @@ async fn main() {
     // Completions are credited to the deep leaf that ran them, so a relay rolls its
     // subtree up: its share line is the work done beneath it (a leaf reports its
     // own), which is what the topology assertions read.
-    for host in state.nodes.keys() {
+    for host in state.nodes().keys() {
         println!("share {host} {}", state.subtree_completed(host));
     }
 }

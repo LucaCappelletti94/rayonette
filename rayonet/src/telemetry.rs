@@ -28,14 +28,14 @@ impl Sampler {
     /// Sample current utilisation, recording `in_flight` tasks running right now.
     pub fn sample(&mut self, in_flight: usize) -> NodeTelemetry {
         let (cpu_pct, mem_pct, gpu) = read_local(&mut self.prev_cpu);
-        NodeTelemetry {
+        NodeTelemetry::new(
             cpu_pct,
             mem_pct,
-            gpu_pct: gpu.map(|(compute, _)| compute),
-            gpu_mem_pct: gpu.map(|(_, memory)| memory),
+            gpu.map(|(compute, _)| compute),
+            gpu.map(|(_, memory)| memory),
             in_flight,
-            interfaces: local_interfaces(),
-        }
+            local_interfaces(),
+        )
     }
 }
 
@@ -257,11 +257,11 @@ mod tests {
         // sets the baseline and the second yields a delta. Values stay in range.
         let mut sampler = Sampler::new();
         let first = sampler.sample(1);
-        assert_eq!(first.in_flight, 1);
+        assert_eq!(first.in_flight(), 1);
         let second = sampler.sample(0);
-        assert!(second.cpu_pct <= 100);
-        assert!(second.mem_pct <= 100);
-        assert_eq!(second.in_flight, 0);
-        assert!(second.gpu_pct.is_none_or(|pct| pct <= 100));
+        assert!(second.cpu_pct() <= 100);
+        assert!(second.mem_pct() <= 100);
+        assert_eq!(second.in_flight(), 0);
+        assert!(second.gpu_pct().is_none_or(|pct| pct <= 100));
     }
 }

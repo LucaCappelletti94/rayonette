@@ -69,8 +69,8 @@ fn tui_matches_the_capstone_golden() {
         let count = (events.len() * pct / 100).max(1);
         let mut app = App::new();
         for record in &events[..count] {
-            app.apply(&record.event);
-            app.elapsed = std::time::Duration::from_millis(record.elapsed_ms);
+            app.apply(record.event());
+            app.set_elapsed(std::time::Duration::from_millis(record.elapsed_ms()));
         }
         writeln!(snapshot, "=== after {pct}% of the run ===").unwrap();
         snapshot.push_str(&render(&app));
@@ -105,7 +105,7 @@ fn the_metropolis_trace_renders_without_panic() {
 
     let mut app = App::new();
     for record in &events {
-        app.apply(&record.event);
+        app.apply(record.event());
         // Render after each event, the way the live replay does, so a graph that
         // is briefly unanalysable mid-run still surfaces here.
         let _ = render(&app);

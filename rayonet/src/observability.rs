@@ -46,20 +46,74 @@ pub enum NodeState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeTelemetry {
     /// CPU utilisation since the previous sample, as a percentage.
-    pub cpu_pct: u8,
+    cpu_pct: u8,
     /// Memory in use, as a percentage of total.
-    pub mem_pct: u8,
+    mem_pct: u8,
     /// GPU compute utilisation, if a GPU was sampled.
-    pub gpu_pct: Option<u8>,
+    gpu_pct: Option<u8>,
     /// GPU memory utilisation, if a GPU was sampled.
-    pub gpu_mem_pct: Option<u8>,
+    gpu_mem_pct: Option<u8>,
     /// Tasks running on the node at the moment of the sample.
-    pub in_flight: usize,
+    in_flight: usize,
     /// The node's own non-loopback IPv4 addresses, as it sees them (its interface
     /// IPs, including any overlay like Tailscale). Empty when none were read.
     /// Defaulted on decode so traces recorded before this field still load.
     #[serde(default)]
-    pub interfaces: Vec<String>,
+    interfaces: Vec<String>,
+}
+
+impl NodeTelemetry {
+    /// A live resource sample: CPU and memory percentages, optional GPU compute
+    /// and memory percentages, the `in_flight` task count, and the node's own
+    /// `interfaces` (its non-loopback IPv4 addresses).
+    #[must_use]
+    pub const fn new(
+        cpu_pct: u8,
+        mem_pct: u8,
+        gpu_pct: Option<u8>,
+        gpu_mem_pct: Option<u8>,
+        in_flight: usize,
+        interfaces: Vec<String>,
+    ) -> Self {
+        Self {
+            cpu_pct,
+            mem_pct,
+            gpu_pct,
+            gpu_mem_pct,
+            in_flight,
+            interfaces,
+        }
+    }
+
+    /// CPU utilisation since the previous sample, as a percentage.
+    #[must_use]
+    pub const fn cpu_pct(&self) -> u8 {
+        self.cpu_pct
+    }
+
+    /// Memory in use, as a percentage of total.
+    #[must_use]
+    pub const fn mem_pct(&self) -> u8 {
+        self.mem_pct
+    }
+
+    /// GPU compute utilisation, if a GPU was sampled.
+    #[must_use]
+    pub const fn gpu_pct(&self) -> Option<u8> {
+        self.gpu_pct
+    }
+
+    /// Tasks running on the node at the moment of the sample.
+    #[must_use]
+    pub const fn in_flight(&self) -> usize {
+        self.in_flight
+    }
+
+    /// The node's own non-loopback IPv4 addresses, as it sees them.
+    #[must_use]
+    pub fn interfaces(&self) -> &[String] {
+        &self.interfaces
+    }
 }
 
 /// One observability event. The stream carries node lifecycle and task
@@ -180,9 +234,30 @@ impl Event {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordedEvent {
     /// Milliseconds from the start of the run to when this event was emitted.
-    pub elapsed_ms: u64,
+    elapsed_ms: u64,
     /// The event itself.
-    pub event: Event,
+    event: Event,
+}
+
+impl RecordedEvent {
+    /// Pair an `event` with the `elapsed_ms` (milliseconds from the start of the
+    /// run) at which it was emitted, the unit a recorded trace is made of.
+    #[must_use]
+    pub const fn new(elapsed_ms: u64, event: Event) -> Self {
+        Self { elapsed_ms, event }
+    }
+
+    /// Milliseconds from the start of the run to when this event was emitted.
+    #[must_use]
+    pub const fn elapsed_ms(&self) -> u64 {
+        self.elapsed_ms
+    }
+
+    /// The event itself.
+    #[must_use]
+    pub const fn event(&self) -> &Event {
+        &self.event
+    }
 }
 
 /// A consumer of the observability event stream.
@@ -268,34 +343,104 @@ pub(crate) fn join_label(head: &str, tail: &str) -> String {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunState {
     /// Total tasks in the run (the progress denominator).
-    pub total_tasks: usize,
+    total_tasks: usize,
     /// Tasks that finished successfully.
-    pub completed: usize,
+    completed: usize,
     /// Tasks that finished with an error.
-    pub failed: usize,
+    failed: usize,
     /// Per-host view, ordered by host name.
-    pub nodes: BTreeMap<String, NodeView>,
+    nodes: BTreeMap<String, NodeView>,
+}
+
+impl RunState {
+    /// Total tasks in the run (the progress denominator).
+    #[must_use]
+    pub const fn total_tasks(&self) -> usize {
+        self.total_tasks
+    }
+
+    /// Tasks that finished successfully.
+    #[must_use]
+    pub const fn completed(&self) -> usize {
+        self.completed
+    }
+
+    /// Tasks that finished with an error.
+    #[must_use]
+    pub const fn failed(&self) -> usize {
+        self.failed
+    }
+
+    /// Per-host view, ordered by host name.
+    #[must_use]
+    pub const fn nodes(&self) -> &BTreeMap<String, NodeView> {
+        &self.nodes
+    }
 }
 
 /// One host's reduced view: its current state and how much it has finished.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeView {
     /// The host's current lifecycle state.
-    pub state: NodeState,
+    state: NodeState,
     /// Tasks this host has finished (ok or err).
-    pub completed: usize,
+    completed: usize,
     /// The host's probed capabilities, once it has been profiled.
-    pub profile: Option<NodeProfile>,
+    profile: Option<NodeProfile>,
     /// The role the fleet filter assigned, once it has been profiled.
-    pub role: Option<Role>,
+    role: Option<Role>,
     /// The physical node's stable id, once profiled (two paths sharing an id are
     /// the same node, reachable redundantly).
-    pub id: Option<String>,
+    id: Option<String>,
     /// The measured latency (microseconds) of the link from this node's parent,
     /// once profiled.
-    pub latency_us: Option<u64>,
+    latency_us: Option<u64>,
     /// The node's most recent live resource sample, once it has reported one.
-    pub telemetry: Option<NodeTelemetry>,
+    telemetry: Option<NodeTelemetry>,
+}
+
+impl NodeView {
+    /// The host's current lifecycle state.
+    #[must_use]
+    pub const fn state(&self) -> NodeState {
+        self.state
+    }
+
+    /// Tasks this host has finished (ok or err).
+    #[must_use]
+    pub const fn completed(&self) -> usize {
+        self.completed
+    }
+
+    /// The host's probed capabilities, once it has been profiled.
+    #[must_use]
+    pub const fn profile(&self) -> Option<&NodeProfile> {
+        self.profile.as_ref()
+    }
+
+    /// The role the fleet filter assigned, once it has been profiled.
+    #[must_use]
+    pub const fn role(&self) -> Option<Role> {
+        self.role
+    }
+
+    /// The physical node's stable id, once profiled.
+    #[must_use]
+    pub fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    /// The measured latency (microseconds) of the link from this node's parent.
+    #[must_use]
+    pub const fn latency_us(&self) -> Option<u64> {
+        self.latency_us
+    }
+
+    /// The node's most recent live resource sample, once it has reported one.
+    #[must_use]
+    pub const fn telemetry(&self) -> Option<&NodeTelemetry> {
+        self.telemetry.as_ref()
+    }
 }
 
 impl RunState {
@@ -814,10 +959,12 @@ mod tests {
     #[test]
     fn recorded_event_round_trips() {
         use super::RecordedEvent;
-        let record = RecordedEvent {
-            elapsed_ms: 1234,
-            event: Event::node("relay/leaf", NodeState::Working),
-        };
+        let record = RecordedEvent::new(1234, Event::node("relay/leaf", NodeState::Working));
+        assert_eq!(record.elapsed_ms(), 1234);
+        assert_eq!(
+            record.event(),
+            &Event::node("relay/leaf", NodeState::Working)
+        );
         let bytes = postcard::to_allocvec(&record).unwrap();
         let back: RecordedEvent = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back, record);

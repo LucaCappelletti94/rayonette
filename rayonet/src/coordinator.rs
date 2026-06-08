@@ -983,16 +983,19 @@ mod tests {
             state.apply(event);
         }
 
-        assert_eq!(state.total_tasks, 40);
-        assert_eq!(state.completed, 40);
+        assert_eq!(state.total_tasks(), 40);
+        assert_eq!(state.completed(), 40);
         assert_eq!(
-            state.nodes["fast"].completed + state.nodes["slow"].completed,
+            state.nodes()["fast"].completed() + state.nodes()["slow"].completed(),
             40
         );
-        let (fast, slow) = (state.nodes["fast"].completed, state.nodes["slow"].completed);
+        let (fast, slow) = (
+            state.nodes()["fast"].completed(),
+            state.nodes()["slow"].completed(),
+        );
         assert!(fast > slow, "fast {fast} vs slow {slow}");
-        assert_eq!(state.nodes["fast"].state, NodeState::Done);
-        assert_eq!(state.nodes["slow"].state, NodeState::Done);
+        assert_eq!(state.nodes()["fast"].state(), NodeState::Done);
+        assert_eq!(state.nodes()["slow"].state(), NodeState::Done);
 
         // The node-state projection drops the task events from the mixed stream.
         let states = collector.states();
@@ -1152,7 +1155,7 @@ mod tests {
             state.apply(event);
         }
         // The subtree node surfaces at its full path with its last reported state.
-        assert_eq!(state.nodes["relay/leaf"].state, NodeState::Done);
+        assert_eq!(state.nodes()["relay/leaf"].state(), NodeState::Done);
     }
 
     #[tokio::test]
@@ -1459,7 +1462,8 @@ mod tests {
             state.apply(event);
         }
         assert_eq!(
-            state.nodes["fast"].completed, 1,
+            state.nodes()["fast"].completed(),
+            1,
             "the idle agent re-ran the straggler and won"
         );
     }
@@ -1519,7 +1523,7 @@ mod tests {
             state.apply(event);
         }
         assert!(
-            state.nodes["joiner"].completed >= 1,
+            state.nodes()["joiner"].completed() >= 1,
             "the joined node should have run at least one task"
         );
     }
