@@ -133,9 +133,10 @@ cargo run -p tui-replay -- --follow /tmp/run.jsonl           # another terminal
 ```
 
 Steer a run live: also set a control socket, then attach the viewer with
-`--control`. Select a node (Tab / click) and press `space` to pause or resume a
+`--control`. Select a node (Tab / click) and press `p` to pause or resume a
 compute leaf, `k` to kill a node now, or `d` to kill it after its current tasks
-drain. The coordinator runs on the host, so the socket is a host path:
+drain (the buttons for these sit at the bottom of the node detail panel). The
+coordinator runs on the host, so the socket is a host path:
 
 ```sh
 RAYONET_EVENT_LOG=/tmp/run.jsonl RAYONET_CONTROL_SOCKET=/tmp/run.sock \

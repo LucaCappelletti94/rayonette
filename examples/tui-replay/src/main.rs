@@ -12,12 +12,12 @@
 //! ```
 //!
 //! Controls: Tab / Shift-Tab (or the arrow keys) select a node, the mouse selects
-//! a node or hovers a link, Esc clears the selection, `p` pauses playback, and `q`
-//! quits. With a control socket attached (`--control <path>`, or the
-//! `RAYONET_CONTROL_SOCKET` env var) the selected node can be steered live:
-//! `space` pauses or resumes a compute leaf, `k` kills the node now, and `d` kills
-//! it after its current tasks drain. Without a socket those keys do nothing. The
-//! terminal is restored on exit.
+//! a node or hovers a link, Esc clears the selection, `space` pauses playback, and
+//! `q` quits. With a control socket attached (`--control <path>`, or the
+//! `RAYONET_CONTROL_SOCKET` env var) the selected node can be steered live: `p`
+//! pauses or resumes a compute leaf, `k` kills the node now, and `d` kills it after
+//! its current tasks drain. Without a socket those keys do nothing. The terminal is
+//! restored on exit.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Stdout};
@@ -122,8 +122,8 @@ fn to_input(event: CtEvent) -> Option<Input> {
     match event {
         CtEvent::Key(key) => match key.code {
             KeyCode::Char('q') => Some(Input::Quit),
-            KeyCode::Char('p') => Some(Input::TogglePause),
-            KeyCode::Char(' ') => Some(Input::PauseNode),
+            KeyCode::Char(' ') => Some(Input::TogglePause),
+            KeyCode::Char('p') => Some(Input::PauseNode),
             KeyCode::Char('k') => Some(Input::KillNode),
             KeyCode::Char('d') => Some(Input::DrainNode),
             KeyCode::Tab | KeyCode::Down => Some(Input::SelectNext),

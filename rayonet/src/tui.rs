@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
@@ -36,6 +36,12 @@ struct HitMap {
     nodes: BTreeMap<(u16, u16), String>,
     /// Cells of a drawn link, mapped to its `(parent id, child id)`.
     edges: BTreeMap<(u16, u16), (String, String)>,
+    /// Cells of an action button in the detail panel, mapped to the input it
+    /// triggers (so a click acts on the pinned node just like the key would).
+    buttons: BTreeMap<(u16, u16), Input>,
+    /// The detail panel's area while a node is pinned, so a click inside it (other
+    /// than on a button) keeps the pin rather than clearing it.
+    panel: Option<Rect>,
 }
 
 /// A semantic input the dashboard understands, decoupled from the terminal's raw
@@ -213,8 +219,20 @@ impl App {
                 self.hovered = self.hit.edges.get(&(col, row)).cloned();
             }
             Input::Click { col, row } => {
-                // Pin whatever is under the pointer: a vertex, else a link, else
-                // clear the pin by clicking empty space. The pin is sticky.
+                // A click on an action button runs that button's command on the
+                // pinned node, leaving the selection unchanged.
+                if let Some(button) = self.hit.buttons.get(&(col, row)).copied() {
+                    return self.on_input(button);
+                }
+                // A click inside the detail panel (but not on a button) keeps the
+                // current pin, so inspecting or clicking the panel does not deselect.
+                if self.hit.panel.is_some_and(|p| {
+                    col >= p.x && col < p.right() && row >= p.y && row < p.bottom()
+                }) {
+                    return Action::Continue;
+                }
+                // Otherwise pin whatever is under the pointer: a vertex, else a
+                // link, else clear the pin by clicking empty space. The pin is sticky.
                 self.selected = if let Some(id) = self.hit.nodes.get(&(col, row)) {
                     Some(Selection::Node(id.clone()))
                 } else {
@@ -506,21 +524,80 @@ fn canvas_point(inner: Rect, cell: (u16, u16)) -> (f64, f64) {
 
 /// The info panel beside the graph: the hovered link's detail, else the selected
 /// vertex's detail, else a legend of keys and colours.
-fn render_info(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn render_info(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     // A pin wins: a click or key keeps its detail up regardless of the pointer.
     // Only with nothing pinned does a hover preview the link under the pointer.
+    // A pinned node gets the structured detail panel (info above, an action bar
+    // pinned to the bottom); everything else is a plain paragraph.
+    if let Some(Selection::Node(id)) = app.selected.clone() {
+        render_node_detail(frame, area, app, &id);
+        return;
+    }
     let (title, lines) = match (&app.selected, &app.hovered) {
-        (Some(Selection::Node(id)), _) => (" details ", node_detail_lines(&app.state, id)),
         (Some(Selection::Edge(parent, child)), _) => {
             (" link ", edge_info_lines(&app.state, parent, child))
         }
         (None, Some((parent, child))) => (" link ", edge_info_lines(&app.state, parent, child)),
-        (None, None) => (" keys ", legend_lines()),
+        _ => (" keys ", legend_lines()),
     };
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
         area,
     );
+}
+
+/// The detail panel for a pinned node: its information fills the top, a divider
+/// separates it, and the action buttons are pinned to the bottom row, so the
+/// controls sit in a consistent place regardless of how much the node has to show.
+/// The buttons are centred with adaptive spacing, and each button's cells are
+/// recorded as a click target, so clicking one acts on the node just like its key.
+fn render_node_detail(frame: &mut Frame<'_>, area: Rect, app: &mut App, id: &str) {
+    // Record the panel area so a click inside it keeps the node pinned.
+    app.hit.panel = Some(area);
+    let block = Block::default().borders(Borders::ALL).title(" details ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    // The info region, a one-row divider, and the one-row action bar at the bottom.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(Paragraph::new(node_detail_lines(&app.state, id)), rows[0]);
+    let divider = "\u{2500}".repeat(rows[1].width as usize);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            divider,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[1],
+    );
+
+    // Lay the buttons across the bar with adaptive margins (centred, evenly
+    // spaced), and record each button's cells as a click target.
+    let buttons = node_action_buttons(&app.state, id);
+    let widths: Vec<Constraint> = buttons
+        .iter()
+        .map(|(label, _, _)| {
+            Constraint::Length(u16::try_from(label.chars().count()).unwrap_or(u16::MAX))
+        })
+        .collect();
+    let cells = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(widths)
+        .flex(Flex::SpaceAround)
+        .split(rows[2]);
+    for ((label, style, input), cell) in buttons.iter().zip(cells.iter()) {
+        frame.render_widget(Paragraph::new(Span::styled(label.clone(), *style)), *cell);
+        for col in cell.x..cell.x + cell.width {
+            for row in cell.y..cell.y + cell.height {
+                app.hit.buttons.insert((col, row), *input);
+            }
+        }
+    }
 }
 
 /// The detail lines for the selected vertex: its identity, role, state, redundancy
@@ -593,15 +670,46 @@ fn node_detail_lines(state: &RunState, id: &str) -> Vec<Line<'static>> {
         )),
     ];
     lines.extend(telemetry_lines(view.telemetry()));
-    // The control keys for this node: a compute leaf can also be paused; a relay
-    // can only be killed (its leaves are paused individually).
-    let actions = if role == Role::Compute {
-        "act   space pause  k kill  d drain"
-    } else {
-        "act   k kill  d drain"
-    };
-    lines.push(Line::from(actions));
     lines
+}
+
+/// The action buttons for the selected node: each is its padded label, its colour,
+/// and the input a click on it triggers. A compute leaf can be paused (blue), and
+/// any node can be killed (red) or drained (amber). A relay has no pause button
+/// (its leaves are paused individually). The caller lays them out and records the
+/// click targets.
+fn node_action_buttons(state: &RunState, id: &str) -> Vec<(String, Style, Input)> {
+    let role = state
+        .paths_by_id()
+        .get(id)
+        .and_then(|paths| paths.first().copied())
+        .and_then(|path| state.nodes().get(path))
+        .and_then(NodeView::role);
+    let node_state = vertex_state(state, id);
+    let button = |text: &str, bg: Color, fg: Color, input: Input| {
+        (
+            format!(" {text} "),
+            Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD),
+            input,
+        )
+    };
+    let mut buttons = Vec::new();
+    if role == Some(Role::Compute) {
+        let label = if node_state == Some(NodeState::Paused) {
+            "p resume"
+        } else {
+            "p pause"
+        };
+        buttons.push(button(label, Color::Blue, Color::White, Input::PauseNode));
+    }
+    buttons.push(button("k kill", Color::Red, Color::White, Input::KillNode));
+    buttons.push(button(
+        "d drain",
+        Color::Yellow,
+        Color::Black,
+        Input::DrainNode,
+    ));
+    buttons
 }
 
 /// A short, self-explanatory label for a node state, used wherever the state is
@@ -705,9 +813,9 @@ fn legend_lines() -> Vec<Line<'static>> {
     vec![
         Line::from("keys"),
         Line::from("Tab / S-Tab  select"),
-        Line::from("space  pause/resume node"),
+        Line::from("p  pause/resume node"),
         Line::from("k kill   d drain+kill"),
-        Line::from("p playback   q quit"),
+        Line::from("space playback   q quit"),
         key(Some(NodeState::Working), "working"),
         key(Some(NodeState::Done), "done"),
         key(Some(NodeState::Ready), "ready / idle"),
@@ -1678,6 +1786,147 @@ mod tests {
         assert_eq!(app.on_input(Input::PauseNode), Action::Continue);
         // Kill works on any node.
         assert!(matches!(app.on_input(Input::KillNode), Action::Control(_)));
+    }
+
+    #[test]
+    fn the_detail_panel_shows_action_buttons() {
+        // A selected compute leaf offers pause, kill, and drain buttons.
+        let app = app_with_selected("leaf", "idL", Role::Compute);
+        let text = render(&app).join("\n");
+        assert!(text.contains("p pause"), "{text}");
+        assert!(text.contains("k kill"), "{text}");
+        assert!(text.contains("d drain"), "{text}");
+
+        // A relay can only be killed or drained, not paused.
+        let relay = app_with_selected("gw", "idG", Role::RelayOnly);
+        let text = render(&relay).join("\n");
+        assert!(text.contains("k kill"), "{text}");
+        assert!(text.contains("d drain"), "{text}");
+        assert!(
+            !text.contains("p pause"),
+            "a relay has no pause button: {text}"
+        );
+    }
+
+    #[test]
+    fn clicking_an_action_button_runs_its_command() {
+        let mut app = app_with_selected("leaf", "idL", Role::Compute);
+        draw_into(&mut app); // records the button hit cells
+        let (&(col, row), _) = app
+            .hit
+            .buttons
+            .iter()
+            .find(|(_, input)| **input == Input::PauseNode)
+            .expect("a pause button was recorded");
+        assert_eq!(
+            app.on_input(Input::Click { col, row }),
+            Action::Control(Control::new("leaf".to_string(), ControlAction::Pause))
+        );
+        // The click ran the command, it did not change the pinned node.
+        assert_eq!(app.selected, Some(Selection::Node("idL".to_string())));
+    }
+
+    #[tokio::test]
+    async fn a_button_click_kills_the_node_over_the_socket() {
+        use crate::agent::{handler, serve, Registry};
+        use crate::control::{ControlClient, ControlListener};
+        use crate::coordinator::{run_job_raw_with_joins, serialize_inputs, RunOptions};
+        use crate::observability::RunState;
+        use crate::testing::{connection_pair, EventRecorder};
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        fn slow(x: u32) -> u32 {
+            std::thread::sleep(Duration::from_millis(6));
+            x * 2
+        }
+
+        // The dashboard: pin node "a", draw to record the buttons, then click the
+        // kill button to get exactly the command the driver would forward.
+        let mut app = App::new();
+        app.apply(&Event::profiled(
+            "a",
+            "ida",
+            profile("x86_64"),
+            Role::Compute,
+            0,
+        ));
+        app.selected = Some(Selection::Node("ida".to_string()));
+        draw_into(&mut app);
+        let (&(col, row), _) = app
+            .hit
+            .buttons
+            .iter()
+            .find(|(_, input)| **input == Input::KillNode)
+            .expect("a kill button was recorded");
+        let Action::Control(control) = app.on_input(Input::Click { col, row }) else {
+            panic!("clicking the kill button yields a control");
+        };
+        assert_eq!(
+            control,
+            Control::new(
+                "a".to_string(),
+                ControlAction::Kill {
+                    mode: KillMode::Now
+                }
+            )
+        );
+
+        // A live run of two agents with a control socket bound.
+        let socket =
+            std::env::temp_dir().join(format!("rayonet-tui-control-{}.sock", std::process::id()));
+        let (listener, controls_rx) = ControlListener::bind(&socket).unwrap();
+        let (a_client, a_server) = connection_pair(256);
+        let (b_client, b_server) = connection_pair(256);
+        tokio::spawn(serve(a_server, Registry::new().with("slow", handler(slow))));
+        tokio::spawn(serve(b_server, Registry::new().with("slow", handler(slow))));
+        let recorder = EventRecorder::default();
+        let agents = vec![("a".to_string(), a_client), ("b".to_string(), b_client)];
+        let payloads = serialize_inputs(&(0..30u32).collect::<Vec<_>>()).unwrap();
+        let (joins_tx, joins_rx) = mpsc::unbounded_channel();
+        drop(joins_tx);
+        let run = run_job_raw_with_joins(
+            agents,
+            "slow",
+            payloads,
+            &[],
+            RunOptions::default(),
+            joins_rx,
+            controls_rx,
+            &recorder,
+        );
+        // The driver seam: connect a real client and send the command the click
+        // produced (the exact path tui-replay wires together).
+        let driver = async {
+            let mut client = ControlClient::connect(&socket).await.unwrap();
+            client.send(&control).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await; // hold the connection
+        };
+        let (raw, ()) = tokio::join!(run, driver);
+        drop(listener);
+
+        assert_eq!(raw.unwrap().len(), 30, "the run survived the kill");
+        let mut state = RunState::default();
+        for event in &recorder.events() {
+            state.apply(event);
+        }
+        assert_eq!(
+            state.nodes()["a"].state(),
+            NodeState::Lost,
+            "the node the button killed is reported Lost"
+        );
+    }
+
+    #[test]
+    fn clicking_the_detail_panel_keeps_the_node_pinned() {
+        let mut app = app_with_selected("leaf", "idL", Role::Compute);
+        draw_into(&mut app); // records the panel area
+        let panel = app.hit.panel.expect("the detail panel area was recorded");
+        // A cell near the top of the panel is info text, not a button.
+        let (col, row) = (panel.x + 1, panel.y + 1);
+        assert!(!app.hit.buttons.contains_key(&(col, row)));
+        assert_eq!(app.on_input(Input::Click { col, row }), Action::Continue);
+        assert_eq!(app.selected, Some(Selection::Node("idL".to_string())));
     }
 
     #[test]

@@ -5,9 +5,9 @@
 ┌ topology ──────────────────────────────────────────────────────────────────────────┐┌ keys ──────────────────────────┐
 │                              ● shared                                              ││keys                            │
 │                         ⣀⡠⠤⠒⠊⠁    ⢣                                                ││Tab / S-Tab  select             │
-│                   ⢀⣀⠤⠒⠊⠉           ⢣                                               ││space  pause/resume node        │
+│                   ⢀⣀⠤⠒⠊⠉           ⢣                                               ││p  pause/resume node            │
 │             ⢀⣀⠤⠔⠒⠉⠁                 ⢣                                              ││k kill   d drain+kill           │
-│        ⣀⡠⠤⠒⠊⠁                        ⠱⡀                                            ││p playback   q quit             │
+│        ⣀⡠⠤⠒⠊⠁                        ⠱⡀                                            ││space playback   q quit         │
 │  ⢀⣀⠤⠒⠊⠉                               ⠱⡀                                           ││● working                       │
 │● gatewayA⠤⠤⠤⠤⠤⠤⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀              ⠱⡀                                          ││◉ done                          │
 │                          ⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠑⠒⠒⠒⠒⠓⡖⠒⠒⠒⠒⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⢄⣀⣀⣀⣀⣀⣀⣀⣀⣀⡀                ││○ ready / idle                  │
@@ -47,9 +47,9 @@
 ┌ topology ──────────────────────────────────────────────────────────────────────────┐┌ keys ──────────────────────────┐
 │                              ● shared                                              ││keys                            │
 │                         ⣀⡠⠤⠒⠊⠁    ⢣                                                ││Tab / S-Tab  select             │
-│                   ⢀⣀⠤⠒⠊⠉           ⢣                                               ││space  pause/resume node        │
+│                   ⢀⣀⠤⠒⠊⠉           ⢣                                               ││p  pause/resume node            │
 │             ⢀⣀⠤⠔⠒⠉⠁                 ⢣                                              ││k kill   d drain+kill           │
-│        ⣀⡠⠤⠒⠊⠁                        ⠱⡀                                            ││p playback   q quit             │
+│        ⣀⡠⠤⠒⠊⠁                        ⠱⡀                                            ││space playback   q quit         │
 │  ⢀⣀⠤⠒⠊⠉                               ⠱⡀                                           ││● working                       │
 │● gatewayA⠤⠤⠤⠤⠤⠤⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀              ⠱⡀                                          ││◉ done                          │
 │                          ⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠑⠒⠒⠒⠒⠓⡖⠒⠒⠒⠒⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⢄⣀⣀⣀⣀⣀⣀⣀⣀⣀⡀                ││○ ready / idle                  │
@@ -89,9 +89,9 @@
 ┌ topology ──────────────────────────────────────────────────────────────────────────┐┌ keys ──────────────────────────┐
 │● extra                                                                             ││keys                            │
 │    ⠈⠉⠒⠢⠤⣀⡀                                                                         ││Tab / S-Tab  select             │
-│          ⠈⠉⠑⠒⠤⢄⣀                                                                   ││space  pause/resume node        │
+│          ⠈⠉⠑⠒⠤⢄⣀                                                                   ││p  pause/resume node            │
 │                 ⠉⠑⠒⠢⠤⣀⡀                                                            ││k kill   d drain+kill           │
-│                       ⠈⠉⠒⠢⠤⢄⣀                                                      ││p playback   q quit             │
+│                       ⠈⠉⠒⠢⠤⢄⣀                                                      ││space playback   q quit         │
 │                           ⚑● gatewayB⠤⠤⠤⢄⣀⣀⣀⣀⣀⣀                                    ││● working                       │
 │                                ⠘⡄              ⠉⠉⠉⠉⠉⠉⠒⠒⠒⠒⠒⠒⠢⠤⠤⠤⠤⠤⢄⣀⣀⣀⣀⣀⣀           ││◉ done                          │
 │                                 ⢣                                     ◆ coordinator││○ ready / idle                  │
@@ -131,9 +131,9 @@
 ┌ topology ──────────────────────────────────────────────────────────────────────────┐┌ keys ──────────────────────────┐
 │◉ extra                                                                             ││keys                            │
 │    ⠈⠉⠒⠢⠤⣀⡀                                                                         ││Tab / S-Tab  select             │
-│          ⠈⠉⠑⠒⠤⢄⣀                                                                   ││space  pause/resume node        │
+│          ⠈⠉⠑⠒⠤⢄⣀                                                                   ││p  pause/resume node            │
 │                 ⠉⠑⠒⠢⠤⣀⡀                                                            ││k kill   d drain+kill           │
-│                       ⠈⠉⠒⠢⠤⢄⣀                                                      ││p playback   q quit             │
+│                       ⠈⠉⠒⠢⠤⢄⣀                                                      ││space playback   q quit         │
 │                           ⚑◉ gatewayB⠤⠤⠤⢄⣀⣀⣀⣀⣀⣀                                    ││● working                       │
 │                                ⠘⡄              ⠉⠉⠉⠉⠉⠉⠒⠒⠒⠒⠒⠒⠢⠤⠤⠤⠤⠤⢄⣀⣀⣀⣀⣀⣀           ││◉ done                          │
 │                                 ⢣                                     ◆ coordinator││○ ready / idle                  │
