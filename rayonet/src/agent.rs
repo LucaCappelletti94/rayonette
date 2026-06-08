@@ -218,8 +218,24 @@ where
                     .await
                     .expect("task handler cannot panic");
                 match outcome {
-                    Ok(output) => tx.send(&FromAgent::Completed { task_id, output }).await?,
-                    Err(error) => tx.send(&FromAgent::Failed { task_id, error }).await?,
+                    // A leaf ran the task itself, so the path down to the runner is
+                    // empty; relays prepend their child label as they forward this.
+                    Ok(output) => {
+                        tx.send(&FromAgent::Completed {
+                            task_id,
+                            output,
+                            via: String::new(),
+                        })
+                        .await?;
+                    }
+                    Err(error) => {
+                        tx.send(&FromAgent::Failed {
+                            task_id,
+                            error,
+                            via: String::new(),
+                        })
+                        .await?;
+                    }
                 }
                 if let Some(telemetry) =
                     due_sample(&mut sampler, &mut last_sample, Instant::now(), 0)
@@ -360,6 +376,7 @@ mod tests {
                 FromAgent::Completed {
                     task_id: 0,
                     output: postcard::to_allocvec(&42u32).unwrap(),
+                    via: String::new(),
                 }
             );
 
@@ -415,10 +432,12 @@ mod tests {
             assert!(terminals.contains(&FromAgent::Failed {
                 task_id: 0,
                 error: "zero is not allowed".to_string(),
+                via: String::new(),
             }));
             assert!(terminals.contains(&FromAgent::Completed {
                 task_id: 1,
                 output: postcard::to_allocvec(&7u32).unwrap(),
+                via: String::new(),
             }));
 
             tx.send(&ToAgent::Shutdown).await.unwrap();
@@ -468,6 +487,7 @@ mod tests {
                 FromAgent::Completed {
                     task_id: 0,
                     output: postcard::to_allocvec(&42u32).unwrap(),
+                    via: String::new(),
                 }
             );
             // Then a clean end-of-stream, past the final telemetry sample.

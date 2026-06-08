@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped when the wire protocol changes. Because the agent is compiled from the
 /// same source as the coordinator (whole-crate compile), this is a sanity
 /// assertion rather than a true negotiation.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Identifies a task within a run.
 pub type TaskId = u64;
@@ -87,6 +87,11 @@ pub enum FromAgent {
         task_id: TaskId,
         /// Postcard-encoded task output.
         output: Vec<u8>,
+        /// The path from this agent down to the leaf that actually ran the task,
+        /// empty when this agent ran it itself. Each relay prepends its child's
+        /// label as it forwards the result up, so the coordinator can credit the
+        /// completion to the deep leaf rather than to the relay it heard it from.
+        via: String,
     },
     /// A task panicked. Terminal: never retried.
     Failed {
@@ -94,6 +99,8 @@ pub enum FromAgent {
         task_id: TaskId,
         /// Captured panic message.
         error: String,
+        /// The path down to the leaf that ran the task (see [`FromAgent::Completed`]).
+        via: String,
     },
     /// A relay's built children, sent in place of `Ready` so the coordinator can
     /// dedup redundant paths and choose which to run before any task flows. The
@@ -165,10 +172,12 @@ mod tests {
             FromAgent::Completed {
                 task_id: 9,
                 output: vec![42; 64],
+                via: "relay/leaf".to_string(),
             },
             FromAgent::Failed {
                 task_id: 9,
                 error: "panicked at 'boom'".to_string(),
+                via: String::new(),
             },
             FromAgent::Observe(Event::node("relay/leaf", NodeState::Working)),
             FromAgent::Discovered {
@@ -206,10 +215,20 @@ mod tests {
         prop_oneof![
             any::<usize>().prop_map(|slots| FromAgent::Ready { slots }),
             any::<u64>().prop_map(|task_id| FromAgent::Started { task_id }),
-            (any::<u64>(), any::<Vec<u8>>())
-                .prop_map(|(task_id, output)| FromAgent::Completed { task_id, output }),
-            (any::<u64>(), any::<String>())
-                .prop_map(|(task_id, error)| FromAgent::Failed { task_id, error }),
+            (any::<u64>(), any::<Vec<u8>>(), any::<String>()).prop_map(|(task_id, output, via)| {
+                FromAgent::Completed {
+                    task_id,
+                    output,
+                    via,
+                }
+            }),
+            (any::<u64>(), any::<String>(), any::<String>()).prop_map(|(task_id, error, via)| {
+                FromAgent::Failed {
+                    task_id,
+                    error,
+                    via,
+                }
+            }),
             any::<usize>().prop_map(|tasks| FromAgent::Observe(Event::RunStarted { tasks })),
             prop::collection::vec(
                 (

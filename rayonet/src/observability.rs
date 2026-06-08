@@ -247,6 +247,18 @@ pub fn leaf_of(id: &str) -> &str {
     id.rsplit_once('/').map_or(id, |(_, leaf)| leaf)
 }
 
+/// Join a path `head` with a `tail` sub-path: `head` alone when `tail` is empty,
+/// else `head/tail`. The building block for attributing a relayed completion to the
+/// deep leaf, mirroring how [`Event::prefix_host`] extends a host one hop.
+#[must_use]
+pub(crate) fn join_label(head: &str, tail: &str) -> String {
+    if tail.is_empty() {
+        head.to_string()
+    } else {
+        format!("{head}/{tail}")
+    }
+}
+
 /// The live, reduced picture of a run: per-node state and task tallies.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunState {
@@ -476,6 +488,16 @@ mod tests {
         assert_eq!(parent_of("a/b/c"), Some("a/b"));
         assert_eq!(depth("a"), 0);
         assert_eq!(depth("a/b/c"), 2);
+    }
+
+    #[test]
+    fn join_label_extends_a_path_one_hop() {
+        use super::join_label;
+        // A relay prepends its child label onto the sub-path beneath it; an empty
+        // tail (the leaf ran it itself) leaves the head alone, so no trailing slash.
+        assert_eq!(join_label("relay", ""), "relay");
+        assert_eq!(join_label("relay", "leaf"), "relay/leaf");
+        assert_eq!(join_label("relay", "sub/leaf"), "relay/sub/leaf");
     }
 
     #[test]

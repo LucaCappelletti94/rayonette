@@ -21,7 +21,7 @@ use crate::coordinator::{
 };
 use crate::fleet::{launch_all, Launch, Launched};
 use crate::framing::{Connection, Receiver, Sender};
-use crate::observability::{Event, EventSink, NodeState};
+use crate::observability::{join_label, Event, EventSink, NodeState};
 use crate::protocol::{ChildAd, FromAgent, TaskId, ToAgent};
 
 /// How often a relay re-reads its children file to pick up newly listed children
@@ -214,10 +214,24 @@ where
             ChildEvent::Message(_, FromAgent::Started { task_id }) => {
                 parent_tx.send(&FromAgent::Started { task_id }).await?;
             }
-            ChildEvent::Message(_, FromAgent::Completed { task_id, output }) => {
+            ChildEvent::Message(
+                _,
+                FromAgent::Completed {
+                    task_id,
+                    output,
+                    via,
+                },
+            ) => {
                 if let Some(child) = self.on_terminal(task_id) {
+                    // Prepend this child's label so the path reaches the deep leaf
+                    // that ran the task, one hop longer per relay it passes.
+                    let via = join_label(&self.labels[child], &via);
                     parent_tx
-                        .send(&FromAgent::Completed { task_id, output })
+                        .send(&FromAgent::Completed {
+                            task_id,
+                            output,
+                            via,
+                        })
                         .await?;
                     self.dispatch().await?;
                     if self.load[child] == 0 {
@@ -225,10 +239,22 @@ where
                     }
                 }
             }
-            ChildEvent::Message(_, FromAgent::Failed { task_id, error }) => {
+            ChildEvent::Message(
+                _,
+                FromAgent::Failed {
+                    task_id,
+                    error,
+                    via,
+                },
+            ) => {
                 if let Some(child) = self.on_terminal(task_id) {
+                    let via = join_label(&self.labels[child], &via);
                     parent_tx
-                        .send(&FromAgent::Failed { task_id, error })
+                        .send(&FromAgent::Failed {
+                            task_id,
+                            error,
+                            via,
+                        })
                         .await?;
                     self.dispatch().await?;
                     if self.load[child] == 0 {
@@ -804,6 +830,15 @@ mod tests {
             assert_eq!(state.nodes[leaf].role, Some(Role::Compute), "{leaf}");
             assert_eq!(state.nodes[leaf].state, NodeState::Done, "{leaf}");
         }
+        // Completions are credited to the deep leaf that ran them, not to the relay
+        // the coordinator heard the result from.
+        assert_eq!(
+            state.nodes["relay"].completed, 0,
+            "the relay computes nothing"
+        );
+        let on_leaves =
+            state.nodes["relay/leaf-a"].completed + state.nodes["relay/leaf-b"].completed;
+        assert_eq!(on_leaves, 12, "every completion landed on a leaf");
     }
 
     #[tokio::test]
@@ -827,6 +862,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, (0..24u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn depth_three_credits_the_full_leaf_path() {
+        use crate::observability::RunState;
+        use crate::testing::EventRecorder;
+        // coordinator -> relay -> sub-relay -> two leaves. A completion is credited
+        // to the full path down to the leaf, with each relay prepending its label.
+        let children = vec![RelayAgent {
+            leaves: vec![
+                (
+                    "leaf-a".to_string(),
+                    Registry::new().with("double", handler(double)),
+                ),
+                (
+                    "leaf-b".to_string(),
+                    Registry::new().with("double", handler(double)),
+                ),
+            ],
+        }];
+        let (coord_side, relay_side) = connection_pair(4096);
+        let relay_fut = relay(relay_side, children);
+        let recorder = EventRecorder::default();
+        let coord_fut = run_job::<_, u32, u32>(
+            vec![("relay".to_string(), coord_side)],
+            "double",
+            (0..16u32).collect(),
+            &recorder,
+        );
+        let (relay_res, out) = tokio::join!(relay_fut, coord_fut);
+        relay_res.unwrap();
+        assert_eq!(out.unwrap().len(), 16);
+
+        let mut state = RunState::default();
+        for event in &recorder.events() {
+            state.apply(event);
+        }
+        // Neither relay computes; the two deepest leaves account for every task.
+        assert_eq!(state.nodes["relay"].completed, 0);
+        assert_eq!(state.nodes["relay/sub-relay"].completed, 0);
+        let on_leaves = state.nodes["relay/sub-relay/leaf-a"].completed
+            + state.nodes["relay/sub-relay/leaf-b"].completed;
+        assert_eq!(on_leaves, 16, "every completion landed on a deep leaf");
     }
 
     #[tokio::test]

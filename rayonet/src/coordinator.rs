@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::framing::{Connection, Receiver, Sender};
-use crate::observability::{Event as Obs, EventSink, NodeState};
+use crate::observability::{join_label, Event as Obs, EventSink, NodeState};
 use crate::protocol::{ChildAd, FromAgent, TaskId, ToAgent, PROTOCOL_VERSION};
 
 /// What a reader task forwards to the coordinator's central loop. A read error
@@ -497,14 +497,28 @@ where
                     });
                 }
             }
-            Event::Message(agent, FromAgent::Completed { task_id, output }) => {
+            Event::Message(
+                agent,
+                FromAgent::Completed {
+                    task_id,
+                    output,
+                    via,
+                },
+            ) => {
                 // The raw bytes are kept as-is; decoding happens in the typed
                 // layer, so a `Completed` is `ok` at the protocol level here.
-                self.finish(task_id, Ok(output), true, agent, events)
+                self.finish(task_id, Ok(output), true, agent, via, events)
                     .await?;
             }
-            Event::Message(agent, FromAgent::Failed { task_id, error }) => {
-                self.finish(task_id, Err(error), false, agent, events)
+            Event::Message(
+                agent,
+                FromAgent::Failed {
+                    task_id,
+                    error,
+                    via,
+                },
+            ) => {
+                self.finish(task_id, Err(error), false, agent, via, events)
                     .await?;
             }
             // A subtree event from a relay child: prefix its host with that
@@ -538,14 +552,17 @@ where
         result: Result<Vec<u8>, String>,
         ok: bool,
         completer: usize,
+        via: String,
         events: &dyn EventSink,
     ) -> std::io::Result<()> {
         let freed = self.record(task_id, result);
         if freed.is_empty() {
             return Ok(());
         }
+        // Credit the completion to the deep leaf that ran it, not the relay we
+        // heard it from: `via` is that path within the completer's subtree.
         events.emit(Obs::TaskFinished {
-            host: self.labels[completer].clone(),
+            host: join_label(&self.labels[completer], &via),
             task: task_id,
             ok,
         });
@@ -1024,6 +1041,7 @@ mod tests {
             tx.send(&FromAgent::Failed {
                 task_id: 0,
                 error: "boom".to_string(),
+                via: String::new(),
             })
             .await
             .unwrap();
@@ -1104,6 +1122,7 @@ mod tests {
             tx.send(&FromAgent::Completed {
                 task_id: 0,
                 output: postcard::to_allocvec(&0u32).unwrap(),
+                via: String::new(),
             })
             .await
             .unwrap();
@@ -1156,6 +1175,7 @@ mod tests {
                 tx.send(&FromAgent::Completed {
                     task_id: id,
                     output: postcard::to_allocvec(&0u32).unwrap(),
+                    via: String::new(),
                 })
                 .await
                 .unwrap();
@@ -1167,6 +1187,7 @@ mod tests {
                         .send(&FromAgent::Completed {
                             task_id,
                             output: postcard::to_allocvec(&0u32).unwrap(),
+                            via: String::new(),
                         })
                         .await
                         .unwrap(),
@@ -1270,6 +1291,7 @@ mod tests {
             tx.send(&FromAgent::Completed {
                 task_id: 0,
                 output: vec![0xFF; 6],
+                via: String::new(),
             })
             .await
             .unwrap();
@@ -1311,12 +1333,14 @@ mod tests {
             tx.send(&FromAgent::Completed {
                 task_id: 0,
                 output: postcard::to_allocvec(&100u32).unwrap(),
+                via: String::new(),
             })
             .await
             .unwrap();
             tx.send(&FromAgent::Completed {
                 task_id: 0,
                 output: postcard::to_allocvec(&999u32).unwrap(),
+                via: String::new(),
             })
             .await
             .unwrap();
@@ -1326,6 +1350,7 @@ mod tests {
             tx.send(&FromAgent::Completed {
                 task_id: 1,
                 output: postcard::to_allocvec(&200u32).unwrap(),
+                via: String::new(),
             })
             .await
             .unwrap();
@@ -1546,6 +1571,7 @@ mod tests {
                     tx.send(&FromAgent::Completed {
                         task_id,
                         output: postcard::to_allocvec(&0u32).unwrap(),
+                        via: String::new(),
                     })
                     .await
                     .unwrap();
@@ -1573,6 +1599,7 @@ mod tests {
             tx.send(&FromAgent::Completed {
                 task_id: 0,
                 output: Vec::new(),
+                via: String::new(),
             })
             .await
             .unwrap();
