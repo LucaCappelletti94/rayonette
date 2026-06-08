@@ -474,28 +474,59 @@ fn node_detail_lines(state: &RunState, id: &str) -> Vec<Line<'static>> {
     let role = view.role.expect("a profiled node has a role");
     let node_state = vertex_state(state, id).expect("a selected vertex has a state");
     let latency = microseconds_to_millis(view.latency_us.expect("a profiled node has a latency"));
-    // Pairs of fields share a line, so the static detail leaves room below for the
-    // live telemetry within the panel's height.
+    let spof = topology.single_points_of_failure().contains(id);
+    // The state glyph and the flag the graph shows are spelled out here, so the
+    // icon language explains itself. Pairs of fields share a line to leave room for
+    // the live telemetry within the panel's height.
     let mut lines = vec![
         Line::from(format!("node  {label}")),
         Line::from(format!("id    {id:.8}")),
-        Line::from(format!("role  {role:?}  state {node_state:?}")),
+        Line::from(format!("role  {role:?}")),
+        Line::from(format!("{} {node_state:?}", node_glyph(Some(node_state)))),
+        Line::from(format!("  {}", state_meaning(node_state))),
         Line::from(format!(
-            "spof  {}  redund {}",
-            yes_no(topology.single_points_of_failure().contains(id)),
-            yes_no(topology.is_redundant(id)),
-        )),
-        Line::from(format!("done  {completed}  lat {latency:.1} ms")),
-        Line::from(format!("os    {:?}  arch {}", profile.os, profile.arch.isa)),
-        Line::from(format!(
-            "cores {}  ram {} MB  gpus {}",
-            profile.cores,
-            profile.ram_mb,
-            profile.gpus.len(),
+            "reach {}",
+            if topology.is_redundant(id) {
+                "redundant"
+            } else {
+                "single path"
+            }
         )),
     ];
+    if spof {
+        lines.push(Line::from("\u{2691} single point of failure"));
+    }
+    lines.push(Line::from(format!(
+        "done  {completed}  lat {latency:.1} ms"
+    )));
+    lines.push(Line::from(format!(
+        "os    {:?}  arch {}",
+        profile.os, profile.arch.isa
+    )));
+    lines.push(Line::from(format!(
+        "cores {}  ram {} MB  gpus {}",
+        profile.cores,
+        profile.ram_mb,
+        profile.gpus.len(),
+    )));
     lines.extend(telemetry_lines(view.telemetry.as_ref()));
     lines
+}
+
+/// A plain-English explanation of what a node's state (and so its glyph) means, for
+/// the detail panel.
+const fn state_meaning(state: NodeState) -> &'static str {
+    match state {
+        NodeState::Probing => "checking the host responds",
+        NodeState::Installing => "installing the toolchain",
+        NodeState::Syncing => "shipping the crate source",
+        NodeState::Building => "compiling the agent",
+        NodeState::Ready => "built, awaiting work",
+        NodeState::Idle => "connected, no task in flight",
+        NodeState::Working => "running tasks now",
+        NodeState::Done => "finished its work",
+        NodeState::Lost => "connection dropped, work requeued",
+    }
 }
 
 /// The live-utilisation lines for the detail panel, or a single "not available"
@@ -589,15 +620,6 @@ fn edge_latency(state: &RunState, parent_id: &str, child_id: &str) -> Option<u64
         }
     }
     None
-}
-
-/// `yes` or `no`, for a boolean detail field.
-const fn yes_no(flag: bool) -> &'static str {
-    if flag {
-        "yes"
-    } else {
-        "no"
-    }
 }
 
 /// One positioned vertex of the topology graph.
@@ -1471,6 +1493,62 @@ mod tests {
         assert!(text.contains("Compute"), "{text}");
         assert!(text.contains("cores 8"), "{text}");
         assert!(text.contains("arch x86_64"), "{text}");
+        // The state glyph is spelled out, so the icon explains itself.
+        assert!(text.contains("\u{25cf} Working"), "{text}");
+        assert!(text.contains("running tasks now"), "{text}");
+    }
+
+    #[test]
+    fn the_detail_panel_explains_the_spof_flag_and_redundancy() {
+        // The shared leaf is reached by both gateways, so its detail reads
+        // redundant.
+        let mut app = diamond();
+        app.selected = Some(Selection::Node("idS".to_string()));
+        assert!(render(&app).join("\n").contains("reach redundant"));
+
+        // A relay whose only leaf has no alternate route is a single point of
+        // failure, and its detail says so in words.
+        let mut lone = App::new();
+        lone.apply(&Event::profiled(
+            "relay",
+            "idR",
+            profile("x86_64"),
+            Role::Compute,
+            0,
+        ));
+        lone.apply(&Event::profiled(
+            "relay/leaf",
+            "idL",
+            profile("x86_64"),
+            Role::Compute,
+            0,
+        ));
+        lone.apply(&Event::node("relay", NodeState::Working));
+        lone.apply(&Event::node("relay/leaf", NodeState::Working));
+        lone.selected = Some(Selection::Node("idR".to_string()));
+        assert!(render(&lone).join("\n").contains("single point of failure"));
+
+        // Its leaf, reached only through that relay, has a single path.
+        lone.selected = Some(Selection::Node("idL".to_string()));
+        assert!(render(&lone).join("\n").contains("reach single path"));
+    }
+
+    #[test]
+    fn state_meaning_describes_every_state() {
+        use super::state_meaning;
+        for state in [
+            NodeState::Probing,
+            NodeState::Installing,
+            NodeState::Syncing,
+            NodeState::Building,
+            NodeState::Ready,
+            NodeState::Idle,
+            NodeState::Working,
+            NodeState::Done,
+            NodeState::Lost,
+        ] {
+            assert!(!state_meaning(state).is_empty());
+        }
     }
 
     #[test]
