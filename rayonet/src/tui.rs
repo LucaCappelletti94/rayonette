@@ -476,41 +476,42 @@ fn node_detail_lines(state: &RunState, id: &str) -> Vec<Line<'static>> {
     // The state glyph and the flag the graph shows are spelled out here, so the
     // icon language explains itself. Pairs of fields share a line to leave room for
     // the live telemetry within the panel's height.
+    let reach = if topology.is_redundant(id) {
+        "redundant"
+    } else {
+        "single path"
+    };
+    let spof_mark = if spof { "  \u{2691} SPOF" } else { "" };
+    // The interface IPs the node reported about itself, and the path(s) the run
+    // reaches it by (its route through the tree). "ip n/a" until it reports a
+    // telemetry sample (or off Linux, where the sampler does not read them yet).
+    let ips = view
+        .telemetry
+        .as_ref()
+        .map(|telemetry| telemetry.interfaces.join("  "))
+        .filter(|joined| !joined.is_empty())
+        .unwrap_or_else(|| "n/a".to_string());
     let mut lines = vec![
         Line::from(format!("node  {label}")),
-        Line::from(format!("id    {id:.8}")),
-        Line::from(format!("role  {role:?}")),
+        Line::from(format!("id    {id:.8}  role {role:?}")),
         Line::from(format!(
             "{} {}",
             node_glyph(Some(node_state)),
             state_label(node_state)
         )),
         Line::from(format!("  {}", state_meaning(node_state))),
+        Line::from(format!("reach {reach}{spof_mark}")),
+        Line::from(format!("via   {}", mine.join("  "))),
+        Line::from(format!("ip    {ips}")),
+        Line::from(format!("done  {completed}  lat {latency:.1} ms")),
+        Line::from(format!("os    {:?}  arch {}", profile.os, profile.arch.isa)),
         Line::from(format!(
-            "reach {}",
-            if topology.is_redundant(id) {
-                "redundant"
-            } else {
-                "single path"
-            }
+            "cores {}  ram {} MB  gpus {}",
+            profile.cores,
+            profile.ram_mb,
+            profile.gpus.len(),
         )),
     ];
-    if spof {
-        lines.push(Line::from("\u{2691} single point of failure"));
-    }
-    lines.push(Line::from(format!(
-        "done  {completed}  lat {latency:.1} ms"
-    )));
-    lines.push(Line::from(format!(
-        "os    {:?}  arch {}",
-        profile.os, profile.arch.isa
-    )));
-    lines.push(Line::from(format!(
-        "cores {}  ram {} MB  gpus {}",
-        profile.cores,
-        profile.ram_mb,
-        profile.gpus.len(),
-    )));
     lines.extend(telemetry_lines(view.telemetry.as_ref()));
     lines
 }
@@ -554,15 +555,16 @@ fn telemetry_lines(telemetry: Option<&NodeTelemetry>) -> Vec<Line<'static>> {
     let Some(sample) = telemetry else {
         return vec![Line::from("util  n/a")];
     };
-    let mut lines = vec![
-        Line::from(format!("cpu   {}%", sample.cpu_pct)),
-        Line::from(format!("mem   {}%", sample.mem_pct)),
-    ];
-    if let Some(gpu) = sample.gpu_pct {
-        lines.push(Line::from(format!("gpu   {gpu}%")));
-    }
-    lines.push(Line::from(format!("tasks {} running", sample.in_flight)));
-    lines
+    let gpu = sample
+        .gpu_pct
+        .map_or_else(String::new, |pct| format!("  gpu {pct}%"));
+    vec![
+        Line::from(format!(
+            "cpu {}%  mem {}%{gpu}",
+            sample.cpu_pct, sample.mem_pct
+        )),
+        Line::from(format!("tasks {} running", sample.in_flight)),
+    ]
 }
 
 /// The detail lines for the hovered link: its endpoints, measured latency, and
@@ -1560,7 +1562,7 @@ mod tests {
         lone.apply(&Event::node("relay", NodeState::Working));
         lone.apply(&Event::node("relay/leaf", NodeState::Working));
         lone.selected = Some(Selection::Node("idR".to_string()));
-        assert!(render(&lone).join("\n").contains("single point of failure"));
+        assert!(render(&lone).join("\n").contains("\u{2691} SPOF"));
 
         // Its leaf, reached only through that relay, has a single path.
         lone.selected = Some(Selection::Node("idL".to_string()));
@@ -1657,7 +1659,8 @@ mod tests {
         app.selected = Some(Selection::Node("idA".to_string()));
         assert!(render(&app).join("\n").contains("util  n/a"));
 
-        // A sample with a GPU shows CPU, memory, GPU, and the running task count.
+        // A sample with a GPU shows CPU, memory, GPU, the running task count, and
+        // the node's reported interface IPs.
         app.apply(&Event::Telemetry {
             host: "gatewayA".to_string(),
             telemetry: NodeTelemetry {
@@ -1666,14 +1669,16 @@ mod tests {
                 gpu_pct: Some(91),
                 gpu_mem_pct: Some(45),
                 in_flight: 1,
+                interfaces: vec!["100.64.0.7".to_string()],
             },
         });
         let with_gpu = render(&app).join("\n");
-        assert!(with_gpu.contains("cpu   64%"), "{with_gpu}");
-        assert!(with_gpu.contains("gpu   91%"), "{with_gpu}");
+        assert!(with_gpu.contains("cpu 64%"), "{with_gpu}");
+        assert!(with_gpu.contains("gpu 91%"), "{with_gpu}");
         assert!(with_gpu.contains("tasks 1 running"), "{with_gpu}");
+        assert!(with_gpu.contains("ip    100.64.0.7"), "{with_gpu}");
 
-        // A sample without a GPU omits the GPU line.
+        // A sample without a GPU omits the GPU figure.
         app.apply(&Event::Telemetry {
             host: "gatewayA".to_string(),
             telemetry: NodeTelemetry {
@@ -1682,11 +1687,12 @@ mod tests {
                 gpu_pct: None,
                 gpu_mem_pct: None,
                 in_flight: 0,
+                interfaces: Vec::new(),
             },
         });
         let no_gpu = render(&app).join("\n");
-        assert!(no_gpu.contains("cpu   10%"), "{no_gpu}");
-        assert!(!no_gpu.contains("gpu  "), "{no_gpu}");
+        assert!(no_gpu.contains("cpu 10%"), "{no_gpu}");
+        assert!(!no_gpu.contains("gpu "), "{no_gpu}");
     }
 
     #[test]

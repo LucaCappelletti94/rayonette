@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped when the wire protocol changes. Because the agent is compiled from the
 /// same source as the coordinator (whole-crate compile), this is a sanity
 /// assertion rather than a true negotiation.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Identifies a task within a run.
 pub type TaskId = u64;

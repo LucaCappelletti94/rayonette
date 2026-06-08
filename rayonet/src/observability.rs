@@ -43,7 +43,7 @@ pub enum NodeState {
 /// Percentages are whole numbers in `0..=100` so the type stays `Eq` (and small on
 /// the wire), matching how the rest of the event stream avoids floats. GPU fields
 /// are absent when the host has no GPU (or no `nvidia-smi`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeTelemetry {
     /// CPU utilisation since the previous sample, as a percentage.
     pub cpu_pct: u8,
@@ -55,6 +55,11 @@ pub struct NodeTelemetry {
     pub gpu_mem_pct: Option<u8>,
     /// Tasks running on the node at the moment of the sample.
     pub in_flight: usize,
+    /// The node's own non-loopback IPv4 addresses, as it sees them (its interface
+    /// IPs, including any overlay like Tailscale). Empty when none were read.
+    /// Defaulted on decode so traces recorded before this field still load.
+    #[serde(default)]
+    pub interfaces: Vec<String>,
 }
 
 /// One observability event. The stream carries node lifecycle and task
@@ -318,7 +323,7 @@ impl RunState {
                 self.node(host);
             }
             Event::Telemetry { host, telemetry } => {
-                self.node(host).telemetry = Some(*telemetry);
+                self.node(host).telemetry = Some(telemetry.clone());
             }
             Event::TaskFinished { host, ok, .. } => {
                 self.node(host).completed += 1;
@@ -774,15 +779,16 @@ mod tests {
             gpu_pct: Some(88),
             gpu_mem_pct: Some(50),
             in_flight: 2,
+            interfaces: vec!["100.64.0.3".to_string()],
         };
 
         // A node's latest sample lands on its view.
         let mut state = RunState::default();
         state.apply(&Event::Telemetry {
             host: "relay/leaf".to_string(),
-            telemetry: sample,
+            telemetry: sample.clone(),
         });
-        assert_eq!(state.nodes["relay/leaf"].telemetry, Some(sample));
+        assert_eq!(state.nodes["relay/leaf"].telemetry, Some(sample.clone()));
 
         // A relay prefixes an agent's self-reported (empty-host) telemetry into a
         // path rather than leaving a leading slash, then the next hop extends it.

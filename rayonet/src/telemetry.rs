@@ -34,6 +34,7 @@ impl Sampler {
             gpu_pct: gpu.map(|(compute, _)| compute),
             gpu_mem_pct: gpu.map(|(_, memory)| memory),
             in_flight,
+            interfaces: local_interfaces(),
         }
     }
 }
@@ -130,6 +131,41 @@ fn read_local(_prev: &mut Option<(u64, u64)>) -> (u8, u8, Option<(u8, u8)>) {
     (0, 0, None)
 }
 
+/// Whether an IPv4 address is worth reporting as a node's own: not loopback and not
+/// link-local. Container and overlay addresses (172.x, 100.x, ...) are kept, since
+/// in a container the docker-network address is the node's real one.
+fn is_reportable_ip(ip: &str) -> bool {
+    !ip.is_empty() && !ip.starts_with("127.") && !ip.starts_with("169.254.")
+}
+
+/// The reportable IPv4 addresses from whitespace-separated `hostname -I` output.
+fn parse_interfaces(hostnames_output: &str) -> Vec<String> {
+    hostnames_output
+        .split_whitespace()
+        .filter(|token| token.contains('.') && is_reportable_ip(token))
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// The node's own non-loopback IPv4 interface addresses on Linux, via `hostname
+/// -I`. Empty when the command is absent or reports nothing.
+#[cfg(target_os = "linux")]
+fn local_interfaces() -> Vec<String> {
+    std::process::Command::new("hostname")
+        .arg("-I")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| parse_interfaces(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default()
+}
+
+/// No interface sampler on platforms other than Linux yet.
+#[cfg(not(target_os = "linux"))]
+fn local_interfaces() -> Vec<String> {
+    Vec::new()
+}
+
 /// GPU utilisation via `nvidia-smi`, or `None` when it is absent or has no GPU.
 #[cfg(target_os = "linux")]
 fn nvidia_gpu_util() -> Option<(u8, u8)> {
@@ -149,6 +185,24 @@ fn nvidia_gpu_util() -> Option<(u8, u8)> {
 #[cfg(test)]
 mod tests {
     use super::{cpu_busy_total, cpu_percent, mem_percent, parse_gpu_util, percent, Sampler};
+
+    #[test]
+    fn parse_interfaces_keeps_real_ips_and_drops_loopback() {
+        use super::parse_interfaces;
+        // hostname -I lists every IPv4 space-separated. Keep routable addresses
+        // (LAN, Tailscale overlay, a container's docker-network IP); drop loopback
+        // and link-local.
+        let out = "192.168.1.40 100.64.0.7 172.18.0.3 127.0.0.1 169.254.1.2";
+        assert_eq!(
+            parse_interfaces(out),
+            vec![
+                "192.168.1.40".to_string(),
+                "100.64.0.7".to_string(),
+                "172.18.0.3".to_string()
+            ]
+        );
+        assert!(parse_interfaces("").is_empty());
+    }
 
     #[test]
     fn percent_clamps_and_guards_zero() {
