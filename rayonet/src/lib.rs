@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod capability;
+pub mod control;
 pub mod coordinator;
 pub mod fleet;
 pub mod framing;

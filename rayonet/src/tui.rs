@@ -17,7 +17,8 @@ use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
 use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use crate::capability::NodeProfile;
+use crate::capability::{NodeProfile, Role};
+use crate::control::{Control, ControlAction, KillMode};
 use crate::graph::{Metric, Topology};
 use crate::layout::positions;
 use crate::observability::{
@@ -47,8 +48,15 @@ pub enum Input {
     SelectPrev,
     /// Clear the current selection and hover (Esc).
     Clear,
-    /// Toggle the paused flag (the driver decides what pausing means).
+    /// Toggle the playback paused flag (the driver decides what pausing means).
     TogglePause,
+    /// Pause or resume the selected node (a compute leaf): a toggle that gates new
+    /// work, or re-enables it. A no-op when nothing, or a non-leaf, is selected.
+    PauseNode,
+    /// Kill the selected node now: drop it and reroute its work.
+    KillNode,
+    /// Kill the selected node after its current tasks drain.
+    DrainNode,
     /// Ask to quit (q).
     Quit,
     /// The pointer moved to an absolute terminal cell.
@@ -68,10 +76,13 @@ pub enum Input {
 }
 
 /// What the driver should do after handling an [`Input`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Keep running.
     Continue,
+    /// Send a control command to the running coordinator (the driver forwards it
+    /// over the control back-channel).
+    Control(Control),
     /// Tear down and exit.
     Quit,
 }
@@ -186,6 +197,17 @@ impl App {
                 self.hovered = None;
             }
             Input::TogglePause => self.paused = !self.paused,
+            Input::PauseNode => return self.toggle_pause_selected(),
+            Input::KillNode => {
+                return self.control_selected(ControlAction::Kill {
+                    mode: KillMode::Now,
+                })
+            }
+            Input::DrainNode => {
+                return self.control_selected(ControlAction::Kill {
+                    mode: KillMode::AfterCurrent,
+                })
+            }
             Input::Quit => return Action::Quit,
             Input::PointerMoved { col, row } => {
                 self.hovered = self.hit.edges.get(&(col, row)).cloned();
@@ -205,6 +227,47 @@ impl App {
             }
         }
         Action::Continue
+    }
+
+    /// The path of the currently-pinned node (the first path that reaches it), or
+    /// `None` when a link, or nothing, is selected.
+    fn selected_path(&self) -> Option<String> {
+        let Selection::Node(id) = self.selected.as_ref()? else {
+            return None;
+        };
+        self.state
+            .paths_by_id()
+            .get(id)
+            .and_then(|paths| paths.first().copied())
+            .map(str::to_string)
+    }
+
+    /// A control command for the pinned node, or `Action::Continue` when nothing
+    /// is pinned. The driver forwards the command over the back-channel.
+    fn control_selected(&self, action: ControlAction) -> Action {
+        self.selected_path().map_or(Action::Continue, |path| {
+            Action::Control(Control::new(path, action))
+        })
+    }
+
+    /// Pause or resume the pinned node, but only when it is a compute leaf (a
+    /// relay's subtree is paused through its own leaves). Toggles by current state.
+    fn toggle_pause_selected(&self) -> Action {
+        let Some(path) = self.selected_path() else {
+            return Action::Continue;
+        };
+        let Some(view) = self.state.nodes().get(&path) else {
+            return Action::Continue;
+        };
+        if view.role() != Some(Role::Compute) {
+            return Action::Continue;
+        }
+        let action = if view.state() == NodeState::Paused {
+            ControlAction::Resume
+        } else {
+            ControlAction::Pause
+        };
+        Action::Control(Control::new(path, action))
     }
 }
 
@@ -530,6 +593,14 @@ fn node_detail_lines(state: &RunState, id: &str) -> Vec<Line<'static>> {
         )),
     ];
     lines.extend(telemetry_lines(view.telemetry()));
+    // The control keys for this node: a compute leaf can also be paused; a relay
+    // can only be killed (its leaves are paused individually).
+    let actions = if role == Role::Compute {
+        "act   space pause  k kill  d drain"
+    } else {
+        "act   k kill  d drain"
+    };
+    lines.push(Line::from(actions));
     lines
 }
 
@@ -545,6 +616,8 @@ const fn state_label(state: NodeState) -> &'static str {
         NodeState::Ready => "Ready",
         NodeState::Idle => "Idle",
         NodeState::Working => "Working",
+        NodeState::Paused => "Paused",
+        NodeState::Draining => "Draining",
         NodeState::Done => "Done",
         NodeState::Lost => "Lost",
     }
@@ -561,6 +634,8 @@ const fn state_meaning(state: NodeState) -> &'static str {
         NodeState::Ready => "built, awaiting work",
         NodeState::Idle => "connected, no task in flight",
         NodeState::Working => "running tasks now",
+        NodeState::Paused => "paused, takes no new work until resumed",
+        NodeState::Draining => "finishing its tasks, then will be killed",
         NodeState::Done => "finished its work",
         NodeState::Lost => "connection dropped, work requeued",
     }
@@ -630,14 +705,14 @@ fn legend_lines() -> Vec<Line<'static>> {
     vec![
         Line::from("keys"),
         Line::from("Tab / S-Tab  select"),
-        Line::from("click        select"),
-        Line::from("hover edge   link info"),
-        Line::from("p pause   q quit"),
-        Line::from(""),
-        key(None, "coordinator"),
+        Line::from("space  pause/resume node"),
+        Line::from("k kill   d drain+kill"),
+        Line::from("p playback   q quit"),
         key(Some(NodeState::Working), "working"),
         key(Some(NodeState::Done), "done"),
         key(Some(NodeState::Ready), "ready / idle"),
+        key(Some(NodeState::Paused), "paused"),
+        key(Some(NodeState::Draining), "draining"),
         key(Some(NodeState::Building), "provisioning"),
         key(Some(NodeState::Lost), "lost"),
         Line::from(Span::styled(
@@ -808,10 +883,12 @@ const fn state_rank(state: NodeState) -> u8 {
         NodeState::Installing => 2,
         NodeState::Syncing => 3,
         NodeState::Building => 4,
-        NodeState::Idle => 5,
-        NodeState::Ready => 6,
-        NodeState::Working => 7,
-        NodeState::Done => 8,
+        NodeState::Paused => 5,
+        NodeState::Draining => 6,
+        NodeState::Idle => 7,
+        NodeState::Ready => 8,
+        NodeState::Working => 9,
+        NodeState::Done => 10,
     }
 }
 
@@ -830,6 +907,8 @@ const fn node_glyph(state: Option<NodeState>) -> char {
         Some(NodeState::Working) => '\u{25cf}',
         Some(NodeState::Done) => '\u{25c9}',
         Some(NodeState::Ready | NodeState::Idle) => '\u{25cb}',
+        Some(NodeState::Paused) => '\u{2016}',
+        Some(NodeState::Draining) => '\u{25d0}',
         Some(
             NodeState::Probing | NodeState::Installing | NodeState::Syncing | NodeState::Building,
         ) => '\u{25cd}',
@@ -843,7 +922,11 @@ const fn node_blink(state: Option<NodeState>) -> Modifier {
     match state {
         Some(NodeState::Lost) => Modifier::RAPID_BLINK,
         Some(
-            NodeState::Probing | NodeState::Installing | NodeState::Syncing | NodeState::Building,
+            NodeState::Probing
+            | NodeState::Installing
+            | NodeState::Syncing
+            | NodeState::Building
+            | NodeState::Draining,
         ) => Modifier::SLOW_BLINK,
         _ => Modifier::empty(),
     }
@@ -995,6 +1078,8 @@ fn state_style(state: NodeState) -> Style {
         NodeState::Working => Color::Green,
         NodeState::Done => Color::Blue,
         NodeState::Lost => Color::Red,
+        NodeState::Paused => Color::Gray,
+        NodeState::Draining => Color::LightRed,
         NodeState::Ready | NodeState::Idle => Color::Cyan,
         NodeState::Probing | NodeState::Installing | NodeState::Syncing | NodeState::Building => {
             Color::Yellow
@@ -1007,6 +1092,7 @@ fn state_style(state: NodeState) -> Style {
 mod tests {
     use super::{draw, Action, App, Input, Selection};
     use crate::capability::{CpuArch, NodeProfile, Os, Role};
+    use crate::control::{Control, ControlAction, KillMode};
     use crate::graph::Topology;
     use crate::observability::{Event, NodeState};
     use ratatui::backend::TestBackend;
@@ -1108,6 +1194,33 @@ mod tests {
             app.apply(&Event::node(host, NodeState::Working));
         }
         app
+    }
+
+    #[test]
+    fn the_paused_and_draining_states_render() {
+        // The operator-control states have a label, a meaning, a glyph, a blink, a
+        // colour, and a rank like every other state.
+        for state in [NodeState::Paused, NodeState::Draining] {
+            assert!(!super::state_label(state).is_empty());
+            assert!(!super::state_meaning(state).is_empty());
+            let _ = super::node_glyph(Some(state));
+            let _ = super::node_blink(Some(state));
+            let _ = super::state_style(state);
+            let _ = super::state_rank(state);
+        }
+        // The two have distinct labels, ranks, and glyphs.
+        assert_ne!(
+            super::state_label(NodeState::Paused),
+            super::state_label(NodeState::Draining)
+        );
+        assert_ne!(
+            super::state_rank(NodeState::Paused),
+            super::state_rank(NodeState::Draining)
+        );
+        assert_ne!(
+            super::node_glyph(Some(NodeState::Paused)),
+            super::node_glyph(Some(NodeState::Draining))
+        );
     }
 
     #[test]
@@ -1510,6 +1623,72 @@ mod tests {
         app.on_input(Input::TogglePause);
         assert!(!app.paused());
         assert_eq!(app.on_input(Input::Quit), Action::Quit);
+    }
+
+    /// Pin the node at `path`/`id` (profiled with `role`) and return the app.
+    fn app_with_selected(path: &str, id: &str, role: Role) -> App {
+        let mut app = App::new();
+        app.apply(&Event::profiled(path, id, profile("x86_64"), role, 0));
+        app.selected = Some(Selection::Node(id.to_string()));
+        app
+    }
+
+    #[test]
+    fn pausing_a_selected_leaf_emits_a_pause_then_resume() {
+        let mut app = app_with_selected("leaf", "idL", Role::Compute);
+        assert_eq!(
+            app.on_input(Input::PauseNode),
+            Action::Control(Control::new("leaf".to_string(), ControlAction::Pause))
+        );
+        // Once the node reads Paused, the same key resumes it.
+        app.apply(&Event::node("leaf", NodeState::Paused));
+        assert_eq!(
+            app.on_input(Input::PauseNode),
+            Action::Control(Control::new("leaf".to_string(), ControlAction::Resume))
+        );
+    }
+
+    #[test]
+    fn killing_and_draining_a_selected_node_emit_the_right_controls() {
+        let mut app = app_with_selected("leaf", "idL", Role::Compute);
+        assert_eq!(
+            app.on_input(Input::KillNode),
+            Action::Control(Control::new(
+                "leaf".to_string(),
+                ControlAction::Kill {
+                    mode: KillMode::Now
+                }
+            ))
+        );
+        assert_eq!(
+            app.on_input(Input::DrainNode),
+            Action::Control(Control::new(
+                "leaf".to_string(),
+                ControlAction::Kill {
+                    mode: KillMode::AfterCurrent
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn pausing_a_relay_is_rejected_but_it_can_still_be_killed() {
+        let mut app = app_with_selected("gw", "idG", Role::RelayOnly);
+        // Pause targets compute leaves only.
+        assert_eq!(app.on_input(Input::PauseNode), Action::Continue);
+        // Kill works on any node.
+        assert!(matches!(app.on_input(Input::KillNode), Action::Control(_)));
+    }
+
+    #[test]
+    fn node_controls_are_a_no_op_with_no_node_pinned() {
+        let mut app = App::new();
+        assert_eq!(app.on_input(Input::PauseNode), Action::Continue);
+        assert_eq!(app.on_input(Input::KillNode), Action::Continue);
+        assert_eq!(app.on_input(Input::DrainNode), Action::Continue);
+        // A pinned link is not a node, so it is a no-op too.
+        app.selected = Some(Selection::Edge("p".to_string(), "c".to_string()));
+        assert_eq!(app.on_input(Input::KillNode), Action::Continue);
     }
 
     #[test]

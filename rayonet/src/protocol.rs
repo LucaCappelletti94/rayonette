@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped when the wire protocol changes. Because the agent is compiled from the
 /// same source as the coordinator (whole-crate compile), this is a sanity
 /// assertion rather than a true negotiation.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Identifies a task within a run.
 pub type TaskId = u64;
@@ -94,6 +94,16 @@ pub enum ToAgent {
         /// Label of the standby child to activate.
         child: String,
     },
+    /// An operator control routed down the tree (pause, resume, or kill a node).
+    /// `target` is the path from this agent down to the node to act on (its first
+    /// segment names a direct child); a relay applies the action to that child
+    /// when the path ends there, or forwards a deeper path one hop further down.
+    Control {
+        /// The remaining path from this agent to the node to control.
+        target: String,
+        /// What to do to it.
+        action: crate::control::ControlAction,
+    },
     /// Stop serving and exit cleanly (sent once every result is in).
     Shutdown,
 }
@@ -159,6 +169,7 @@ pub enum FromAgent {
 #[cfg(test)]
 mod tests {
     use super::{ChildAd, FromAgent, ToAgent, PROTOCOL_VERSION};
+    use crate::control::{ControlAction, KillMode};
     use crate::observability::{Event, NodeState};
     use proptest::prelude::*;
 
@@ -190,6 +201,16 @@ mod tests {
             },
             ToAgent::Promote {
                 child: "leaf-b".to_string(),
+            },
+            ToAgent::Control {
+                target: "leaf-a".to_string(),
+                action: ControlAction::Pause,
+            },
+            ToAgent::Control {
+                target: "leaf-a/deep".to_string(),
+                action: ControlAction::Kill {
+                    mode: KillMode::AfterCurrent,
+                },
             },
             ToAgent::Shutdown,
         ] {
@@ -240,6 +261,20 @@ mod tests {
             prop::collection::vec(any::<String>(), 0..4)
                 .prop_map(|active| ToAgent::Activate { active }),
             any::<String>().prop_map(|child| ToAgent::Promote { child }),
+            (
+                any::<String>(),
+                prop_oneof![
+                    Just(ControlAction::Pause),
+                    Just(ControlAction::Resume),
+                    Just(ControlAction::Kill {
+                        mode: KillMode::Now
+                    }),
+                    Just(ControlAction::Kill {
+                        mode: KillMode::AfterCurrent
+                    }),
+                ],
+            )
+                .prop_map(|(target, action)| ToAgent::Control { target, action }),
             Just(ToAgent::Shutdown),
         ]
     }

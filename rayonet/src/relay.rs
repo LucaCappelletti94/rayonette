@@ -16,6 +16,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
 use crate::agent::recv_hello;
+use crate::control::{ControlAction, KillMode};
 use crate::coordinator::{
     connect_agents, handshake_join, spawn_reader, ActivationPolicy, Agents, Event as ChildEvent,
 };
@@ -77,6 +78,12 @@ struct Relay<S> {
     active: Vec<bool>,
     /// Whether each child is still up; a lost one takes no more tasks.
     alive: Vec<bool>,
+    /// Whether each child is paused by an operator: connected, but handed no new
+    /// work until resumed (its in-flight tasks finish).
+    paused: Vec<bool>,
+    /// Whether each child is draining toward a kill: handed no new work, and
+    /// dropped once its in-flight tasks finish.
+    draining: Vec<bool>,
     /// How many tasks each child is currently running.
     load: Vec<usize>,
     /// Tasks waiting for a free child slot, with their payloads.
@@ -105,6 +112,8 @@ where
             capacity,
             active,
             alive: vec![true; n],
+            paused: vec![false; n],
+            draining: vec![false; n],
             load: vec![0; n],
             pending: VecDeque::new(),
             inflight: HashMap::new(),
@@ -142,9 +151,13 @@ where
     /// reported as `Working`.
     async fn dispatch(&mut self) -> io::Result<()> {
         while !self.pending.is_empty() {
-            let Some(child) = (0..self.senders.len())
-                .find(|&c| self.active[c] && self.alive[c] && self.load[c] < self.capacity[c])
-            else {
+            let Some(child) = (0..self.senders.len()).find(|&c| {
+                self.active[c]
+                    && self.alive[c]
+                    && !self.paused[c]
+                    && !self.draining[c]
+                    && self.load[c] < self.capacity[c]
+            }) else {
                 return Ok(());
             };
             let (task_id, payload) = self.pending.pop_front().expect("pending is non-empty");
@@ -199,6 +212,90 @@ where
         self.alive.iter().any(|alive| *alive)
     }
 
+    /// Kill a child: shut it down, then take the same lost path a dropped child
+    /// would (requeue its work onto the survivors). Returns whether the subtree is
+    /// still alive afterward (`false` means this relay should tear down).
+    async fn kill_child(&mut self, child: usize) -> io::Result<bool> {
+        if !self.alive[child] {
+            return Ok(true);
+        }
+        let _ = self.senders[child].send(&ToAgent::Shutdown).await;
+        self.on_lost(child);
+        self.dispatch().await?;
+        Ok(self.any_alive_child())
+    }
+
+    /// React to a child whose last in-flight task just finished: kill it if it was
+    /// draining, leave it showing `Paused` if paused, else report it `Idle`.
+    /// Returns whether the subtree is still alive (`false` means tear down).
+    async fn on_child_idle(&mut self, child: usize) -> io::Result<bool> {
+        if self.draining[child] {
+            return self.kill_child(child).await;
+        }
+        if !self.paused[child] {
+            self.report(child, NodeState::Idle);
+        }
+        Ok(true)
+    }
+
+    /// Apply an operator control routed from the parent. `target`'s first segment
+    /// names a child; when the path ends there the action is applied here, else it
+    /// is forwarded one hop further down. Returns whether the subtree is still
+    /// alive (`false` means tear down).
+    async fn control(&mut self, target: String, action: ControlAction) -> io::Result<bool> {
+        let (head, rest) = match target.split_once('/') {
+            Some((head, rest)) => (head, Some(rest)),
+            None => (target.as_str(), None),
+        };
+        let Some(child) = self.labels.iter().position(|label| label == head) else {
+            return Ok(true);
+        };
+        if !self.alive[child] {
+            return Ok(true);
+        }
+        if let Some(rest) = rest {
+            let _ = self.senders[child]
+                .send(&ToAgent::Control {
+                    target: rest.to_string(),
+                    action,
+                })
+                .await;
+            return Ok(true);
+        }
+        match action {
+            ControlAction::Pause => {
+                if !self.paused[child] && !self.draining[child] {
+                    self.paused[child] = true;
+                    self.report(child, NodeState::Paused);
+                }
+            }
+            ControlAction::Resume => {
+                if self.paused[child] {
+                    self.paused[child] = false;
+                    self.dispatch().await?;
+                    let state = if self.load[child] > 0 {
+                        NodeState::Working
+                    } else {
+                        NodeState::Idle
+                    };
+                    self.report(child, state);
+                }
+            }
+            ControlAction::Kill { mode } => match mode {
+                KillMode::Now => return self.kill_child(child).await,
+                KillMode::AfterCurrent => {
+                    if self.load[child] == 0 {
+                        return self.kill_child(child).await;
+                    } else if !self.draining[child] {
+                        self.draining[child] = true;
+                        self.report(child, NodeState::Draining);
+                    }
+                }
+            },
+        }
+        Ok(true)
+    }
+
     /// Handle one event from a child, forwarding its task lifecycle and
     /// observability up to `parent_tx` and keeping the schedule fed. Returns
     /// `false` when the subtree is gone and the relay should tear down.
@@ -234,8 +331,8 @@ where
                         })
                         .await?;
                     self.dispatch().await?;
-                    if self.load[child] == 0 {
-                        self.report(child, NodeState::Idle);
+                    if self.load[child] == 0 && !self.on_child_idle(child).await? {
+                        return Ok(false);
                     }
                 }
             }
@@ -257,8 +354,8 @@ where
                         })
                         .await?;
                     self.dispatch().await?;
-                    if self.load[child] == 0 {
-                        self.report(child, NodeState::Idle);
+                    if self.load[child] == 0 && !self.on_child_idle(child).await? {
+                        return Ok(false);
                     }
                 }
             }
@@ -514,6 +611,13 @@ where
                         sched.dispatch().await?;
                     }
                 }
+                // An operator control: apply it to the named child or forward it
+                // deeper. Tears down if killing the child empties the subtree.
+                Some(ToAgent::Control { target, action }) => {
+                    if !sched.control(target, action).await? {
+                        break;
+                    }
+                }
                 // A clean Shutdown or a dropped parent both end the relay.
                 Some(ToAgent::Shutdown) | None => break,
                 Some(other @ (ToAgent::Hello { .. } | ToAgent::Activate { .. })) => {
@@ -552,6 +656,8 @@ where
                         sched.capacity.push(joiner.capacity);
                         sched.active.push(true);
                         sched.alive.push(true);
+                        sched.paused.push(false);
+                        sched.draining.push(false);
                         sched.load.push(0);
                         readers.push(spawn_reader(joiner.rx, child, child_events_tx.clone()));
                         sched.report(child, NodeState::Idle);
@@ -617,6 +723,12 @@ mod tests {
     use tokio::task::JoinHandle;
 
     fn double(x: u32) -> u32 {
+        x * 2
+    }
+
+    /// A double slow enough that work stays in flight while a control lands.
+    fn slow(x: u32) -> u32 {
+        std::thread::sleep(std::time::Duration::from_millis(3));
         x * 2
     }
 
@@ -1454,5 +1566,286 @@ mod tests {
         };
         let (res, ()) = tokio::join!(relay_fut, driver);
         assert!(res.is_err());
+    }
+
+    /// Build a coordinator-side connection to a relay over two slow leaves, and the
+    /// relay future, for the control tests below.
+    fn coord_and_relay_over_two_leaves() -> (
+        Connection<DuplexStream>,
+        impl std::future::Future<Output = std::io::Result<()>>,
+    ) {
+        let children = vec![
+            LocalAgent::new("leaf-a", Registry::new().with("slow", handler(slow))),
+            LocalAgent::new("leaf-b", Registry::new().with("slow", handler(slow))),
+        ];
+        let (coord_side, relay_side) = connection_pair(4096);
+        (coord_side, relay(relay_side, children))
+    }
+
+    #[tokio::test]
+    async fn killing_a_leaf_behind_a_relay_reroutes_and_reports_it_lost() {
+        use crate::control::{Control, ControlAction, KillMode};
+        use crate::coordinator::{
+            decode_output, run_job_raw_with_joins, serialize_inputs, RunOptions,
+        };
+        use crate::observability::{NodeState, RunState};
+        use crate::testing::EventRecorder;
+        use tokio::sync::mpsc;
+
+        let (coord_side, relay_fut) = coord_and_relay_over_two_leaves();
+        let recorder = EventRecorder::default();
+        let (joins_tx, joins_rx) = mpsc::unbounded_channel();
+        drop(joins_tx);
+        let (controls_tx, controls_rx) = mpsc::unbounded_channel::<Control>();
+        let payloads = serialize_inputs(&(0..20u32).collect::<Vec<_>>()).unwrap();
+        let coord_fut = run_job_raw_with_joins(
+            vec![("relay".to_string(), coord_side)],
+            "slow",
+            payloads,
+            &[],
+            RunOptions::default(),
+            joins_rx,
+            controls_rx,
+            &recorder,
+        );
+        let driver = async {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            controls_tx
+                .send(Control::new(
+                    "relay/leaf-a".to_string(),
+                    ControlAction::Kill {
+                        mode: KillMode::Now,
+                    },
+                ))
+                .unwrap();
+            // A follow-up to the now-dead leaf and an unknown child are no-ops.
+            controls_tx
+                .send(Control::new(
+                    "relay/leaf-a".to_string(),
+                    ControlAction::Resume,
+                ))
+                .unwrap();
+            controls_tx
+                .send(Control::new(
+                    "relay/ghost".to_string(),
+                    ControlAction::Pause,
+                ))
+                .unwrap();
+            drop(controls_tx);
+        };
+        let (relay_res, raw, ()) = tokio::join!(relay_fut, coord_fut, driver);
+        relay_res.unwrap();
+        let outs: Vec<Result<u32, String>> =
+            raw.unwrap().into_iter().map(decode_output::<u32>).collect();
+        assert_eq!(outs, (0..20u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+        let mut state = RunState::default();
+        for event in &recorder.events() {
+            state.apply(event);
+        }
+        assert_eq!(state.nodes()["relay/leaf-a"].state(), NodeState::Lost);
+    }
+
+    #[tokio::test]
+    async fn pausing_leaves_behind_a_relay_stalls_until_resumed() {
+        use crate::control::{Control, ControlAction};
+        use crate::coordinator::{run_job_raw_with_joins, serialize_inputs, RunOptions};
+        use crate::observability::NodeState;
+        use crate::testing::EventRecorder;
+        use tokio::sync::mpsc;
+
+        let (coord_side, relay_fut) = coord_and_relay_over_two_leaves();
+        let relay_task = tokio::spawn(relay_fut);
+        let recorder = EventRecorder::default();
+        let (joins_tx, joins_rx) = mpsc::unbounded_channel();
+        drop(joins_tx);
+        let (controls_tx, controls_rx) = mpsc::unbounded_channel::<Control>();
+        let payloads = serialize_inputs(&(0..10u32).collect::<Vec<_>>()).unwrap();
+        let coord = run_job_raw_with_joins(
+            vec![("relay".to_string(), coord_side)],
+            "slow",
+            payloads,
+            &[],
+            RunOptions::default(),
+            joins_rx,
+            controls_rx,
+            &recorder,
+        );
+        tokio::pin!(coord);
+
+        // Pause both leaves: no leaf can take work, so the run cannot finish.
+        controls_tx
+            .send(Control::new(
+                "relay/leaf-a".to_string(),
+                ControlAction::Pause,
+            ))
+            .unwrap();
+        controls_tx
+            .send(Control::new(
+                "relay/leaf-b".to_string(),
+                ControlAction::Pause,
+            ))
+            .unwrap();
+        let early = tokio::time::timeout(std::time::Duration::from_millis(150), &mut coord).await;
+        assert!(
+            early.is_err(),
+            "both leaves paused: the run cannot complete"
+        );
+
+        // Resume and let it drain.
+        controls_tx
+            .send(Control::new(
+                "relay/leaf-a".to_string(),
+                ControlAction::Resume,
+            ))
+            .unwrap();
+        controls_tx
+            .send(Control::new(
+                "relay/leaf-b".to_string(),
+                ControlAction::Resume,
+            ))
+            .unwrap();
+        drop(controls_tx);
+        let raw = (&mut coord).await.unwrap();
+        assert_eq!(raw.len(), 10);
+        relay_task.await.unwrap().unwrap();
+        assert!(
+            recorder.states().contains(&NodeState::Paused),
+            "a leaf behind the relay was reported Paused"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_after_current_behind_a_relay_drains_then_loses_the_leaf() {
+        use crate::control::{Control, ControlAction, KillMode};
+        use crate::coordinator::{
+            decode_output, run_job_raw_with_joins, serialize_inputs, RunOptions,
+        };
+        use crate::observability::{NodeState, RunState};
+        use crate::testing::EventRecorder;
+        use tokio::sync::mpsc;
+
+        let (coord_side, relay_fut) = coord_and_relay_over_two_leaves();
+        let recorder = EventRecorder::default();
+        let (joins_tx, joins_rx) = mpsc::unbounded_channel();
+        drop(joins_tx);
+        let (controls_tx, controls_rx) = mpsc::unbounded_channel::<Control>();
+        let payloads = serialize_inputs(&(0..20u32).collect::<Vec<_>>()).unwrap();
+        let coord_fut = run_job_raw_with_joins(
+            vec![("relay".to_string(), coord_side)],
+            "slow",
+            payloads,
+            &[],
+            RunOptions::default(),
+            joins_rx,
+            controls_rx,
+            &recorder,
+        );
+        let driver = async {
+            // Wait until the leaf is actually running a task, so the after-current
+            // kill has something to drain (robust under slow, instrumented runs).
+            loop {
+                let mut state = RunState::default();
+                for event in &recorder.events() {
+                    state.apply(event);
+                }
+                if state
+                    .nodes()
+                    .get("relay/leaf-a")
+                    .is_some_and(|view| view.state() == NodeState::Working)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            controls_tx
+                .send(Control::new(
+                    "relay/leaf-a".to_string(),
+                    ControlAction::Kill {
+                        mode: KillMode::AfterCurrent,
+                    },
+                ))
+                .unwrap();
+            drop(controls_tx);
+        };
+        let (relay_res, raw, ()) = tokio::join!(relay_fut, coord_fut, driver);
+        relay_res.unwrap();
+        let outs: Vec<Result<u32, String>> =
+            raw.unwrap().into_iter().map(decode_output::<u32>).collect();
+        assert_eq!(outs, (0..20u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+        let states = recorder.states();
+        assert!(states.contains(&NodeState::Draining), "{states:?}");
+        let mut state = RunState::default();
+        for event in &recorder.events() {
+            state.apply(event);
+        }
+        assert_eq!(state.nodes()["relay/leaf-a"].state(), NodeState::Lost);
+    }
+
+    #[tokio::test]
+    async fn killing_a_leaf_two_relays_deep_routes_through_both() {
+        use crate::control::{Control, ControlAction, KillMode};
+        use crate::coordinator::{
+            decode_output, run_job_raw_with_joins, serialize_inputs, RunOptions,
+        };
+        use crate::observability::{NodeState, RunState};
+        use crate::testing::EventRecorder;
+        use tokio::sync::mpsc;
+
+        // coordinator -> relay -> sub-relay -> {leaf-x, leaf-y}. A control aimed at
+        // the deep leaf is forwarded through both relays before it is applied.
+        let children = vec![RelayAgent {
+            leaves: vec![
+                (
+                    "leaf-x".to_string(),
+                    Registry::new().with("slow", handler(slow)),
+                ),
+                (
+                    "leaf-y".to_string(),
+                    Registry::new().with("slow", handler(slow)),
+                ),
+            ],
+        }];
+        let (coord_side, relay_side) = connection_pair(4096);
+        let relay_fut = relay(relay_side, children);
+        let recorder = EventRecorder::default();
+        let (joins_tx, joins_rx) = mpsc::unbounded_channel();
+        drop(joins_tx);
+        let (controls_tx, controls_rx) = mpsc::unbounded_channel::<Control>();
+        let payloads = serialize_inputs(&(0..20u32).collect::<Vec<_>>()).unwrap();
+        let coord_fut = run_job_raw_with_joins(
+            vec![("relay".to_string(), coord_side)],
+            "slow",
+            payloads,
+            &[],
+            RunOptions::default(),
+            joins_rx,
+            controls_rx,
+            &recorder,
+        );
+        let driver = async {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            controls_tx
+                .send(Control::new(
+                    "relay/sub-relay/leaf-x".to_string(),
+                    ControlAction::Kill {
+                        mode: KillMode::Now,
+                    },
+                ))
+                .unwrap();
+            drop(controls_tx);
+        };
+        let (relay_res, raw, ()) = tokio::join!(relay_fut, coord_fut, driver);
+        relay_res.unwrap();
+        let outs: Vec<Result<u32, String>> =
+            raw.unwrap().into_iter().map(decode_output::<u32>).collect();
+        assert_eq!(outs, (0..20u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+        let mut state = RunState::default();
+        for event in &recorder.events() {
+            state.apply(event);
+        }
+        assert_eq!(
+            state.nodes()["relay/sub-relay/leaf-x"].state(),
+            NodeState::Lost
+        );
     }
 }

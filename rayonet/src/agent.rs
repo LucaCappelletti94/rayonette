@@ -247,9 +247,12 @@ where
             }
             ToAgent::Shutdown => break,
             // A leaf has no children, so it never readies via the relay handshake
-            // and the coordinator never sends it an active-set or a promotion.
-            other
-            @ (ToAgent::Hello { .. } | ToAgent::Activate { .. } | ToAgent::Promote { .. }) => {
+            // and the coordinator never sends it an active-set, a promotion, or a
+            // control to route (its relay applies pause/kill to it directly).
+            other @ (ToAgent::Hello { .. }
+            | ToAgent::Activate { .. }
+            | ToAgent::Promote { .. }
+            | ToAgent::Control { .. }) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("unexpected message: {other:?}"),

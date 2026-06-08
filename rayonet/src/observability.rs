@@ -32,6 +32,12 @@ pub enum NodeState {
     Working,
     /// Connected and ready but with no task in flight.
     Idle,
+    /// Paused by an operator: still connected, but assigned no new work until
+    /// resumed (any in-flight task finishes first).
+    Paused,
+    /// Being killed after its current tasks drain: assigned no new work, and
+    /// dropped once its in-flight tasks finish.
+    Draining,
     /// The run finished on this node.
     Done,
     /// The node's connection dropped; its in-flight work was requeued.

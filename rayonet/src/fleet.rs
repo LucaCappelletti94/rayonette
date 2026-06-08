@@ -450,8 +450,20 @@ impl<L: Launch + Send + Sync> ErasedFleet for Fleet<L> {
             // the job's result returns as soon as it completes, and the driver's
             // guards (the agents it joined) are held until then.
             let (joins_tx, joins_rx) = mpsc::unbounded_channel();
+            // Attach the control back-channel when a socket is configured, so a
+            // client (the TUI, or another tool) can pause or kill nodes mid-run.
+            // The listener is held for the run's duration; without it the channel
+            // is an inert closed one.
+            let (_control_listener, controls_rx) = control_channel();
             let job = run_job_raw_with_joins(
-                agents, fn_key, payloads, &latencies, options, joins_rx, events,
+                agents,
+                fn_key,
+                payloads,
+                &latencies,
+                options,
+                joins_rx,
+                controls_rx,
+                events,
             );
             let driver = rejoin_driver(
                 retry,
@@ -480,6 +492,26 @@ impl<L: Launch + Send + Sync> ErasedFleet for Fleet<L> {
             result
         })
     }
+}
+
+/// The control receiver that feeds the run loop, plus a guard to keep it alive.
+///
+/// When `RAYONET_CONTROL_SOCKET` is set, binds a [`ControlListener`] there so a
+/// client can pause or kill nodes mid-run (the returned guard holds it open).
+/// Otherwise, or if binding fails, returns a closed channel that never yields, so
+/// the run behaves exactly as it did without control.
+fn control_channel() -> (
+    Option<crate::control::ControlListener>,
+    mpsc::UnboundedReceiver<crate::control::Control>,
+) {
+    if let Some(path) = std::env::var_os("RAYONET_CONTROL_SOCKET") {
+        if let Ok((listener, rx)) = crate::control::ControlListener::bind(path) {
+            return (Some(listener), rx);
+        }
+    }
+    let (tx, rx) = mpsc::unbounded_channel();
+    drop(tx);
+    (None, rx)
 }
 
 /// The process-global fleet that [`NetMapExt::net_map`] runs against. Installed

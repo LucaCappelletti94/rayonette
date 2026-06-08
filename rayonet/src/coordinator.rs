@@ -16,6 +16,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::control::{Control, ControlAction, KillMode};
 use crate::framing::{Connection, Receiver, Sender};
 use crate::observability::{join_label, Event as Obs, EventSink, NodeState};
 use crate::protocol::{ChildAd, FromAgent, TaskId, ToAgent, PROTOCOL_VERSION};
@@ -327,6 +328,12 @@ struct Job<S> {
     standbys: Vec<Vec<ChildAd>>,
     /// Whether each agent's connection is still up; a lost one takes no tasks.
     alive: Vec<bool>,
+    /// Whether each agent is paused by an operator: still connected, but handed no
+    /// new work until resumed. Its in-flight tasks finish.
+    paused: Vec<bool>,
+    /// Whether each agent is draining toward a kill: handed no new work, and
+    /// dropped once its in-flight tasks finish.
+    draining: Vec<bool>,
     pending: VecDeque<usize>,
     /// `task_id` -> (input index, the agents running it). Usually one agent; with
     /// speculation a straggler is raced on a second, so the first terminal frees
@@ -348,6 +355,12 @@ where
     /// fronting many slots is kept fed while a leaf still holds one task; a lost
     /// agent takes nothing.
     async fn fill(&mut self, agent: usize) -> std::io::Result<()> {
+        // A paused or draining agent takes no new work; a lost one takes none either
+        // (the inner loops also guard on `alive`, but gating here keeps speculation
+        // off a held node too).
+        if !self.alive[agent] || self.paused[agent] || self.draining[agent] {
+            return Ok(());
+        }
         self.assign_up_to_capacity(agent).await?;
         if self.speculative {
             self.speculate(agent).await?;
@@ -538,13 +551,96 @@ where
             // in-flight tasks, promote standbys so a survivor takes over the
             // orphaned subtree, and feed the survivors.
             Event::Lost(agent) => {
-                events.emit(Obs::node(&self.labels[agent], NodeState::Lost));
-                self.requeue_lost(agent);
-                self.reroute().await?;
-                for survivor in 0..self.senders.len() {
-                    self.fill(survivor).await?;
+                self.lose(agent, events).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Abandon a lost agent: mark it lost, requeue its in-flight tasks, promote
+    /// standbys so a survivor takes over the orphaned subtree, and feed the
+    /// survivors. Idempotent: a node killed by command is already not alive when
+    /// its dropped connection later surfaces as [`Event::Lost`], so the second
+    /// call is a no-op.
+    async fn lose(&mut self, agent: usize, events: &dyn EventSink) -> std::io::Result<()> {
+        if !self.alive[agent] {
+            return Ok(());
+        }
+        events.emit(Obs::node(&self.labels[agent], NodeState::Lost));
+        self.requeue_lost(agent);
+        self.reroute().await?;
+        for survivor in 0..self.senders.len() {
+            self.fill(survivor).await?;
+        }
+        Ok(())
+    }
+
+    /// Kill a direct child now: shut it down (best-effort), then take the same Lost
+    /// path a dropped connection would (requeue, reroute, refill survivors).
+    async fn kill_now(&mut self, agent: usize, events: &dyn EventSink) -> std::io::Result<()> {
+        if !self.alive[agent] {
+            return Ok(());
+        }
+        let _ = self.senders[agent].send(&ToAgent::Shutdown).await;
+        self.lose(agent, events).await
+    }
+
+    /// Apply an out-of-band [`Control`]. A `target` that names a direct child is
+    /// acted on here; a deeper path is routed one hop down to the relay fronting
+    /// its first segment, which applies it (or forwards it further). An unknown
+    /// target, or one behind a lost relay, is dropped.
+    async fn control(&mut self, control: Control, events: &dyn EventSink) -> std::io::Result<()> {
+        let target = control.target();
+        let direct = self.labels.iter().position(|label| label == target);
+        let Some(agent) = direct else {
+            // Not a direct child: route to the relay fronting the path's head.
+            if let Some((head, rest)) = target.split_once('/') {
+                if let Some(relay) = self.labels.iter().position(|label| label == head) {
+                    if self.alive[relay] {
+                        let _ = self.senders[relay]
+                            .send(&ToAgent::Control {
+                                target: rest.to_string(),
+                                action: control.action(),
+                            })
+                            .await;
+                    }
                 }
             }
+            return Ok(());
+        };
+        if !self.alive[agent] {
+            return Ok(());
+        }
+        match control.action() {
+            ControlAction::Pause => {
+                if !self.paused[agent] && !self.draining[agent] {
+                    self.paused[agent] = true;
+                    events.emit(Obs::node(&self.labels[agent], NodeState::Paused));
+                }
+            }
+            ControlAction::Resume => {
+                if self.paused[agent] {
+                    self.paused[agent] = false;
+                    self.fill(agent).await?;
+                    let state = if self.in_flight[agent] > 0 {
+                        NodeState::Working
+                    } else {
+                        NodeState::Idle
+                    };
+                    events.emit(Obs::node(&self.labels[agent], state));
+                }
+            }
+            ControlAction::Kill { mode } => match mode {
+                KillMode::Now => self.kill_now(agent, events).await?,
+                KillMode::AfterCurrent => {
+                    if self.in_flight[agent] == 0 {
+                        self.kill_now(agent, events).await?;
+                    } else if !self.draining[agent] {
+                        self.draining[agent] = true;
+                        events.emit(Obs::node(&self.labels[agent], NodeState::Draining));
+                    }
+                }
+            },
         }
         Ok(())
     }
@@ -575,7 +671,13 @@ where
         for agent in freed {
             self.fill(agent).await?;
             if self.in_flight[agent] == 0 {
-                events.emit(Obs::node(&self.labels[agent], NodeState::Idle));
+                if self.draining[agent] {
+                    // The drain finished: now take it down.
+                    self.kill_now(agent, events).await?;
+                } else if !self.paused[agent] {
+                    // A paused agent stays Paused rather than flipping to Idle.
+                    events.emit(Obs::node(&self.labels[agent], NodeState::Idle));
+                }
             }
         }
         Ok(())
@@ -629,10 +731,12 @@ pub(crate) async fn run_job_raw<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // No node can join: an immediately-closed channel makes the elastic core
-    // behave exactly like the static run.
+    // No node can join and no controller is attached: immediately-closed channels
+    // make the elastic core behave exactly like the static run.
     let (joins_tx, joins_rx) = mpsc::unbounded_channel::<Joiner<S>>();
     drop(joins_tx);
+    let (controls_tx, controls_rx) = mpsc::unbounded_channel::<Control>();
+    drop(controls_tx);
     run_job_raw_with_joins(
         agents,
         fn_key,
@@ -640,6 +744,7 @@ where
         agent_latencies,
         options,
         joins_rx,
+        controls_rx,
         events,
     )
     .await
@@ -655,6 +760,9 @@ where
 /// # Errors
 /// Returns an error on a handshake or transport failure, or if every agent is
 /// lost with no node left able to join before the job completes.
+// The elastic core: the agents, payloads, options, the joins and controls
+// channels, and the sink are each a distinct input to one cohesive run loop.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn run_job_raw_with_joins<S>(
     agents: Vec<(String, Connection<S>)>,
     fn_key: &str,
@@ -662,6 +770,7 @@ pub(crate) async fn run_job_raw_with_joins<S>(
     agent_latencies: &[u64],
     options: RunOptions,
     mut joins: mpsc::UnboundedReceiver<Joiner<S>>,
+    mut controls: mpsc::UnboundedReceiver<Control>,
     events: &dyn EventSink,
 ) -> std::io::Result<Vec<Result<Vec<u8>, String>>>
 where
@@ -695,6 +804,8 @@ where
         capacity,
         standbys,
         alive: vec![true; agent_count],
+        paused: vec![false; agent_count],
+        draining: vec![false; agent_count],
         pending: (0..num_tasks).collect(),
         assigned: HashMap::new(),
         results: (0..num_tasks).map(|_| None).collect(),
@@ -715,6 +826,9 @@ where
     // a closed `joins` channel means no more nodes can join, which is how a run
     // with no rejoin driver (and the static [`run_job_raw`]) behaves.
     let mut joins_open = true;
+    // A closed controls channel returns `None` immediately, so guard the branch to
+    // keep `select!` from spinning on it once no controller can send.
+    let mut controls_open = true;
     loop {
         if job.remaining == 0 {
             break;
@@ -731,6 +845,10 @@ where
                     .expect("the loop holds an events sender, so the channel stays open");
                 job.on_event(event, events).await?;
             }
+            maybe_control = controls.recv(), if controls_open => match maybe_control {
+                Some(control) => job.control(control, events).await?,
+                None => controls_open = false,
+            },
             maybe_join = joins.recv(), if joins_open => match maybe_join {
                 // Splice a node that joined mid-run into the live schedule: append
                 // it to every per-agent vector (agents are only appended, never
@@ -744,6 +862,8 @@ where
                     // A late joiner activates all its own children, so none standby.
                     job.standbys.push(Vec::new());
                     job.alive.push(true);
+                    job.paused.push(false);
+                    job.draining.push(false);
                     job.in_flight.push(0);
                     job.readers
                         .push(spawn_reader(joiner.rx, agent, events_tx.clone()));
@@ -815,6 +935,7 @@ where
 mod tests {
     use super::run_job;
     use crate::agent::{fn_key, handler, serve, Registry};
+    use crate::control::{Control, ControlAction, KillMode};
     use crate::framing::Connection;
     use crate::observability::NoopSink;
     use crate::protocol::{FromAgent, ToAgent};
@@ -824,6 +945,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::io::{AsyncRead, AsyncWrite};
+    use tokio::sync::mpsc;
+
+    /// A closed control channel, for runs that take no control commands.
+    fn no_controls() -> mpsc::UnboundedReceiver<Control> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(tx);
+        rx
+    }
 
     /// Run a job over unlabeled connections, discarding events: most tests care
     /// only about results, not the observability stream.
@@ -1449,6 +1578,7 @@ mod tests {
                 speculative: true,
             },
             joins_rx,
+            no_controls(),
             &recorder,
         )
         .await
@@ -1494,6 +1624,7 @@ mod tests {
             &[],
             super::RunOptions::default(),
             joins_rx,
+            no_controls(),
             &recorder,
         );
         let driver = async {
@@ -1552,6 +1683,7 @@ mod tests {
             &[],
             super::RunOptions::default(),
             joins_rx,
+            no_controls(),
             &NoopSink,
         );
         let driver = async {
@@ -1666,6 +1798,7 @@ mod tests {
             &[],
             super::RunOptions::default(),
             joins_rx,
+            no_controls(),
             &NoopSink,
         );
         let driver = async {
@@ -1675,5 +1808,209 @@ mod tests {
         let (res, ()) = tokio::join!(run, driver);
         let err = res.unwrap_err();
         assert!(err.to_string().contains("no node could join"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn pause_gates_new_work_until_resume() {
+        use crate::observability::{NodeState, RunState};
+        use crate::testing::EventRecorder;
+
+        // One agent, several slow tasks. Pausing it stops new assignments, so the
+        // run cannot finish; resuming lets it drain to completion.
+        let (client, server) = connection_pair(256);
+        tokio::spawn(serve(
+            server,
+            Registry::new().with("slow", handler(slow_double)),
+        ));
+        let recorder = EventRecorder::default();
+        let agents = vec![("a".to_string(), client)];
+        let payloads = super::serialize_inputs(&(0..10u32).collect::<Vec<_>>()).unwrap();
+        let (joins_tx, joins_rx) = mpsc::unbounded_channel();
+        drop(joins_tx);
+        let (controls_tx, controls_rx) = mpsc::unbounded_channel::<Control>();
+        let run = super::run_job_raw_with_joins(
+            agents,
+            "slow",
+            payloads,
+            &[],
+            super::RunOptions::default(),
+            joins_rx,
+            controls_rx,
+            &recorder,
+        );
+        tokio::pin!(run);
+
+        // Pause the agent; an unknown target is a harmless no-op.
+        controls_tx
+            .send(Control::new("a".to_string(), ControlAction::Pause))
+            .unwrap();
+        controls_tx
+            .send(Control::new("ghost".to_string(), ControlAction::Pause))
+            .unwrap();
+
+        // While paused the run makes no further progress, so it does not finish.
+        let early = tokio::time::timeout(std::time::Duration::from_millis(80), &mut run).await;
+        assert!(early.is_err(), "a paused run must not complete");
+
+        // Resume and let it finish.
+        controls_tx
+            .send(Control::new("a".to_string(), ControlAction::Resume))
+            .unwrap();
+        drop(controls_tx);
+        let raw = run.await.unwrap();
+        assert_eq!(raw.len(), 10);
+
+        let mut state = RunState::default();
+        for event in &recorder.events() {
+            state.apply(event);
+        }
+        assert!(
+            recorder.states().contains(&NodeState::Paused),
+            "the node was reported Paused"
+        );
+        assert_eq!(state.nodes()["a"].state(), NodeState::Done);
+    }
+
+    #[tokio::test]
+    async fn kill_now_reroutes_work_to_a_survivor() {
+        use crate::observability::{NodeState, RunState};
+        use crate::testing::EventRecorder;
+
+        // Two agents; kill "a" immediately. Its work requeues onto "b", every task
+        // still completes once, and "a" is reported Lost.
+        let (a_client, a_server) = connection_pair(256);
+        let (b_client, b_server) = connection_pair(256);
+        tokio::spawn(serve(
+            a_server,
+            Registry::new().with("slow", handler(slow_double)),
+        ));
+        tokio::spawn(serve(
+            b_server,
+            Registry::new().with("slow", handler(slow_double)),
+        ));
+        let recorder = EventRecorder::default();
+        let agents = vec![("a".to_string(), a_client), ("b".to_string(), b_client)];
+        let payloads = super::serialize_inputs(&(0..20u32).collect::<Vec<_>>()).unwrap();
+        let (joins_tx, joins_rx) = mpsc::unbounded_channel();
+        drop(joins_tx);
+        let (controls_tx, controls_rx) = mpsc::unbounded_channel::<Control>();
+        let run = super::run_job_raw_with_joins(
+            agents,
+            "slow",
+            payloads,
+            &[],
+            super::RunOptions::default(),
+            joins_rx,
+            controls_rx,
+            &recorder,
+        );
+        let driver = async {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            controls_tx
+                .send(Control::new(
+                    "a".to_string(),
+                    ControlAction::Kill {
+                        mode: KillMode::Now,
+                    },
+                ))
+                .unwrap();
+            // A second command to the now-dead node is a harmless no-op.
+            controls_tx
+                .send(Control::new("a".to_string(), ControlAction::Resume))
+                .unwrap();
+            drop(controls_tx);
+        };
+        let (raw, ()) = tokio::join!(run, driver);
+        let outs: Vec<Result<u32, String>> = raw
+            .unwrap()
+            .into_iter()
+            .map(super::decode_output::<u32>)
+            .collect();
+        assert_eq!(outs, (0..20u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+
+        let mut state = RunState::default();
+        for event in &recorder.events() {
+            state.apply(event);
+        }
+        assert_eq!(state.nodes()["a"].state(), NodeState::Lost);
+    }
+
+    #[tokio::test]
+    async fn kill_after_current_drains_then_loses_the_node() {
+        use crate::observability::{NodeState, RunState};
+        use crate::testing::EventRecorder;
+
+        // Two agents; kill "a" after its current task. It finishes what it holds,
+        // is reported Draining then Lost, and "b" completes the rest.
+        let (a_client, a_server) = connection_pair(256);
+        let (b_client, b_server) = connection_pair(256);
+        tokio::spawn(serve(
+            a_server,
+            Registry::new().with("slow", handler(slow_double)),
+        ));
+        tokio::spawn(serve(
+            b_server,
+            Registry::new().with("slow", handler(slow_double)),
+        ));
+        let recorder = EventRecorder::default();
+        let agents = vec![("a".to_string(), a_client), ("b".to_string(), b_client)];
+        let payloads = super::serialize_inputs(&(0..20u32).collect::<Vec<_>>()).unwrap();
+        let (joins_tx, joins_rx) = mpsc::unbounded_channel();
+        drop(joins_tx);
+        let (controls_tx, controls_rx) = mpsc::unbounded_channel::<Control>();
+        let run = super::run_job_raw_with_joins(
+            agents,
+            "slow",
+            payloads,
+            &[],
+            super::RunOptions::default(),
+            joins_rx,
+            controls_rx,
+            &recorder,
+        );
+        let driver = async {
+            // Wait until "a" is actually running a task, so the after-current kill
+            // has something to drain (robust under slow, instrumented runs).
+            loop {
+                let mut state = RunState::default();
+                for event in &recorder.events() {
+                    state.apply(event);
+                }
+                if state
+                    .nodes()
+                    .get("a")
+                    .is_some_and(|view| view.state() == NodeState::Working)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            controls_tx
+                .send(Control::new(
+                    "a".to_string(),
+                    ControlAction::Kill {
+                        mode: KillMode::AfterCurrent,
+                    },
+                ))
+                .unwrap();
+            drop(controls_tx);
+        };
+        let (raw, ()) = tokio::join!(run, driver);
+        let outs: Vec<Result<u32, String>> = raw
+            .unwrap()
+            .into_iter()
+            .map(super::decode_output::<u32>)
+            .collect();
+        assert_eq!(outs, (0..20u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+
+        let states = recorder.states();
+        assert!(
+            states.contains(&NodeState::Draining),
+            "a drained before being killed: {states:?}"
+        );
+        assert!(
+            states.contains(&NodeState::Lost),
+            "a was lost after draining: {states:?}"
+        );
     }
 }
