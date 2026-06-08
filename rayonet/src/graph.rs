@@ -375,13 +375,19 @@ impl Topology {
             .symbols((0..order).enumerate())
             .build()
             .expect("a contiguous 0..order vocabulary is always valid");
-        // The undirected builder is upper triangular, so each edge is normalized
-        // to (min, max). A directed parent -> child edge can run either way once
-        // the vertices are numbered by id order.
+        // The undirected builder is upper triangular and wants its coordinates in
+        // sorted order, so each edge is normalized to (min, max) and the whole set
+        // re-sorted: flipping a directed parent -> child edge can move it earlier
+        // than an edge already emitted, which the builder rejects as unordered.
+        // Deduplicate too, since two directed edges can normalize to the same pair.
+        let mut undirected: Vec<(usize, usize)> =
+            edges.iter().map(|&(a, b)| (a.min(b), a.max(b))).collect();
+        undirected.sort_unstable();
+        undirected.dedup();
         let matrix: SymmetricCSR2D<CSR2D<usize, usize, usize>> = UndiEdgesBuilder::default()
-            .expected_number_of_edges(edges.len())
+            .expected_number_of_edges(undirected.len())
             .expected_shape(order)
-            .edges(edges.iter().map(|&(a, b)| (a.min(b), a.max(b))))
+            .edges(undirected.into_iter())
             .build()
             .expect("the edges are vertex-index pairs within the vertex count");
         UndiGraph::from((nodes, matrix))
@@ -519,6 +525,27 @@ mod tests {
 
     fn ids(items: &[&str]) -> BTreeSet<String> {
         items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn analysis_survives_edges_that_unsort_when_normalized() {
+        // Vertices are numbered by sorted id (ROOT=0, a=1, b=2, c=3, d=4, e=5). The
+        // edge e -> b is (5, 2), which flips to (2, 5) and so must sort before the
+        // already-emitted c -> d (3, 4). The undirected builder rejects an unsorted
+        // sequence, so this used to panic; the analysis must just run.
+        let state = discovered(&[
+            ("a", "a"),
+            ("c", "c"),
+            ("c/d", "d"),
+            ("e", "e"),
+            ("e/b", "b"),
+        ]);
+        let topo = Topology::from_run_state(&state);
+        // c and e each gate their lone child, so both are single points of failure;
+        // the top-level leaf a gates nothing.
+        assert_eq!(topo.single_points_of_failure(), ids(&["c", "e"]));
+        assert!(topo.is_acyclic());
+        assert!(!topo.is_redundant("d"));
     }
 
     #[test]

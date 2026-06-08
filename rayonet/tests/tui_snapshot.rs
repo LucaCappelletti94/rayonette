@@ -89,3 +89,25 @@ fn tui_matches_the_capstone_golden() {
         "the TUI render drifted from the golden; review the diff and, if intended, re-bless with RAYONET_TUI_BLESS=1"
     );
 }
+
+#[test]
+fn the_metropolis_trace_renders_without_panic() {
+    // The richer metropolis topology once crashed the graph layout (an edge that
+    // unsorts when normalized for the undirected projection). Replaying it must
+    // render at every step, so guard the whole trace, not just the final frame.
+    let trace = std::fs::read_to_string(fixture("metropolis.jsonl")).unwrap();
+    let events: Vec<RecordedEvent> = trace
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(!events.is_empty(), "the metropolis trace fixture is empty");
+
+    let mut app = App::new();
+    for record in &events {
+        app.apply(&record.event);
+        // Render after each event, the way the live replay does, so a graph that
+        // is briefly unanalysable mid-run still surfaces here.
+        let _ = render(&app);
+    }
+}
