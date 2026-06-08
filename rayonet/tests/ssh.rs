@@ -29,8 +29,11 @@ fn localhost() -> SshConfig {
 async fn ssh_remote_runs_a_command() {
     let remote = SshRemote::connect(&localhost()).await.unwrap();
     let out = remote.run("echo hello-rayonet").await.unwrap();
-    assert_eq!(out.status, 0);
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello-rayonet");
+    assert_eq!(out.status(), 0);
+    assert_eq!(
+        String::from_utf8_lossy(out.stdout()).trim(),
+        "hello-rayonet"
+    );
 }
 
 #[tokio::test]
@@ -40,7 +43,7 @@ async fn ssh_remote_uploads_and_rejects_bad_paths() {
     let dest = "/tmp/rayonet-ssh-upload-test.bin";
     remote.upload(b"payload-bytes", dest).await.unwrap();
     let out = remote.run(&format!("cat {dest}")).await.unwrap();
-    assert_eq!(out.stdout, b"payload-bytes");
+    assert_eq!(out.stdout(), b"payload-bytes");
     remote.run(&format!("rm -f {dest}")).await.unwrap();
 
     // A write into a non-existent directory fails, reported as an error.
@@ -65,8 +68,8 @@ async fn ssh_launch_runs_a_task_end_to_end() {
     // Probing the real localhost reports a usable profile (this host runs the
     // CI, so it is Linux with at least one core).
     let profile = ssh.probe(&session).await.unwrap();
-    assert_eq!(profile.os, Os::Linux);
-    assert!(profile.cores >= 1, "{profile:?}");
+    assert_eq!(profile.os(), &Os::Linux);
+    assert!(profile.cores() >= 1, "{profile:?}");
 
     // The real machine id is read over ssh and is stable (non-empty, repeatable).
     let id = ssh.node_id(&session).await;
@@ -91,7 +94,7 @@ async fn ssh_launch_runs_a_task_end_to_end() {
 #[ignore = "needs ssh localhost self-login; run with --include-ignored"]
 async fn ssh_remote_honors_an_explicit_port() {
     let remote = SshRemote::connect(&localhost().port(22)).await.unwrap();
-    assert_eq!(remote.run("true").await.unwrap().status, 0);
+    assert_eq!(remote.run("true").await.unwrap().status(), 0);
 }
 
 #[tokio::test]

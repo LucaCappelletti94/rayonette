@@ -43,7 +43,7 @@ pub async fn run_agent(registry: crate::agent::Registry) -> std::io::Result<()> 
 /// A spawned agent subprocess: its handle and captured stderr.
 pub struct AgentProcess {
     /// The child process handle.
-    pub child: Child,
+    child: Child,
     stderr: Arc<Mutex<Vec<u8>>>,
     task: JoinHandle<()>,
 }
@@ -64,6 +64,14 @@ impl AgentProcess {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         String::from_utf8_lossy(&captured).into_owned()
+    }
+
+    /// Kill the agent process, used to simulate a crashed agent.
+    ///
+    /// # Errors
+    /// Returns an error if the kill signal cannot be delivered.
+    pub async fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill().await
     }
 
     /// Wait for the agent to exit, returning its status and full stderr.

@@ -18,14 +18,47 @@ pub type TaskId = u64;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildAd {
     /// The child's local label under this relay (its path segment).
-    pub label: String,
+    label: String,
     /// The child's stable physical node id (shared across redundant paths).
-    pub id: String,
+    id: String,
     /// How many tasks the child can hold in flight (its own advertised slots).
-    pub slots: usize,
+    slots: usize,
     /// Measured latency (microseconds) of the relay's link to this child, the
     /// weight used to pick the primary among redundant paths.
-    pub latency_us: u64,
+    latency_us: u64,
+}
+
+impl ChildAd {
+    /// Advertise a built child: its local `label` under the relay, its stable
+    /// physical node `id`, its advertised `slots`, and the relay's measured link
+    /// `latency_us` to it.
+    #[must_use]
+    pub const fn new(label: String, id: String, slots: usize, latency_us: u64) -> Self {
+        Self {
+            label,
+            id,
+            slots,
+            latency_us,
+        }
+    }
+
+    /// The child's local label under its relay (its path segment).
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// The child's stable physical node id, shared across redundant paths.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Measured latency (microseconds) of the relay's link to this child.
+    #[must_use]
+    pub const fn latency_us(&self) -> u64 {
+        self.latency_us
+    }
 }
 
 /// Coordinator to agent.

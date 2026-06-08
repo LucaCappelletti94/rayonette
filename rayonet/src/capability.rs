@@ -54,13 +54,38 @@ pub enum GpuVendor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gpu {
     /// The hardware vendor.
-    pub vendor: GpuVendor,
+    vendor: GpuVendor,
     /// The runtime it exposes, if known.
-    pub runtime: Option<GpuRuntime>,
+    runtime: Option<GpuRuntime>,
     /// The marketing/model name, verbatim.
-    pub model: String,
+    model: String,
     /// Total video memory in MB, if known.
-    pub vram_mb: Option<u64>,
+    vram_mb: Option<u64>,
+}
+
+impl Gpu {
+    /// Describe one GPU: its `vendor`, the `runtime` it exposes (if known), its
+    /// `model` name, and its `vram_mb` (if known).
+    #[must_use]
+    pub const fn new(
+        vendor: GpuVendor,
+        runtime: Option<GpuRuntime>,
+        model: String,
+        vram_mb: Option<u64>,
+    ) -> Self {
+        Self {
+            vendor,
+            runtime,
+            model,
+            vram_mb,
+        }
+    }
+
+    /// The runtime this GPU exposes, if known.
+    #[must_use]
+    pub const fn runtime(&self) -> Option<&GpuRuntime> {
+        self.runtime.as_ref()
+    }
 }
 
 /// A node's CPU architecture: the instruction set plus the enabled feature flags.
@@ -72,12 +97,19 @@ pub struct Gpu {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CpuArch {
     /// The instruction set from `uname -m`, for example `x86_64` or `aarch64`.
-    pub isa: String,
+    isa: String,
     /// The CPU instruction-set feature flags, sorted and deduplicated.
-    pub features: Vec<String>,
+    features: Vec<String>,
 }
 
 impl CpuArch {
+    /// A CPU architecture: its `isa` (instruction set) and `features` (the
+    /// instruction-set extension flags).
+    #[must_use]
+    pub const fn new(isa: String, features: Vec<String>) -> Self {
+        Self { isa, features }
+    }
+
     /// An unknown architecture, for a host that has not been probed.
     #[must_use]
     pub fn unknown() -> Self {
@@ -86,6 +118,18 @@ impl CpuArch {
             features: Vec::new(),
         }
     }
+
+    /// The instruction set, for example `x86_64` or `aarch64`.
+    #[must_use]
+    pub fn isa(&self) -> &str {
+        &self.isa
+    }
+
+    /// The CPU instruction-set feature flags, sorted and deduplicated.
+    #[must_use]
+    pub fn features(&self) -> &[String] {
+        &self.features
+    }
 }
 
 /// A node's probed capabilities. Extensible: new capabilities are new fields,
@@ -93,24 +137,87 @@ impl CpuArch {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeProfile {
     /// The operating system.
-    pub os: Os,
+    os: Os,
+    /// The host's own name (`uname -n`), the human-friendly handle for the machine,
+    /// distinct from its ssh-dest label and its stable machine id. Empty if unknown.
+    /// Defaulted on decode so traces recorded before this field still load.
+    #[serde(default)]
+    hostname: String,
     /// The CPU architecture (instruction set and feature flags).
-    pub arch: CpuArch,
+    arch: CpuArch,
     /// Logical CPU count (0 if it could not be determined).
-    pub cores: u32,
+    cores: u32,
     /// Total RAM in MB (0 if it could not be determined).
-    pub ram_mb: u64,
+    ram_mb: u64,
     /// The GPUs found, empty if none or none could be parsed.
-    pub gpus: Vec<Gpu>,
+    gpus: Vec<Gpu>,
 }
 
 impl NodeProfile {
+    /// Assemble a probed profile from its `os`, `hostname`, CPU `arch`, logical
+    /// `cores`, `ram_mb`, and discovered `gpus`.
+    #[must_use]
+    pub const fn new(
+        os: Os,
+        hostname: String,
+        arch: CpuArch,
+        cores: u32,
+        ram_mb: u64,
+        gpus: Vec<Gpu>,
+    ) -> Self {
+        Self {
+            os,
+            hostname,
+            arch,
+            cores,
+            ram_mb,
+            gpus,
+        }
+    }
+
+    /// The operating system.
+    #[must_use]
+    pub const fn os(&self) -> &Os {
+        &self.os
+    }
+
+    /// The host's own name (`uname -n`), empty when unknown.
+    #[must_use]
+    pub fn hostname(&self) -> &str {
+        &self.hostname
+    }
+
+    /// The CPU architecture (instruction set and feature flags).
+    #[must_use]
+    pub const fn arch(&self) -> &CpuArch {
+        &self.arch
+    }
+
+    /// Logical CPU count (0 if it could not be determined).
+    #[must_use]
+    pub const fn cores(&self) -> u32 {
+        self.cores
+    }
+
+    /// Total RAM in MB (0 if it could not be determined).
+    #[must_use]
+    pub const fn ram_mb(&self) -> u64 {
+        self.ram_mb
+    }
+
+    /// The GPUs found, empty if none or none could be parsed.
+    #[must_use]
+    pub fn gpus(&self) -> &[Gpu] {
+        &self.gpus
+    }
+
     /// A placeholder profile for a launcher with no real host to probe (a local
     /// subprocess or an in-process test agent): no known capabilities.
     #[must_use]
     pub fn unknown() -> Self {
         Self {
             os: Os::Other("unknown".to_string()),
+            hostname: String::new(),
             arch: CpuArch::unknown(),
             cores: 0,
             ram_mb: 0,
@@ -508,6 +615,7 @@ pub mod pred {
         fn rocm_box() -> NodeProfile {
             NodeProfile {
                 os: Os::Linux,
+                hostname: String::new(),
                 arch: crate::capability::CpuArch::unknown(),
                 cores: 64,
                 ram_mb: 131_072,
@@ -523,6 +631,7 @@ pub mod pred {
         fn mac() -> NodeProfile {
             NodeProfile {
                 os: Os::MacOs,
+                hostname: String::new(),
                 arch: crate::capability::CpuArch::unknown(),
                 cores: 8,
                 ram_mb: 16_384,
@@ -705,6 +814,7 @@ Agent 3
 
         let mac = NodeProfile {
             os: Os::MacOs,
+            hostname: String::new(),
             arch: crate::capability::CpuArch::unknown(),
             cores: 8,
             ram_mb: 16_384,
@@ -714,6 +824,7 @@ Agent 3
 
         let rocm_box = NodeProfile {
             os: Os::Linux,
+            hostname: String::new(),
             arch: crate::capability::CpuArch::unknown(),
             cores: 64,
             ram_mb: 131_072,
@@ -728,6 +839,7 @@ Agent 3
 
         let plain = NodeProfile {
             os: Os::Linux,
+            hostname: String::new(),
             arch: crate::capability::CpuArch::unknown(),
             cores: 4,
             ram_mb: 8_000,
@@ -745,6 +857,7 @@ Agent 3
         let filter = Filter::new().exclude(cuda()).otherwise(Role::Compute);
         let cuda_box = NodeProfile {
             os: Os::Linux,
+            hostname: String::new(),
             arch: crate::capability::CpuArch::unknown(),
             cores: 32,
             ram_mb: 65_536,
@@ -759,6 +872,7 @@ Agent 3
 
         let cpu_only = NodeProfile {
             os: Os::Linux,
+            hostname: String::new(),
             arch: crate::capability::CpuArch::unknown(),
             cores: 32,
             ram_mb: 65_536,
@@ -775,6 +889,7 @@ Agent 3
         use super::{Gpu, GpuRuntime, GpuVendor, NodeProfile, Os};
         let rocm = NodeProfile {
             os: Os::Linux,
+            hostname: String::new(),
             arch: crate::capability::CpuArch::unknown(),
             cores: 64,
             ram_mb: 131_072,
@@ -792,6 +907,7 @@ Agent 3
 
         let bare = NodeProfile {
             os: Os::MacOs,
+            hostname: String::new(),
             arch: crate::capability::CpuArch::unknown(),
             cores: 8,
             ram_mb: 16_384,

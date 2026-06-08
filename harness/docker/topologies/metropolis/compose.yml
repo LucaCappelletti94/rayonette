@@ -31,28 +31,38 @@ x-agent: &agent
     - ../../secrets:/secrets:ro
     - rayonet-topo-cache:/home/rayonet/.cache
 
+# Each container is given a friendly hostname (uname -n) distinct from its ssh
+# label, so the dashboard can show the machine's own name (e.g. "relay-east")
+# alongside its wiring (the gw1/... path). Without this, docker hands out a random
+# container id and the graph would just echo the ssh labels.
 services:
   gw1:
     <<: *agent
+    hostname: relay-east
     networks: [net1]
     ports:
       - "2250:22"
   gw2:
     <<: *agent
+    hostname: relay-west
     networks: [net2]
     ports:
       - "2251:22"
   gw3:
     <<: *agent
+    hostname: gpu-spot
     networks: [net3]
     ports:
       - "2252:22"
   shared:
     <<: *agent
+    hostname: cache-store
     networks: [net1, net2]
   leafA:
     <<: *agent
+    hostname: worker-east
     networks: [net1]
   leafB:
     <<: *agent
+    hostname: worker-west
     networks: [net2]

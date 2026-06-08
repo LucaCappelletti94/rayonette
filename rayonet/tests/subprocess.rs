@@ -46,7 +46,7 @@ async fn agent_stderr_is_captured_including_panics() {
 #[tokio::test]
 async fn a_killed_agent_is_observed_as_a_failure() {
     let (connection, mut agent) = process::spawn(agent_command()).expect("spawn agent");
-    agent.child.kill().await.expect("kill agent");
+    agent.kill().await.expect("kill agent");
 
     let res = run_job::<_, u32, u32>(solo(connection), "double", vec![1, 2, 3], &NoopSink).await;
     assert!(res.is_err());

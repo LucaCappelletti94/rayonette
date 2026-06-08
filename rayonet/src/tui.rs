@@ -17,6 +17,7 @@ use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
 use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table};
 use ratatui::Frame;
 
+use crate::capability::NodeProfile;
 use crate::graph::{Metric, Topology};
 use crate::layout::positions;
 use crate::observability::{leaf_of, parent_of, Event, NodeState, NodeTelemetry, RunState};
@@ -504,12 +505,16 @@ fn node_detail_lines(state: &RunState, id: &str) -> Vec<Line<'static>> {
         Line::from(format!("via   {}", mine.join("  "))),
         Line::from(format!("ip    {ips}")),
         Line::from(format!("done  {completed}  lat {latency:.1} ms")),
-        Line::from(format!("os    {:?}  arch {}", profile.os, profile.arch.isa)),
+        Line::from(format!(
+            "os    {:?}  arch {}",
+            profile.os(),
+            profile.arch().isa()
+        )),
         Line::from(format!(
             "cores {}  ram {} MB  gpus {}",
-            profile.cores,
-            profile.ram_mb,
-            profile.gpus.len(),
+            profile.cores(),
+            profile.ram_mb(),
+            profile.gpus().len(),
         )),
     ];
     lines.extend(telemetry_lines(view.telemetry.as_ref()));
@@ -746,13 +751,26 @@ fn graph_geometry(inner: Rect, app: &App) -> GraphGeometry {
     GraphGeometry { nodes, edges }
 }
 
-/// Each physical node id's display label: the local name of any path that reaches
-/// it (all paths to one node share that last segment).
+/// Each physical node id's display label: the machine's own hostname when it has
+/// reported one (more recognisable than the wiring), otherwise the local name of
+/// any path that reaches it (all paths to one node share that last segment). The
+/// ssh path itself stays visible in the detail panel's `via` line either way.
 fn vertex_labels(state: &RunState) -> BTreeMap<String, String> {
     state
         .paths_by_id()
         .into_iter()
-        .filter_map(|(id, paths)| paths.first().map(|path| (id, leaf_of(path).to_string())))
+        .filter_map(|(id, paths)| {
+            let path = *paths.first()?;
+            let label = state
+                .nodes
+                .get(path)
+                .and_then(|view| view.profile.as_ref())
+                .map(NodeProfile::hostname)
+                .filter(|hostname| !hostname.is_empty())
+                .unwrap_or_else(|| leaf_of(path))
+                .to_string();
+            Some((id, label))
+        })
         .collect()
 }
 
@@ -898,7 +916,7 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let arch = view
             .profile
             .as_ref()
-            .map_or_else(String::new, |profile| profile.arch.isa.clone());
+            .map_or_else(String::new, |profile| profile.arch().isa().to_string());
         let flag = if view.id.as_deref().is_some_and(|id| spofs.contains(id)) {
             "SPOF"
         } else {
@@ -999,16 +1017,19 @@ mod tests {
 
     /// A simple Linux profile with the given instruction set, for table tests.
     fn profile(isa: &str) -> NodeProfile {
-        NodeProfile {
-            os: Os::Linux,
-            arch: CpuArch {
-                isa: isa.to_string(),
-                features: Vec::new(),
-            },
-            cores: 8,
-            ram_mb: 16_000,
-            gpus: Vec::new(),
-        }
+        profile_named(isa, "")
+    }
+
+    /// Like [`profile`], but with a reported hostname, for label tests.
+    fn profile_named(isa: &str, hostname: &str) -> NodeProfile {
+        NodeProfile::new(
+            Os::Linux,
+            hostname.to_string(),
+            CpuArch::new(isa.to_string(), Vec::new()),
+            8,
+            16_000,
+            Vec::new(),
+        )
     }
 
     /// Each buffer row as a trailing-space-trimmed string.
@@ -1075,6 +1096,31 @@ mod tests {
             app.apply(&Event::node(host, NodeState::Working));
         }
         app
+    }
+
+    #[test]
+    fn graph_label_prefers_the_hostname_when_reported() {
+        // A node that reported its own hostname is labelled by it (recognisable);
+        // one that has not falls back to the ssh path's local segment.
+        let mut app = App::new();
+        let named = profile_named("x86_64", "host-alpha");
+        app.apply(&Event::profiled(
+            "gatewayA",
+            "idA",
+            named,
+            Role::Compute,
+            1_000,
+        ));
+        app.apply(&Event::profiled(
+            "gatewayB",
+            "idB",
+            profile("x86_64"),
+            Role::Compute,
+            1_000,
+        ));
+        let labels = super::vertex_labels(&app.state);
+        assert_eq!(labels.get("idA").map(String::as_str), Some("host-alpha"));
+        assert_eq!(labels.get("idB").map(String::as_str), Some("gatewayB"));
     }
 
     #[test]

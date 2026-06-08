@@ -109,12 +109,12 @@ async fn main() {
         // without one it serves as a leaf. This is what lets the harness build
         // real relay trees, not just a flat star. agent_main serves, then exits
         // the process (an agent must not linger on its parent's stdin).
-        rayonet::node::agent_main(rayonet::node::NodeConfig {
-            registry: __rayonet_registry(),
-            source: __rayonet_source(),
-            binary_name: "rayonet-docker-consumer".to_string(),
-            toolchain: std::env::var("RAYONET_TOOLCHAIN").unwrap_or_else(|_| "stable".to_string()),
-        })
+        rayonet::node::agent_main(rayonet::node::NodeConfig::new(
+            __rayonet_registry(),
+            __rayonet_source(),
+            "rayonet-docker-consumer".to_string(),
+            std::env::var("RAYONET_TOOLCHAIN").unwrap_or_else(|_| "stable".to_string()),
+        ))
         .await;
     }
 

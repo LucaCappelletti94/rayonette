@@ -1291,20 +1291,22 @@ mod tests {
         use crate::testing::EventRecorder;
         use std::sync::Arc;
 
-        let linux = NodeProfile {
-            os: Os::Linux,
-            arch: crate::capability::CpuArch::unknown(),
-            cores: 8,
-            ram_mb: 16_000,
-            gpus: Vec::new(),
-        };
-        let mac = NodeProfile {
-            os: Os::MacOs,
-            arch: crate::capability::CpuArch::unknown(),
-            cores: 8,
-            ram_mb: 16_000,
-            gpus: Vec::new(),
-        };
+        let linux = NodeProfile::new(
+            Os::Linux,
+            String::new(),
+            crate::capability::CpuArch::unknown(),
+            8,
+            16_000,
+            Vec::new(),
+        );
+        let mac = NodeProfile::new(
+            Os::MacOs,
+            String::new(),
+            crate::capability::CpuArch::unknown(),
+            8,
+            16_000,
+            Vec::new(),
+        );
 
         // A filter that keeps Linux as Compute and excludes everything else, so
         // the macOS host is dropped before it is ever activated.
@@ -1349,25 +1351,27 @@ mod tests {
         use crate::testing::EventRecorder;
         use std::sync::Arc;
 
-        let rocm_box = NodeProfile {
-            os: Os::Linux,
-            arch: crate::capability::CpuArch::unknown(),
-            cores: 32,
-            ram_mb: 128_000,
-            gpus: vec![Gpu {
-                vendor: GpuVendor::Amd,
-                runtime: Some(GpuRuntime::Rocm),
-                model: "Instinct".to_string(),
-                vram_mb: Some(65_536),
-            }],
-        };
-        let cpu_box = NodeProfile {
-            os: Os::Linux,
-            arch: crate::capability::CpuArch::unknown(),
-            cores: 8,
-            ram_mb: 16_000,
-            gpus: Vec::new(),
-        };
+        let rocm_box = NodeProfile::new(
+            Os::Linux,
+            String::new(),
+            crate::capability::CpuArch::unknown(),
+            32,
+            128_000,
+            vec![Gpu::new(
+                GpuVendor::Amd,
+                Some(GpuRuntime::Rocm),
+                "Instinct".to_string(),
+                Some(65_536),
+            )],
+        );
+        let cpu_box = NodeProfile::new(
+            Os::Linux,
+            String::new(),
+            crate::capability::CpuArch::unknown(),
+            8,
+            16_000,
+            Vec::new(),
+        );
 
         let sink = Arc::new(EventRecorder::default());
         let launchers = vec![
@@ -1545,14 +1549,22 @@ mod tests {
         use crate::capability::{pred, Filter, NodeProfile, Os};
         use tokio::sync::mpsc;
 
-        let linux = NodeProfile {
-            os: Os::Linux,
-            ..NodeProfile::unknown()
-        };
-        let mac = NodeProfile {
-            os: Os::MacOs,
-            ..NodeProfile::unknown()
-        };
+        let linux = NodeProfile::new(
+            Os::Linux,
+            String::new(),
+            crate::capability::CpuArch::unknown(),
+            0,
+            0,
+            Vec::new(),
+        );
+        let mac = NodeProfile::new(
+            Os::MacOs,
+            String::new(),
+            crate::capability::CpuArch::unknown(),
+            0,
+            0,
+            Vec::new(),
+        );
         // Three candidates, each exercising one non-join outcome: one that cannot
         // be probed (retry then give up), one the filter excludes (give up at
         // once), and one that probes fine but cannot be provisioned (retry then

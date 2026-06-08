@@ -54,10 +54,10 @@ impl EventSink for Progress {
                 "  {}{}: {role:?} ({:?}, {} cores, {} MB RAM, {} GPUs)",
                 "  ".repeat(depth(&host)),
                 leaf_of(&host),
-                profile.os,
-                profile.cores,
-                profile.ram_mb,
-                profile.gpus.len()
+                profile.os(),
+                profile.cores(),
+                profile.ram_mb(),
+                profile.gpus().len()
             ),
             _ => {}
         }
@@ -81,12 +81,12 @@ async fn main() {
     if process::is_agent() {
         // As an agent: a leaf, or a relay if this host has a children file. A
         // relay re-ships this same source bundle down to its own children.
-        let config = NodeConfig {
-            registry: __rayonet_registry(),
-            source: __rayonet_source(),
-            binary_name: "ssh-run".to_string(),
-            toolchain: "stable".to_string(),
-        };
+        let config = NodeConfig::new(
+            __rayonet_registry(),
+            __rayonet_source(),
+            "ssh-run".to_string(),
+            "stable".to_string(),
+        );
         run_node(config).await.expect("agent failed");
         return;
     }

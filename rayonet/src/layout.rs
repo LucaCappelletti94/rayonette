@@ -128,13 +128,14 @@ mod tests {
     use crate::observability::{Event, RunState};
 
     fn profile() -> NodeProfile {
-        NodeProfile {
-            os: Os::Linux,
-            arch: crate::capability::CpuArch::unknown(),
-            cores: 4,
-            ram_mb: 8_000,
-            gpus: Vec::new(),
-        }
+        NodeProfile::new(
+            Os::Linux,
+            String::new(),
+            crate::capability::CpuArch::unknown(),
+            4,
+            8_000,
+            Vec::new(),
+        )
     }
 
     /// A topology from a chain of profiled nodes: each `path` is one physical id

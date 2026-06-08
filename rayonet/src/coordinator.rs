@@ -82,9 +82,10 @@ fn active_labels(
             .iter()
             .map(|report| match report {
                 FirstReport::Leaf(_) => Vec::new(),
-                FirstReport::Relay(children) => {
-                    children.iter().map(|child| child.label.clone()).collect()
-                }
+                FirstReport::Relay(children) => children
+                    .iter()
+                    .map(|child| child.label().to_string())
+                    .collect(),
             })
             .collect(),
         ActivationPolicy::DedupById => dedup_active(reports, labels, latencies),
@@ -117,11 +118,11 @@ fn relay_reports(
     for (agent, report) in reports.iter().enumerate() {
         if let FirstReport::Relay(children) = report {
             relay_agents.push(agent);
-            relays.push(crate::graph::RelayReport {
-                label: labels[agent].clone(),
-                latency_us: latencies.get(agent).copied().unwrap_or(0),
-                children: children.clone(),
-            });
+            relays.push(crate::graph::RelayReport::new(
+                labels[agent].clone(),
+                latencies.get(agent).copied().unwrap_or(0),
+                children.clone(),
+            ));
         }
     }
     (relay_agents, relays)
@@ -189,7 +190,10 @@ where
     let capacity = match rx.recv::<FromAgent>().await? {
         Some(FromAgent::Ready { slots }) => slots,
         Some(FromAgent::Discovered { children }) => {
-            let active = children.iter().map(|child| child.label.clone()).collect();
+            let active = children
+                .iter()
+                .map(|child| child.label().to_string())
+                .collect();
             tx.send(&ToAgent::Activate { active }).await?;
             match rx.recv::<FromAgent>().await? {
                 Some(FromAgent::Ready { slots }) => slots,
@@ -277,7 +281,7 @@ where
                 };
                 let standby = children
                     .into_iter()
-                    .filter(|child| !active.contains(&child.label))
+                    .filter(|child| !active.iter().any(|l| l == child.label()))
                     .collect();
                 (slots, standby)
             }
@@ -453,7 +457,9 @@ where
             }
             for child in std::mem::take(&mut self.standbys[agent]) {
                 self.senders[agent]
-                    .send(&ToAgent::Promote { child: child.label })
+                    .send(&ToAgent::Promote {
+                        child: child.label().to_string(),
+                    })
                     .await?;
             }
         }
@@ -1553,12 +1559,7 @@ mod tests {
                 let (mut tx, mut rx) = relay_server.split();
                 let _hello = rx.recv::<ToAgent>().await;
                 tx.send(&FromAgent::Discovered {
-                    children: vec![ChildAd {
-                        label: "child".to_string(),
-                        id: "child".to_string(),
-                        slots: 1,
-                        latency_us: 0,
-                    }],
+                    children: vec![ChildAd::new("child".to_string(), "child".to_string(), 1, 0)],
                 })
                 .await
                 .unwrap();
@@ -1620,12 +1621,7 @@ mod tests {
             let (mut tx, mut rx) = server.split();
             let _hello = rx.recv::<ToAgent>().await;
             tx.send(&FromAgent::Discovered {
-                children: vec![ChildAd {
-                    label: "c".to_string(),
-                    id: "c".to_string(),
-                    slots: 1,
-                    latency_us: 0,
-                }],
+                children: vec![ChildAd::new("c".to_string(), "c".to_string(), 1, 0)],
             })
             .await
             .unwrap();

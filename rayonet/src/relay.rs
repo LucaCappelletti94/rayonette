@@ -347,11 +347,13 @@ where
     P: AsyncRead + AsyncWrite + Unpin,
 {
     let children: Vec<ChildAd> = (0..labels.len())
-        .map(|child| ChildAd {
-            label: labels[child].clone(),
-            id: ids[child].clone(),
-            slots: capacity[child],
-            latency_us: latencies.get(child).copied().unwrap_or(0),
+        .map(|child| {
+            ChildAd::new(
+                labels[child].clone(),
+                ids[child].clone(),
+                capacity[child],
+                latencies.get(child).copied().unwrap_or(0),
+            )
         })
         .collect();
     parent_tx.send(&FromAgent::Discovered { children }).await?;
@@ -1378,7 +1380,10 @@ mod tests {
                 panic!("expected Discovered, got {discovered:?}");
             };
             tx.send(&ToAgent::Activate {
-                active: children.into_iter().map(|child| child.label).collect(),
+                active: children
+                    .into_iter()
+                    .map(|child| child.label().to_string())
+                    .collect(),
             })
             .await
             .unwrap();
@@ -1436,7 +1441,10 @@ mod tests {
             // child's bogus second Ready, then drain until it errors and closes.
             if let Ok(Some(FromAgent::Discovered { children })) = rx.recv::<FromAgent>().await {
                 tx.send(&ToAgent::Activate {
-                    active: children.into_iter().map(|child| child.label).collect(),
+                    active: children
+                        .into_iter()
+                        .map(|child| child.label().to_string())
+                        .collect(),
                 })
                 .await
                 .unwrap();

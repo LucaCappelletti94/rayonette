@@ -16,11 +16,42 @@ use crate::observability::{Event, EventSink, NodeState};
 #[derive(Debug, Clone)]
 pub struct CommandOutput {
     /// Process exit code (or a negative value if it was killed by a signal).
-    pub status: i32,
+    status: i32,
     /// Captured standard output.
-    pub stdout: Vec<u8>,
+    stdout: Vec<u8>,
     /// Captured standard error.
-    pub stderr: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl CommandOutput {
+    /// Capture a finished command's `status` code and its `stdout`/`stderr`
+    /// bytes. A [`Remote`] implementation builds this from its transport.
+    #[must_use]
+    pub const fn new(status: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
+        Self {
+            status,
+            stdout,
+            stderr,
+        }
+    }
+
+    /// Process exit code (or a negative value if it was killed by a signal).
+    #[must_use]
+    pub const fn status(&self) -> i32 {
+        self.status
+    }
+
+    /// Captured standard output.
+    #[must_use]
+    pub fn stdout(&self) -> &[u8] {
+        &self.stdout
+    }
+
+    /// Captured standard error.
+    #[must_use]
+    pub fn stderr(&self) -> &[u8] {
+        &self.stderr
+    }
 }
 
 /// A host the provisioner can run commands on and upload files to.
@@ -47,7 +78,15 @@ pub trait Remote {
 #[derive(Debug, Clone)]
 pub struct Provisioned {
     /// Absolute (shell-expanded) path to the built agent binary on the remote.
-    pub binary_path: String,
+    binary_path: String,
+}
+
+impl Provisioned {
+    /// Absolute (shell-expanded) path to the built agent binary on the remote.
+    #[must_use]
+    pub fn binary_path(&self) -> &str {
+        &self.binary_path
+    }
 }
 
 /// A non-cryptographic hash is not enough for a content cache; use blake3.
@@ -84,7 +123,7 @@ fn remote_binary_path(source_tar: &[u8], variant: &str, binary_name: &str) -> St
 /// a native build (whose code depends on the exact microarchitecture) is keyed to
 /// the CPU it was built for.
 fn build_variant(arch: &CpuArch, target_cpu: &str) -> String {
-    let signature = format!("{} {} {target_cpu}", arch.isa, arch.features.join(" "));
+    let signature = format!("{} {} {target_cpu}", arch.isa(), arch.features().join(" "));
     content_hash(signature.as_bytes())[..16].to_string()
 }
 
@@ -123,13 +162,13 @@ pub async fn remote_agent_path<R: Remote>(
 
 /// Turn a non-zero exit into a host-named error so the caller can requeue.
 fn require_success(host: &str, step: &str, out: &CommandOutput) -> io::Result<()> {
-    if out.status == 0 {
+    if out.status() == 0 {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = String::from_utf8_lossy(out.stderr());
     Err(io::Error::other(format!(
         "rayonet: {host}: {step} failed (exit {}): {}",
-        out.status,
+        out.status(),
         stderr.trim()
     )))
 }
@@ -162,14 +201,19 @@ pub async fn provision<R: Remote>(
     let binary_path = remote_binary_path(source_tar, &variant, binary_name);
 
     // Cache hit: a prior run already built this exact source for this CPU here.
-    if remote.run(&format!("test -x {binary_path}")).await?.status == 0 {
+    if remote
+        .run(&format!("test -x {binary_path}"))
+        .await?
+        .status()
+        == 0
+    {
         events.emit(Event::node(host, NodeState::Ready));
         return Ok(Provisioned { binary_path });
     }
 
     // Install rust user-locally only when it is missing.
     let cargo = "command -v cargo >/dev/null 2>&1 || test -x \"$HOME/.cargo/bin/cargo\"";
-    if remote.run(cargo).await?.status != 0 {
+    if remote.run(cargo).await?.status() != 0 {
         events.emit(Event::node(host, NodeState::Installing));
         // Download then run as separate `&&`-chained commands: piping curl into
         // sh would mask a curl failure (the pipe's status is sh's), so a host
@@ -220,6 +264,9 @@ pub async fn provision<R: Remote>(
 /// Returns an error if the `uname -s` probe cannot run.
 pub async fn probe<R: Remote>(remote: &R) -> io::Result<NodeProfile> {
     let os = capability::parse_os(&run_stdout(remote, "uname -s").await?);
+    // The host's own name, a human-friendly handle distinct from its ssh label.
+    // Best-effort: a missing value just leaves it empty.
+    let hostname = run_or_empty(remote, "uname -n").await.trim().to_string();
     let (cores, ram_mb, gpus) = if os == Os::MacOs {
         (
             capability::parse_cores(&run_or_empty(remote, "sysctl -n hw.ncpu").await),
@@ -245,13 +292,7 @@ pub async fn probe<R: Remote>(remote: &R) -> io::Result<NodeProfile> {
         (cores, ram_mb, gpus)
     };
     let arch = cpu_arch(remote, &os).await;
-    Ok(NodeProfile {
-        os,
-        arch,
-        cores,
-        ram_mb,
-        gpus,
-    })
+    Ok(NodeProfile::new(os, hostname, arch, cores, ram_mb, gpus))
 }
 
 /// Probe a host's CPU architecture over `remote`.
@@ -308,14 +349,14 @@ pub async fn node_id<R: Remote>(remote: &R) -> String {
 /// stdout); a transport failure propagates.
 async fn run_stdout<R: Remote>(remote: &R, command: &str) -> io::Result<String> {
     let out = remote.run(command).await?;
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(String::from_utf8_lossy(out.stdout()).into_owned())
 }
 
 /// Run `command`, returning its stdout only if it succeeded; an error or a
 /// non-zero exit (a missing tool like `nvidia-smi`) yields an empty string.
 async fn run_or_empty<R: Remote>(remote: &R, command: &str) -> String {
     match remote.run(command).await {
-        Ok(out) if out.status == 0 => String::from_utf8_lossy(&out.stdout).into_owned(),
+        Ok(out) if out.status() == 0 => String::from_utf8_lossy(out.stdout()).into_owned(),
         _ => String::new(),
     }
 }
@@ -455,18 +496,18 @@ mod tests {
     #[test]
     fn build_variant_separates_architectures_and_target_cpus() {
         use super::{build_variant, CpuArch};
-        let avx2 = CpuArch {
-            isa: "x86_64".to_string(),
-            features: vec!["avx2".to_string(), "sse2".to_string()],
-        };
-        let avx512 = CpuArch {
-            isa: "x86_64".to_string(),
-            features: vec![
+        let avx2 = CpuArch::new(
+            "x86_64".to_string(),
+            vec!["avx2".to_string(), "sse2".to_string()],
+        );
+        let avx512 = CpuArch::new(
+            "x86_64".to_string(),
+            vec![
                 "avx2".to_string(),
                 "avx512f".to_string(),
                 "sse2".to_string(),
             ],
-        };
+        );
         // A native binary's cache key changes with the microarchitecture, so it is
         // never reused on a CPU missing a feature (which would fault), even when
         // the source is identical.
@@ -557,7 +598,7 @@ mod tests {
             stderr: Vec::new(),
         };
         let output_copy = output.clone();
-        assert_eq!(output.status, output_copy.status);
+        assert_eq!(output.status(), output_copy.status());
         assert!(format!("{output:?}").contains("status"));
     }
 
@@ -624,11 +665,11 @@ mod tests {
             ],
         };
         let p = super::probe(&host).await.unwrap();
-        assert_eq!(p.os, Os::Linux);
-        assert_eq!(p.cores, 64);
-        assert_eq!(p.ram_mb, 131_923_148 / 1024);
-        assert_eq!(p.gpus.len(), 1);
-        assert_eq!(p.gpus[0].runtime, Some(GpuRuntime::Cuda));
+        assert_eq!(p.os(), &Os::Linux);
+        assert_eq!(p.cores(), 64);
+        assert_eq!(p.ram_mb(), 131_923_148 / 1024);
+        assert_eq!(p.gpus().len(), 1);
+        assert_eq!(p.gpus()[0].runtime(), Some(&GpuRuntime::Cuda));
 
         // Probing is read-only; the scripted host still satisfies the full
         // `Remote` contract, whose upload is a no-op here.
@@ -647,11 +688,37 @@ mod tests {
             ],
         };
         let p = super::probe(&host).await.unwrap();
-        assert_eq!(p.os, Os::MacOs);
-        assert_eq!(p.cores, 12);
-        assert_eq!(p.ram_mb, 131_072);
-        assert_eq!(p.gpus.len(), 1);
-        assert_eq!(p.gpus[0].runtime, Some(GpuRuntime::Metal));
+        assert_eq!(p.os(), &Os::MacOs);
+        assert_eq!(p.cores(), 12);
+        assert_eq!(p.ram_mb(), 131_072);
+        assert_eq!(p.gpus().len(), 1);
+        assert_eq!(p.gpus()[0].runtime(), Some(&GpuRuntime::Metal));
+    }
+
+    #[tokio::test]
+    async fn probe_reads_the_hostname() {
+        use crate::capability::Os;
+        let host = ProbeHost {
+            os: "Linux",
+            replies: vec![
+                ("nproc", "8\n"),
+                ("/proc/meminfo", "MemTotal: 8000000 kB\n"),
+                ("uname -n", "  host-alpha\n"),
+            ],
+        };
+        let p = super::probe(&host).await.unwrap();
+        assert_eq!(p.os(), &Os::Linux);
+        assert_eq!(p.hostname(), "host-alpha");
+    }
+
+    #[tokio::test]
+    async fn probe_leaves_the_hostname_empty_when_unavailable() {
+        let host = ProbeHost {
+            os: "Linux",
+            replies: vec![("nproc", "8\n")],
+        };
+        let p = super::probe(&host).await.unwrap();
+        assert!(p.hostname().is_empty());
     }
 
     #[tokio::test]
@@ -665,7 +732,7 @@ mod tests {
             ],
         };
         let p = super::probe(&host).await.unwrap();
-        assert_eq!(p.os, Os::Linux);
-        assert!(p.gpus.is_empty());
+        assert_eq!(p.os(), &Os::Linux);
+        assert!(p.gpus().is_empty());
     }
 }

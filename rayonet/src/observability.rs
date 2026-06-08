@@ -456,10 +456,10 @@ impl PlainRenderer {
                 "{}{}: {role:?} ({:?}, {} cores, {} MB RAM, {} GPUs)",
                 "  ".repeat(depth(host)),
                 leaf_of(host),
-                profile.os,
-                profile.cores,
-                profile.ram_mb,
-                profile.gpus.len()
+                profile.os(),
+                profile.cores(),
+                profile.ram_mb(),
+                profile.gpus().len()
             )),
             Event::TaskStarted { .. } | Event::Telemetry { .. } => None,
             Event::TaskFinished { .. } => Some(format!(
@@ -577,13 +577,14 @@ mod tests {
 
     #[test]
     fn run_state_records_a_profile_and_role() {
-        let profile = NodeProfile {
-            os: Os::Linux,
-            arch: crate::capability::CpuArch::unknown(),
-            cores: 8,
-            ram_mb: 16_000,
-            gpus: Vec::new(),
-        };
+        let profile = NodeProfile::new(
+            Os::Linux,
+            String::new(),
+            crate::capability::CpuArch::unknown(),
+            8,
+            16_000,
+            Vec::new(),
+        );
         let mut state = RunState::default();
         state.apply(&Event::profiled(
             "host-a",
@@ -602,13 +603,14 @@ mod tests {
 
     #[test]
     fn paths_by_id_groups_a_redundantly_reachable_node() {
-        let profile = NodeProfile {
-            os: Os::Linux,
-            arch: crate::capability::CpuArch::unknown(),
-            cores: 8,
-            ram_mb: 16_000,
-            gpus: Vec::new(),
-        };
+        let profile = NodeProfile::new(
+            Os::Linux,
+            String::new(),
+            crate::capability::CpuArch::unknown(),
+            8,
+            16_000,
+            Vec::new(),
+        );
         let mut state = RunState::default();
         // The same physical node ("shared") is reached via two relays.
         state.apply(&Event::profiled(
@@ -640,13 +642,14 @@ mod tests {
 
     #[test]
     fn plain_renderer_summarizes_a_profile() {
-        let profile = NodeProfile {
-            os: Os::Linux,
-            arch: crate::capability::CpuArch::unknown(),
-            cores: 8,
-            ram_mb: 16_000,
-            gpus: Vec::new(),
-        };
+        let profile = NodeProfile::new(
+            Os::Linux,
+            String::new(),
+            crate::capability::CpuArch::unknown(),
+            8,
+            16_000,
+            Vec::new(),
+        );
         let mut renderer = super::PlainRenderer::new();
         let line = renderer
             .render(&Event::profiled(

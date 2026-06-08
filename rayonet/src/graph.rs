@@ -59,9 +59,9 @@ fn microseconds_to_millis(microseconds: u64) -> f64 {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LinkMetric {
     /// Link round-trip latency in milliseconds (lower is better).
-    pub latency_ms: f64,
+    latency_ms: f64,
     /// Link bandwidth in bytes per second, if probed (higher is better).
-    pub bandwidth: Option<f64>,
+    bandwidth: Option<f64>,
 }
 
 impl Default for LinkMetric {
@@ -91,11 +91,25 @@ pub enum Metric {
 #[derive(Debug)]
 pub struct RelayReport {
     /// The relay's label under the coordinator (its path segment).
-    pub label: String,
+    label: String,
     /// Measured latency (microseconds) of the coordinator's link to this relay.
-    pub latency_us: u64,
+    latency_us: u64,
     /// The children this relay discovered, by id and link latency.
-    pub children: Vec<ChildAd>,
+    children: Vec<ChildAd>,
+}
+
+impl RelayReport {
+    /// Describe one relay at the handshake: its `label` under the coordinator,
+    /// the `latency_us` of the coordinator's link to it, and the `children` it
+    /// built and is offering.
+    #[must_use]
+    pub const fn new(label: String, latency_us: u64, children: Vec<ChildAd>) -> Self {
+        Self {
+            label,
+            latency_us,
+            children,
+        }
+    }
 }
 
 /// Choose, by `metric`, which children each relay activates now.
@@ -117,11 +131,11 @@ pub fn choose_active(relays: &[RelayReport], metric: Metric) -> Vec<Vec<String>>
                 .filter(|child| {
                     // A uniquely reached child (absent from the primary map) is
                     // always active. A shared one runs only on its primary relay.
-                    primaries.get(&child.id).is_none_or(|order| {
+                    primaries.get(child.id()).is_none_or(|order| {
                         order.first().map(String::as_str) == Some(relay.label.as_str())
                     })
                 })
-                .map(|child| child.label.clone())
+                .map(|child| child.label().to_string())
                 .collect()
         })
         .collect()
@@ -142,11 +156,11 @@ fn relay_topology(relays: &[RelayReport]) -> RunState {
         ));
         for child in &relay.children {
             state.apply(&Event::profiled(
-                &format!("{}/{}", relay.label, child.label),
-                &child.id,
+                &format!("{}/{}", relay.label, child.label()),
+                child.id(),
                 NodeProfile::unknown(),
                 Role::Compute,
-                child.latency_us,
+                child.latency_us(),
             ));
         }
     }
@@ -162,8 +176,8 @@ pub fn redundancy_gaps(relays: &[RelayReport]) -> Vec<String> {
     let mut gaps = Vec::new();
     let mut seen = BTreeSet::new();
     for child in relays.iter().flat_map(|relay| &relay.children) {
-        if seen.insert(child.id.as_str()) && !topology.is_redundant(&child.id) {
-            gaps.push(child.id.clone());
+        if seen.insert(child.id()) && !topology.is_redundant(child.id()) {
+            gaps.push(child.id().to_string());
         }
     }
     gaps
@@ -505,13 +519,14 @@ mod tests {
     use std::collections::BTreeSet;
 
     fn profile() -> NodeProfile {
-        NodeProfile {
-            os: Os::Linux,
-            arch: crate::capability::CpuArch::unknown(),
-            cores: 4,
-            ram_mb: 8_000,
-            gpus: Vec::new(),
-        }
+        NodeProfile::new(
+            Os::Linux,
+            String::new(),
+            crate::capability::CpuArch::unknown(),
+            4,
+            8_000,
+            Vec::new(),
+        )
     }
 
     /// Build a run state from `(path_id, physical_id)` discovery facts.
@@ -717,12 +732,7 @@ mod tests {
     fn choose_active_runs_a_shared_child_on_its_lower_latency_relay() {
         use super::{choose_active, Metric, RelayReport};
         use crate::protocol::ChildAd;
-        let shared = |latency_us| ChildAd {
-            label: "L".to_string(),
-            id: "idL".to_string(),
-            slots: 1,
-            latency_us,
-        };
+        let shared = |latency_us| ChildAd::new("L".to_string(), "idL".to_string(), 1, latency_us);
         // Both relays reach leaf L, but "fast" has the lower-latency path. "fast"
         // also has its own leaf U, reached only through it.
         let relays = vec![
@@ -731,12 +741,7 @@ mod tests {
                 latency_us: 100,
                 children: vec![
                     shared(100),
-                    ChildAd {
-                        label: "U".to_string(),
-                        id: "idU".to_string(),
-                        slots: 1,
-                        latency_us: 100,
-                    },
+                    ChildAd::new("U".to_string(), "idU".to_string(), 1, 100),
                 ],
             },
             RelayReport {
@@ -756,12 +761,7 @@ mod tests {
     fn redundancy_gaps_flags_compute_behind_a_single_relay() {
         use super::{redundancy_gaps, RelayReport};
         use crate::protocol::ChildAd;
-        let child = |label: &str, id: &str| ChildAd {
-            label: label.to_string(),
-            id: id.to_string(),
-            slots: 1,
-            latency_us: 0,
-        };
+        let child = |label: &str, id: &str| ChildAd::new(label.to_string(), id.to_string(), 1, 0);
         // L is shared by both relays (redundant). X hangs off relay A alone.
         let relays = vec![
             RelayReport {

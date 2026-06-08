@@ -155,11 +155,11 @@ impl Remote for SshRemote {
             .output()
             .await
             .map_err(to_io)?;
-        Ok(CommandOutput {
-            status: output.status.code().unwrap_or(-1),
-            stdout: output.stdout,
-            stderr: output.stderr,
-        })
+        Ok(CommandOutput::new(
+            output.status.code().unwrap_or(-1),
+            output.stdout,
+            output.stderr,
+        ))
     }
 
     async fn upload(&self, bytes: &[u8], dest: &str) -> io::Result<()> {
@@ -305,7 +305,7 @@ impl Launch for Ssh {
                     events,
                 )
                 .await?;
-                provisioned.binary_path
+                provisioned.binary_path().to_string()
             }
         };
         // ssh does not forward the local environment, so the agent marker is

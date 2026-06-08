@@ -27,13 +27,33 @@ use crate::ssh::{parse_host_list, Ssh, SshConfig};
 #[derive(Debug)]
 pub struct NodeConfig {
     /// The task handlers this node serves as a leaf.
-    pub registry: Registry,
+    registry: Registry,
     /// The crate source tarball to ship to children (a relay's `__rayonet_source()`).
-    pub source: Vec<u8>,
+    source: Vec<u8>,
     /// The agent binary name to build on children.
-    pub binary_name: String,
+    binary_name: String,
     /// The rust toolchain to build children with.
-    pub toolchain: String,
+    toolchain: String,
+}
+
+impl NodeConfig {
+    /// Assemble a node's boot configuration from its leaf task `registry`, the
+    /// crate `source` tarball a relay cascades to its children, and the
+    /// `binary_name` and `toolchain` those children are built with.
+    #[must_use]
+    pub const fn new(
+        registry: Registry,
+        source: Vec<u8>,
+        binary_name: String,
+        toolchain: String,
+    ) -> Self {
+        Self {
+            registry,
+            source,
+            binary_name,
+            toolchain,
+        }
+    }
 }
 
 /// The children file path: `$RAYONET_CHILDREN` if set, else
@@ -218,12 +238,12 @@ mod tests {
     }
 
     fn config(registry: Registry) -> NodeConfig {
-        NodeConfig {
+        NodeConfig::new(
             registry,
-            source: b"source-bundle".to_vec(),
-            binary_name: "consumer".to_string(),
-            toolchain: "stable".to_string(),
-        }
+            b"source-bundle".to_vec(),
+            "consumer".to_string(),
+            "stable".to_string(),
+        )
     }
 
     #[test]
