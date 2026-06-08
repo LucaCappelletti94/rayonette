@@ -465,11 +465,9 @@ fn node_detail_lines(state: &RunState, id: &str) -> Vec<Line<'static>> {
         .profile
         .as_ref()
         .expect("a profiled node has a profile");
-    let completed: usize = mine
-        .iter()
-        .filter_map(|path| state.nodes.get(*path))
-        .map(|view| view.completed)
-        .sum();
+    // Work done by or under this node, summed across every path that reaches it: a
+    // leaf reports its own, a relay rolls its subtree up.
+    let completed: usize = mine.iter().map(|path| state.subtree_completed(path)).sum();
 
     let role = view.role.expect("a profiled node has a role");
     let node_state = vertex_state(state, id).expect("a selected vertex has a state");
@@ -863,7 +861,7 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Cell::from(path.clone()),
             Cell::from(role),
             Cell::from(format!("{effective:?}")).style(state_style(effective)),
-            Cell::from(view.completed.to_string()),
+            Cell::from(state.subtree_completed(path).to_string()),
             Cell::from(latency),
             Cell::from(arch),
             Cell::from(flag).style(Style::default().fg(Color::Red)),
@@ -1531,6 +1529,46 @@ mod tests {
         // Its leaf, reached only through that relay, has a single path.
         lone.selected = Some(Selection::Node("idL".to_string()));
         assert!(render(&lone).join("\n").contains("reach single path"));
+    }
+
+    #[test]
+    fn a_relay_rolls_up_its_subtree_done_count() {
+        // With completions credited to the deep leaf, a relay computes nothing
+        // itself; its detail rolls its subtree's work up so it does not read 0.
+        let mut app = App::new();
+        app.apply(&Event::profiled(
+            "relay",
+            "idR",
+            profile("x86_64"),
+            Role::Compute,
+            0,
+        ));
+        app.apply(&Event::profiled(
+            "relay/leaf",
+            "idL",
+            profile("x86_64"),
+            Role::Compute,
+            0,
+        ));
+        app.apply(&Event::node("relay", NodeState::Working));
+        app.apply(&Event::node("relay/leaf", NodeState::Working));
+        for task in 0..3 {
+            app.apply(&Event::TaskFinished {
+                host: "relay/leaf".to_string(),
+                task,
+                ok: true,
+            });
+        }
+        app.selected = Some(Selection::Node("idR".to_string()));
+        assert!(
+            render(&app).join("\n").contains("done  3"),
+            "relay rolls up"
+        );
+        app.selected = Some(Selection::Node("idL".to_string()));
+        assert!(
+            render(&app).join("\n").contains("done  3"),
+            "leaf shows own"
+        );
     }
 
     #[test]

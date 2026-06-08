@@ -341,6 +341,21 @@ impl RunState {
             .collect()
     }
 
+    /// Tasks finished anywhere in `host`'s subtree: its own count plus every
+    /// descendant's. A relay computes nothing itself, so this rolls its leaves'
+    /// work up to it for a per-subtree total, while a leaf (no descendants) reports
+    /// just its own. Matches descendants by the `host/` path prefix, so `relayA`
+    /// does not absorb `relayAB`.
+    #[must_use]
+    pub fn subtree_completed(&self, host: &str) -> usize {
+        let prefix = format!("{host}/");
+        self.nodes
+            .iter()
+            .filter(|(path, _)| path.as_str() == host || path.starts_with(&prefix))
+            .map(|(_, view)| view.completed)
+            .sum()
+    }
+
     /// The direct children of `id`, in id order.
     #[must_use]
     pub fn children_of(&self, id: &str) -> Vec<&str> {
@@ -510,6 +525,27 @@ mod tests {
         assert_eq!(state.children_of("a"), vec!["a/b", "a/c"]);
         assert_eq!(state.children_of("a/b"), vec!["a/b/d"]);
         assert!(state.children_of("e").is_empty());
+    }
+
+    #[test]
+    fn subtree_completed_rolls_descendants_up() {
+        let mut state = RunState::default();
+        // relayA fronts a leaf that did 6; relayAB (a different node) did 1; the
+        // prefix match must not let relayA absorb relayAB.
+        for (host, done) in [("relayA", 0), ("relayA/leaf", 6), ("relayAB", 1)] {
+            for task in 0..done {
+                state.apply(&Event::TaskFinished {
+                    host: host.to_string(),
+                    task,
+                    ok: true,
+                });
+            }
+        }
+        // relayA rolls up its leaf (its own 0 plus the leaf's 6), not relayAB.
+        assert_eq!(state.subtree_completed("relayA"), 6);
+        // A leaf with no descendants reports just its own count.
+        assert_eq!(state.subtree_completed("relayA/leaf"), 6);
+        assert_eq!(state.subtree_completed("relayAB"), 1);
     }
 
     #[test]

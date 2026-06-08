@@ -189,7 +189,10 @@ async fn main() {
     println!("ok: {} results", out.len());
 
     let state = sink.state.lock().unwrap();
-    for (host, view) in &state.nodes {
-        println!("share {host} {}", view.completed);
+    // Completions are credited to the deep leaf that ran them, so a relay rolls its
+    // subtree up: its share line is the work done beneath it (a leaf reports its
+    // own), which is what the topology assertions read.
+    for host in state.nodes.keys() {
+        println!("share {host} {}", state.subtree_completed(host));
     }
 }
