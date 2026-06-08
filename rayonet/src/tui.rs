@@ -373,14 +373,19 @@ fn render_graph(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     // Node labels on top of the lines.
     let buffer = frame.buffer_mut();
     for node in &geometry.nodes {
-        // A single point of failure is flagged with a leading marker so the graph
-        // shows it even without colour.
+        // Each node gets a state glyph; a single point of failure is flagged with a
+        // leading pennant so it reads even without colour.
+        let glyph = node_glyph(node.state);
         let label = if node.spof {
-            format!("!{}", node.label)
+            format!("\u{2691}{glyph} {}", node.label)
         } else {
-            node.label.clone()
+            format!("{glyph} {}", node.label)
         };
-        let mut style = node_style(node.state).add_modifier(Modifier::BOLD);
+        // Colour by state, plus an effect: provisioning slow-blinks, a lost node
+        // rapid-blinks, so the rate distinguishes them at a glance.
+        let mut style = node_style(node.state)
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(node_blink(node.state));
         if matches!(&selected, Some(Selection::Node(id)) if *id == node.id) {
             style = style.add_modifier(Modifier::REVERSED);
         }
@@ -725,6 +730,34 @@ const fn state_rank(state: NodeState) -> u8 {
 /// coordinator root, which has no state of its own.
 fn node_style(state: Option<NodeState>) -> Style {
     state.map_or_else(|| Style::default().fg(Color::Magenta), state_style)
+}
+
+/// The single-width glyph for a vertex: a diamond for the coordinator root, then a
+/// shape per lifecycle state (filled working, ringed done, hollow idle, dotted
+/// while provisioning, a cross when lost).
+const fn node_glyph(state: Option<NodeState>) -> char {
+    match state {
+        None => '\u{25c6}', // coordinator root
+        Some(NodeState::Working) => '\u{25cf}',
+        Some(NodeState::Done) => '\u{25c9}',
+        Some(NodeState::Ready | NodeState::Idle) => '\u{25cb}',
+        Some(
+            NodeState::Probing | NodeState::Installing | NodeState::Syncing | NodeState::Building,
+        ) => '\u{25cd}',
+        Some(NodeState::Lost) => '\u{2717}',
+    }
+}
+
+/// The blink effect for a vertex, so its rate carries meaning: a node still being
+/// provisioned blinks slowly, a lost node blinks fast, everything else is steady.
+const fn node_blink(state: Option<NodeState>) -> Modifier {
+    match state {
+        Some(NodeState::Lost) => Modifier::RAPID_BLINK,
+        Some(
+            NodeState::Probing | NodeState::Installing | NodeState::Syncing | NodeState::Building,
+        ) => Modifier::SLOW_BLINK,
+        _ => Modifier::empty(),
+    }
 }
 
 /// Project a unit-square position onto a cell of `area`, with y flipped so the top
@@ -1200,8 +1233,45 @@ mod tests {
             .find(|node| node.label == "leaf")
             .expect("the leaf vertex is present");
         assert!(!leaf.spof, "the leaf is not a point of failure");
-        // The marker reaches the rendered frame.
-        assert!(render(&app).iter().any(|row| row.contains("!relay")));
+        // The pennant flag reaches the rendered frame on the relay's row.
+        assert!(render(&app)
+            .iter()
+            .any(|row| row.contains('\u{2691}') && row.contains("relay")));
+    }
+
+    #[test]
+    fn node_glyphs_and_blink_cover_every_state() {
+        use super::{node_blink, node_glyph};
+        use ratatui::style::Modifier;
+        // The coordinator (no state) and each lifecycle state get a distinct glyph,
+        // and provisioning slow-blinks while a lost node rapid-blinks.
+        assert_eq!(node_glyph(None), '\u{25c6}');
+        assert_eq!(node_blink(None), Modifier::empty());
+        let mut glyphs = std::collections::BTreeSet::new();
+        for state in [
+            NodeState::Probing,
+            NodeState::Installing,
+            NodeState::Syncing,
+            NodeState::Building,
+            NodeState::Ready,
+            NodeState::Idle,
+            NodeState::Working,
+            NodeState::Done,
+            NodeState::Lost,
+        ] {
+            glyphs.insert(node_glyph(Some(state)));
+            let blink = node_blink(Some(state));
+            match state {
+                NodeState::Lost => assert_eq!(blink, Modifier::RAPID_BLINK),
+                NodeState::Probing
+                | NodeState::Installing
+                | NodeState::Syncing
+                | NodeState::Building => assert_eq!(blink, Modifier::SLOW_BLINK),
+                _ => assert_eq!(blink, Modifier::empty()),
+            }
+        }
+        // Working, Done, idle/ready, provisioning, and lost are five distinct shapes.
+        assert_eq!(glyphs.len(), 5);
     }
 
     #[test]

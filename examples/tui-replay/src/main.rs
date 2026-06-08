@@ -123,7 +123,18 @@ fn replay(terminal: &mut Term, path: &str, speed: f64, follow: bool) -> io::Resu
         }
     };
 
+    // Hold each event on screen for at least this long, so a burst of events
+    // recorded in the same instant does not flash by faster than the eye can
+    // follow. Override with RAYONET_REPLAY_MIN_DWELL_MS.
+    let min_dwell = Duration::from_millis(
+        std::env::var("RAYONET_REPLAY_MIN_DWELL_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(120),
+    );
+
     let start = Instant::now();
+    let mut last_applied = Instant::now();
     let mut line = String::new();
     loop {
         if pump_input(&mut app)? == Action::Quit {
@@ -148,17 +159,21 @@ fn replay(terminal: &mut Term, path: &str, speed: f64, follow: bool) -> io::Resu
             continue; // a blank or partially-written line; the next event redraws
         };
         // Pace a finished trace by its own timestamps; show a live one as it lands.
-        if !follow {
-            let target = Duration::from_secs_f64(record.elapsed_ms as f64 / 1000.0 / speed);
-            while start.elapsed() < target {
-                if pump_input(&mut app)? == Action::Quit {
-                    return Ok(());
-                }
-                terminal.draw(|frame| rayonet::tui::draw(frame, &mut app))?;
-                std::thread::sleep(Duration::from_millis(10));
+        let target = if follow {
+            last_applied + min_dwell
+        } else {
+            (start + Duration::from_secs_f64(record.elapsed_ms as f64 / 1000.0 / speed))
+                .max(last_applied + min_dwell)
+        };
+        while Instant::now() < target {
+            if pump_input(&mut app)? == Action::Quit {
+                return Ok(());
             }
+            terminal.draw(|frame| rayonet::tui::draw(frame, &mut app))?;
+            std::thread::sleep(Duration::from_millis(10));
         }
         app.apply(&record.event);
         app.elapsed = start.elapsed();
+        last_applied = Instant::now();
     }
 }
