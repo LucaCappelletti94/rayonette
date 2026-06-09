@@ -4,6 +4,7 @@
 //! `.net_map` over subprocess agents (copies of itself).
 
 use rayonette::fleet::{Fleet, NetMapExt, Subprocess};
+use rayonette::node::{agent_main, NodeConfig};
 use rayonette::process;
 
 const fn double(x: u32) -> u32 {
@@ -15,10 +16,15 @@ rayonette::embed_microcrates!();
 #[tokio::main]
 async fn main() {
     if process::is_agent() {
-        process::run_agent(__rayonette_registry())
-            .await
-            .expect("agent failed");
-        return;
+        // The one agent entry point: serves as a leaf (or a relay if a children
+        // file names children), then exits the process. It never returns.
+        let config = NodeConfig::new(
+            __rayonette_registry(),
+            __rayonette_source(),
+            "consumer".to_string(),
+            "stable".to_string(),
+        );
+        agent_main(config).await;
     }
 
     // The source bundle rayonette would ship to a remote worker (unused here, since

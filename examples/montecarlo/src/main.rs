@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rayonette::fleet::{Fleet, NetMapExt};
+use rayonette::node::{agent_main, NodeConfig};
 use rayonette::observability::{Event, EventSink};
 use rayonette::process;
 use rayonette::ssh::{Ssh, SshConfig};
@@ -87,10 +88,15 @@ fn cluster_dir() -> PathBuf {
 #[tokio::main]
 async fn main() {
     if process::is_agent() {
-        process::run_agent(__rayonette_registry())
-            .await
-            .expect("agent failed");
-        return;
+        // The one agent entry point: a leaf, or a relay if this worker names
+        // children, then exits the process. It never returns.
+        let config = NodeConfig::new(
+            __rayonette_registry(),
+            __rayonette_source(),
+            "montecarlo".to_string(),
+            "stable".to_string(),
+        );
+        agent_main(config).await;
     }
 
     // `cluster/up.sh` writes the key and one `host port` line per worker.
