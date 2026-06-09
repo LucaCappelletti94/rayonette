@@ -1,0 +1,19 @@
+# Base agent host: an ssh server plus the tools the provisioning ladder needs
+# (curl for rustup, tar for the source bundle, gcc for crates that build C).
+# Deliberately has NO rust, so the ladder must install it.
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        openssh-server curl ca-certificates tar gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /run/sshd \
+    && ssh-keygen -A \
+    && useradd -m -s /bin/bash rayonette \
+    && printf 'PasswordAuthentication no\nPermitRootLogin no\n' \
+        > /etc/ssh/sshd_config.d/rayonette.conf
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

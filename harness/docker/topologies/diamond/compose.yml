@@ -1,0 +1,53 @@
+# Diamond topology (R5 redundant paths and reroute).
+#
+# A compute leaf is reachable through two relays, so when one relay dies the
+# other takes over:
+#
+#   coordinator (host)
+#     |  ssh 127.0.0.1:2211        |  ssh 127.0.0.1:2212
+#     v                            v
+#   relayA (netA)               relayB (netB)
+#     |  ssh leaf (netA)           |  ssh leaf (netB)
+#     +----------> leaf <----------+
+#
+# leaf sits on both netA and netB but is published nowhere, so the coordinator
+# can reach it ONLY through a relay. relayA is the only bridge between the host
+# and leaf-via-netA, so killing relayA partitions that path while leaf survives
+# on netB through relayB. Each relay reaches leaf with the shared key over its
+# own child network, the decentralized way.
+
+name: rayonette-diamond
+
+volumes:
+  rayonette-topo-cache:
+    external: true
+
+networks:
+  netA: {}
+  netB: {}
+
+x-agent: &agent
+  init: true
+  volumes:
+    - ../../secrets:/secrets:ro
+    - rayonette-topo-cache:/home/rayonette/.cache
+
+services:
+  relayA:
+    <<: *agent
+    image: rayonette-harness-base:latest
+    networks: [netA]
+    ports:
+      - "2211:22"
+
+  relayB:
+    <<: *agent
+    image: rayonette-harness-base:latest
+    networks: [netB]
+    ports:
+      - "2212:22"
+
+  leaf:
+    <<: *agent
+    image: rayonette-harness-base:latest
+    networks: [netA, netB]

@@ -1,0 +1,68 @@
+# metropolis: a richer, growing network in one run.
+#
+#   coordinator (host)
+#     |  :2250        |  :2251              |  :2252 (joins mid-run)
+#     v               v                     v
+#   gw1 (net1)      gw2 (net2)            gw3 (net3, compute)
+#     | leafA         | leafB
+#     +--> shared <---+   (shared sits on net1 and net2, deduped to one node:
+#                          one primary gateway, one standby)
+#
+# The run starts with gw1 and gw2 (relays) fronting their own leaf plus a shared,
+# redundant leaf. gw3 is a compute node that is down at launch and brought up
+# mid-run, so the coordinator's rejoin driver absorbs a new top-level node and the
+# network visibly grows. Then the primary gateway for shared is killed and shared
+# reroutes onto the standby. The gateways relay and never compute.
+name: rayonette-metropolis
+
+volumes:
+  rayonette-topo-cache:
+    external: true
+
+networks:
+  net1: {}
+  net2: {}
+  net3: {}
+
+x-agent: &agent
+  init: true
+  image: rayonette-harness-base:latest
+  volumes:
+    - ../../secrets:/secrets:ro
+    - rayonette-topo-cache:/home/rayonette/.cache
+
+# Each container is given a friendly hostname (uname -n) distinct from its ssh
+# label, so the dashboard can show the machine's own name (e.g. "relay-east")
+# alongside its wiring (the gw1/... path). Without this, docker hands out a random
+# container id and the graph would just echo the ssh labels.
+services:
+  gw1:
+    <<: *agent
+    hostname: relay-east
+    networks: [net1]
+    ports:
+      - "2250:22"
+  gw2:
+    <<: *agent
+    hostname: relay-west
+    networks: [net2]
+    ports:
+      - "2251:22"
+  gw3:
+    <<: *agent
+    hostname: gpu-spot
+    networks: [net3]
+    ports:
+      - "2252:22"
+  shared:
+    <<: *agent
+    hostname: cache-store
+    networks: [net1, net2]
+  leafA:
+    <<: *agent
+    hostname: worker-east
+    networks: [net1]
+  leafB:
+    <<: *agent
+    hostname: worker-west
+    networks: [net2]

@@ -1,0 +1,26 @@
+# A small local "swarm" of blank workers for the Monte Carlo example. Each is an
+# ssh host with no rust; rayonette provisions them. Their ssh ports are published
+# on the host so the coordinator (cargo run -p montecarlo) can reach them.
+
+name: montecarlo
+
+x-worker: &worker
+  image: montecarlo-worker:latest
+  init: true
+  volumes:
+    - ./secrets:/secrets:ro
+
+services:
+  worker-1:
+    <<: *worker
+    build: .
+    ports:
+      - "2201:22"
+  worker-2:
+    <<: *worker
+    ports:
+      - "2202:22"
+  worker-3:
+    <<: *worker
+    ports:
+      - "2203:22"

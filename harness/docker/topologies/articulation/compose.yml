@@ -1,0 +1,48 @@
+# articulation: a diamond (the shared leaf is reachable through relayA and relayB)
+# plus a solo leaf reachable only through relayA. relayA is an articulation point
+# for solo. Killing relayA strands solo's path, but because tasks are not pinned
+# to a node, its work reroutes onto the surviving compute (the shared leaf via
+# relayB), so the run still completes: graceful degradation, not failure.
+#
+#   coordinator
+#     |  :2211            |  :2212
+#     v                   v
+#   relayA (netA)       relayB (netB)
+#     |  \                 |
+#     v   v                v
+#   solo  shared <---------+
+#   (netA)(netA+netB)
+name: rayonette-articulation
+
+volumes:
+  rayonette-topo-cache:
+    external: true
+
+networks:
+  netA: {}
+  netB: {}
+
+x-agent: &agent
+  init: true
+  image: rayonette-harness-base:latest
+  volumes:
+    - ../../secrets:/secrets:ro
+    - rayonette-topo-cache:/home/rayonette/.cache
+
+services:
+  relayA:
+    <<: *agent
+    networks: [netA]
+    ports:
+      - "2211:22"
+  relayB:
+    <<: *agent
+    networks: [netB]
+    ports:
+      - "2212:22"
+  shared:
+    <<: *agent
+    networks: [netA, netB]
+  solo:
+    <<: *agent
+    networks: [netA]

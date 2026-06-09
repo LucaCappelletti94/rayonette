@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Levels 1-2 of the test pyramid (in-process and subprocess), plus the lint
+  # and format gates. ssh-localhost (level 3) runs in the coverage job; docker
+  # multi-host (level 4) runs in the docker job.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --workspace --all-features
+
+  # Coverage via cargo-llvm-cov (LLVM source-based instrumentation). llvm-cov's
+  # region attribution credits async/macro code that line-based tools miss.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      # The ssh-localhost tests (pyramid level 3) are #[ignore]d, so this job
+      # sets up self-login and runs with --include-ignored to both execute them
+      # and cover src/ssh.rs.
+      - name: Set up ssh localhost self-login (pyramid level 3)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+          sudo service ssh start
+          ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/rayonette_localhost_ed25519"
+          cat "$HOME/.ssh/rayonette_localhost_ed25519.pub" >> "$HOME/.ssh/authorized_keys"
+          chmod 600 "$HOME/.ssh/authorized_keys"
+          ssh -i "$HOME/.ssh/rayonette_localhost_ed25519" -o StrictHostKeyChecking=accept-new -o BatchMode=yes localhost true
+      # 100% functions and ~100% lines are attainable; region coverage is
+      # capped below 100% by generic monomorphization (per-type encode/decode
+      # error arms that protocol types never exercise), not by dead code.
+      - name: Coverage
+        run: cargo llvm-cov --workspace --all-features --ignore-filename-regex 'src/bin/|fixtures/|harness/|examples/' --fail-under-functions 100 --fail-under-lines 99 -- --include-ignored
+
+  # Pyramid level 4: the segmented multi-host docker network. Provisions cold
+  # hosts (install -> ship -> build -> run), proves the cache, multi-hop
+  # ProxyJump, and legible per-host failure. Also runs the flagship example.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Bring up the harness network
+        run: bash harness/docker/up.sh
+      - name: Run level-4 scenarios
+        run: bash harness/docker/run-scenarios.sh
+      - name: Tear down
+        if: always()
+        run: bash harness/docker/down.sh
+      - name: Flagship example, distributed run over a docker swarm
+        run: |
+          examples/montecarlo/cluster/up.sh
+          out=$(cargo run -p montecarlo)
+          echo "$out"
+          examples/montecarlo/cluster/down.sh
+          echo "$out" | grep -qE 'pi ~= 3\.1[0-9]' || { echo "pi estimate missing or wrong"; exit 1; }
+      # The relay-tree bestiarium (harness/docker/topologies/run-all.sh) is run
+      # locally and on demand, not gated here. It stands up eight deep multi-hop
+      # ssh topologies in sequence, which is resource-marginal on a shared 2-core
+      # runner: the deep leaf containers have no published port, so the harness
+      # cannot wait for their sshd, and a relay that connects before a child is
+      # ready fails fast with "no usable children". The relay-tree logic itself is
+      # covered in CI by the in-process and subprocess tests in the check job, and
+      # real ssh over docker is exercised above by the level-4 scenarios and the
+      # flagship swarm run.

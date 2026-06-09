@@ -1,0 +1,22 @@
+[package]
+name = "rayonette-build"
+description = "Build-time source extraction and codegen for rayonette (used in a consumer's build.rs)."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "visit"] }
+tar = "0.4"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

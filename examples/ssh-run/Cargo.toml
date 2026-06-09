@@ -1,0 +1,15 @@
+[package]
+name = "ssh-run"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rayonette = { path = "../../rayonette" }
+tokio = { version = "1", features = ["full"] }
+
+[build-dependencies]
+rayonette-build = { path = "../../rayonette-build" }
+
+[lints]
+workspace = true

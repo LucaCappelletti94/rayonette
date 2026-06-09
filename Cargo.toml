@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "rayonette",
+    "rayonette-build",
+    "fixtures/consumer",
+    "harness/docker/consumer",
+    "examples/montecarlo",
+    "examples/ssh-run",
+    "examples/tui-replay",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+authors = ["Luca Cappelletti"]
+license = "MIT"
+repository = "https://github.com/LucaCappelletti94/rayonette"
+readme = "README.md"
+keywords = ["distributed", "ssh", "parallel", "rayon", "tasks"]
+categories = ["concurrency"]
+
+# Extremely aggressive lints, workspace-wide. Group lints are denied at a lower
+# priority so individual carve-outs (priority 0) win. Carve-outs are kept to the
+# few that are impractical wholesale, everything else must be fixed, not allowed.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -2 }
+pedantic = { level = "deny", priority = -2 }
+nursery = { level = "deny", priority = -2 }
+cargo = { level = "deny", priority = -2 }
+# Impractical wholesale: the transitive dep graph routinely carries duplicates.
+multiple_crate_versions = "allow"
+# Would force Send/Sync bounds across the whole async API for a nursery lint;
+# revisit once we commit to a spawnable (Send) transport.
+future_not_send = "allow"
+# A few high-value restriction lints on top of the groups.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+# Force every carve-out to be a reasoned `#[expect]`, so an allow is
+# self-documenting and the build fails when one goes stale.
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+# Zero-fallout guardrails: cheap to adopt now, each catches a future regression.
+# (The unwrap/panic/unreachable family is denied per-crate, scoped to non-test,
+# in each crate root, since it fires in test code.)
+mem_forget = "deny"
+mutex_atomic = "deny"
+rc_buffer = "deny"
+path_buf_push_overwrite = "deny"
+verbose_file_reads = "deny"
+lossy_float_literal = "deny"
+self_named_module_files = "deny"

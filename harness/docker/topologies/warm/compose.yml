@@ -1,0 +1,17 @@
+# A single leaf used to warm the shared build cache once, sequentially, so every
+# topology afterward provisions by cache hit. See ../lib.sh topo_warm.
+name: rayonette-warm
+
+volumes:
+  rayonette-topo-cache:
+    external: true
+
+services:
+  warm:
+    init: true
+    image: rayonette-harness-base:latest
+    volumes:
+      - ../../secrets:/secrets:ro
+      - rayonette-topo-cache:/home/rayonette/.cache
+    ports:
+      - "2299:22"

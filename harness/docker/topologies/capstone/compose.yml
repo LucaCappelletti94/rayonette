@@ -1,0 +1,50 @@
+# capstone (R7): segmented + multi-level + redundant + elastic in one run.
+#
+#   coordinator (host)
+#     |  ssh 127.0.0.1:2240         |  ssh 127.0.0.1:2241
+#     v                             v
+#   gatewayA (netA)              gatewayB (netB)
+#     |  ssh shared (netA)          |  ssh shared (netB)
+#     +---------> shared <----------+        and, added mid-run, extra
+#
+# shared sits on both nets but is published nowhere, so the coordinator reaches
+# it only through a gateway, and both gateways naming the same node dedup it to
+# one (one primary gateway, one standby). extra is a distinct compute leaf on
+# both nets, started and added to the standby gateway's children file mid-run, so
+# the standby re-reads and absorbs it. Killing the primary gateway then reroutes
+# shared onto the standby. The gateways relay and never compute, so they are
+# relay-only by construction.
+name: rayonette-capstone
+
+volumes:
+  rayonette-topo-cache:
+    external: true
+
+networks:
+  netA: {}
+  netB: {}
+
+x-agent: &agent
+  init: true
+  image: rayonette-harness-base:latest
+  volumes:
+    - ../../secrets:/secrets:ro
+    - rayonette-topo-cache:/home/rayonette/.cache
+
+services:
+  gatewayA:
+    <<: *agent
+    networks: [netA]
+    ports:
+      - "2240:22"
+  gatewayB:
+    <<: *agent
+    networks: [netB]
+    ports:
+      - "2241:22"
+  shared:
+    <<: *agent
+    networks: [netA, netB]
+  extra:
+    <<: *agent
+    networks: [netA, netB]

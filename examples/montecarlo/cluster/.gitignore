@@ -1,0 +1,3 @@
+# Throwaway keys and the generated fleet list (never commit secrets).
+secrets/
+fleet
