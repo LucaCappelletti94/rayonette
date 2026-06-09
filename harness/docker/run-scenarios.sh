@@ -80,8 +80,12 @@ fi
 # Work-share: a CPU-bound batch across a full-speed and a throttled host. Warm
 # both build caches with a cheap pass first so the cap bites task execution.
 run fastslow-warmup "leaf-fast,leaf-slow" double 1
-run fastslow "leaf-fast,leaf-slow" crunch 40
-expect fastslow 'ok: 40 results' 'every task completed'
+# Enough CPU-bound tasks that the 0.5-cpu cap on leaf-slow pulls the shares
+# apart: at this count the throttle yields a wide margin (the kill scenario
+# below, same task and count, splits roughly 3:1), whereas a small batch divides
+# evenly during the ramp before the cap bites.
+run fastslow "leaf-fast,leaf-slow" crunch 120
+expect fastslow 'ok: 120 results' 'every task completed'
 fast=$(grep 'share leaf-fast ' "/tmp/rayonet-scenario-fastslow.log" | awk '{print $NF}')
 slow=$(grep 'share leaf-slow ' "/tmp/rayonet-scenario-fastslow.log" | awk '{print $NF}')
 if [ -n "${fast:-}" ] && [ -n "${slow:-}" ] && [ "$fast" -gt "$slow" ]; then

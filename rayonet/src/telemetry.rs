@@ -28,15 +28,29 @@ impl Sampler {
     /// Sample current utilisation, recording `in_flight` tasks running right now.
     pub fn sample(&mut self, in_flight: usize) -> NodeTelemetry {
         let (cpu_pct, mem_pct, gpu) = read_local(&mut self.prev_cpu);
-        NodeTelemetry::new(
-            cpu_pct,
-            mem_pct,
-            gpu.map(|(compute, _)| compute),
-            gpu.map(|(_, memory)| memory),
-            in_flight,
-            local_interfaces(),
-        )
+        telemetry_from_reading(cpu_pct, mem_pct, gpu, in_flight, local_interfaces())
     }
+}
+
+/// Assemble a [`NodeTelemetry`] from a raw reading, splitting the combined GPU
+/// `(compute, memory)` pair into its two optional fields. Kept separate from the
+/// `read_local` sampling so the GPU split is exercised by a unit test on any
+/// machine, with or without a GPU present.
+fn telemetry_from_reading(
+    cpu_pct: u8,
+    mem_pct: u8,
+    gpu: Option<(u8, u8)>,
+    in_flight: usize,
+    interfaces: Vec<String>,
+) -> NodeTelemetry {
+    NodeTelemetry::new(
+        cpu_pct,
+        mem_pct,
+        gpu.map(|(compute, _)| compute),
+        gpu.map(|(_, memory)| memory),
+        in_flight,
+        interfaces,
+    )
 }
 
 /// `part` as a whole-number percentage of `whole`, clamped to `0..=100`. A zero
@@ -184,7 +198,10 @@ fn nvidia_gpu_util() -> Option<(u8, u8)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cpu_busy_total, cpu_percent, mem_percent, parse_gpu_util, percent, Sampler};
+    use super::{
+        cpu_busy_total, cpu_percent, mem_percent, parse_gpu_util, percent, telemetry_from_reading,
+        Sampler,
+    };
 
     #[test]
     fn parse_interfaces_keeps_real_ips_and_drops_loopback() {
@@ -263,5 +280,18 @@ mod tests {
         assert!(second.mem_pct() <= 100);
         assert_eq!(second.in_flight(), 0);
         assert!(second.gpu_pct().is_none_or(|pct| pct <= 100));
+    }
+
+    #[test]
+    fn a_gpu_reading_is_split_into_its_two_fields() {
+        // Assembling from a Some reading runs both gpu.map splits on any machine,
+        // with or without a GPU, so their coverage does not depend on the host
+        // having one. A None reading leaves the GPU fields empty.
+        let with_gpu = telemetry_from_reading(10, 20, Some((85, 40)), 2, Vec::new());
+        assert_eq!(with_gpu.gpu_pct(), Some(85));
+        assert_eq!(with_gpu.in_flight(), 2);
+
+        let without_gpu = telemetry_from_reading(10, 20, None, 0, Vec::new());
+        assert_eq!(without_gpu.gpu_pct(), None);
     }
 }
