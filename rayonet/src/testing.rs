@@ -255,6 +255,7 @@ mod tests {
         tx.send(&ToAgent::Hello {
             protocol_version: 1,
             fn_key: "x".to_string(),
+            heartbeat: crate::heartbeat::HeartbeatConfig::default(),
         })
         .await
         .unwrap();

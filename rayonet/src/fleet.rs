@@ -317,6 +317,9 @@ enum JoinAttempt<L: Launch> {
 /// The per-attempt handshake (connect, probe, identify, filter, provision,
 /// handshake) is inlined rather than a helper, so it does not monomorphize into a
 /// separate function per launcher type that a fixed fleet would never exercise.
+// Candidates, key, filter, requirement, the joins channel, the retry policy, the
+// heartbeat cadence, and the sink are each a distinct input the rejoin needs.
+#[allow(clippy::too_many_arguments)]
 async fn rejoin_driver<L: Launch + Send + Sync>(
     candidates: Vec<&L>,
     fn_key: &str,
@@ -324,6 +327,7 @@ async fn rejoin_driver<L: Launch + Send + Sync>(
     requires: Option<&Predicate>,
     joins_tx: mpsc::UnboundedSender<Joiner<L::Stream>>,
     policy: RejoinPolicy,
+    heartbeat: crate::heartbeat::HeartbeatConfig,
     events: &dyn EventSink,
 ) -> Vec<L::Guard> {
     let mut guards = Vec::new();
@@ -358,7 +362,7 @@ async fn rejoin_driver<L: Launch + Send + Sync>(
                 let Ok((connection, guard)) = launcher.activate(session, events).await else {
                     break 'attempt JoinAttempt::Retry;
                 };
-                handshake_join(label, connection, fn_key)
+                handshake_join(label, connection, fn_key, heartbeat)
                     .await
                     .map_or(JoinAttempt::Retry, |joiner| {
                         JoinAttempt::Joined(joiner, guard)
@@ -472,6 +476,7 @@ impl<L: Launch + Send + Sync> ErasedFleet for Fleet<L> {
                 requires,
                 joins_tx,
                 REJOIN_POLICY,
+                options.heartbeat,
                 events,
             );
             tokio::pin!(job);
@@ -557,6 +562,7 @@ pub struct NetMap<'a, F, I> {
     requires: Option<Predicate>,
     require_redundancy: bool,
     speculative: bool,
+    heartbeat: crate::heartbeat::HeartbeatConfig,
 }
 
 impl<F, I> std::fmt::Debug for NetMap<'_, F, I> {
@@ -595,6 +601,23 @@ impl<F, I> NetMap<'_, F, I> {
         self.speculative = true;
         self
     }
+
+    /// Set the liveness heartbeat for this run: a parent pings its children every
+    /// `interval`, and a peer silent for `timeout` is given up on (a child tears
+    /// itself down when its parent goes silent; a parent reroutes a silent child).
+    /// Defaults to pinging every 5s with a 20s timeout.
+    pub fn heartbeat(mut self, interval: Duration, timeout: Duration) -> Self {
+        self.heartbeat = crate::heartbeat::HeartbeatConfig::new(interval, timeout);
+        self
+    }
+
+    /// Disable the liveness heartbeat: no pings, and a node never tears down or
+    /// reroutes a peer for silence (a parent crash can then leave a child blocked
+    /// until the OS reaps the connection).
+    pub const fn no_heartbeat(mut self) -> Self {
+        self.heartbeat = crate::heartbeat::HeartbeatConfig::disabled();
+        self
+    }
 }
 
 impl<F, I> NetMap<'_, F, I>
@@ -614,6 +637,7 @@ where
         let options = RunOptions {
             require_redundancy: self.require_redundancy,
             speculative: self.speculative,
+            heartbeat: self.heartbeat,
         };
         let raw = match self.runner {
             RunnerRef::Borrowed(fleet) => {
@@ -738,6 +762,7 @@ pub trait NetMapExt: IntoIterator + Sized {
             requires: None,
             require_redundancy: false,
             speculative: false,
+            heartbeat: crate::heartbeat::HeartbeatConfig::default(),
         }
     }
 
@@ -761,6 +786,7 @@ pub trait NetMapExt: IntoIterator + Sized {
             requires: None,
             require_redundancy: false,
             speculative: false,
+            heartbeat: crate::heartbeat::HeartbeatConfig::default(),
         }
     }
 }
@@ -1563,6 +1589,7 @@ mod tests {
                 backoff: std::time::Duration::from_millis(1),
                 max_attempts: 3,
             },
+            crate::heartbeat::HeartbeatConfig::default(),
             &super::NoopSink,
         )
         .await;
@@ -1626,6 +1653,7 @@ mod tests {
                 backoff: std::time::Duration::from_millis(1),
                 max_attempts: 2,
             },
+            crate::heartbeat::HeartbeatConfig::default(),
             &super::NoopSink,
         )
         .await;
@@ -1645,6 +1673,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, (0..12u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn the_heartbeat_cadence_is_a_per_run_builder_option() {
+        use std::time::Duration;
+        // A tuned cadence and a disabled heartbeat both run to completion; the
+        // builder options only set the run's liveness config.
+        let fleet = Fleet::new((0..2).map(|_| InProcess::serving(true)).collect());
+        let tuned: Vec<Result<u32, String>> = (0..6u32)
+            .net_map_with_fleet(double, &fleet)
+            .heartbeat(Duration::from_secs(1), Duration::from_secs(4))
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(tuned, (0..6u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+
+        let fleet = Fleet::new((0..2).map(|_| InProcess::serving(true)).collect());
+        let off: Vec<Result<u32, String>> = (0..6u32)
+            .net_map_with_fleet(double, &fleet)
+            .no_heartbeat()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(off, (0..6u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
     }
 
     #[tokio::test]

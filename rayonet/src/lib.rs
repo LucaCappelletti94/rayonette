@@ -11,6 +11,7 @@ pub mod coordinator;
 pub mod fleet;
 pub mod framing;
 pub mod graph;
+pub mod heartbeat;
 #[cfg(feature = "tui")]
 pub mod layout;
 pub mod node;

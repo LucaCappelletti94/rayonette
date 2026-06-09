@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped when the wire protocol changes. Because the agent is compiled from the
 /// same source as the coordinator (whole-crate compile), this is a sanity
 /// assertion rather than a true negotiation.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Identifies a task within a run.
 pub type TaskId = u64;
@@ -70,6 +70,9 @@ pub enum ToAgent {
         protocol_version: u32,
         /// The `type_name` selector identifying the task function to run.
         fn_key: String,
+        /// The run's liveness cadence, so every node agrees on the ping interval
+        /// and the silence timeout. A relay passes it on to its own children.
+        heartbeat: crate::heartbeat::HeartbeatConfig,
     },
     /// One unit of work.
     Assign {
@@ -104,6 +107,10 @@ pub enum ToAgent {
         /// What to do to it.
         action: crate::control::ControlAction,
     },
+    /// A liveness probe a parent sends its children on the heartbeat interval; the
+    /// child answers with [`FromAgent::Pong`]. Receiving it (like any message)
+    /// keeps the child from giving its parent up.
+    Ping,
     /// Stop serving and exit cleanly (sent once every result is in).
     Shutdown,
 }
@@ -164,6 +171,9 @@ pub enum FromAgent {
     /// receiver prefixes the event's host with the sending child's label, so the
     /// host becomes a path from the root (the parent is the path prefix).
     Observe(crate::observability::Event),
+    /// A child's reply to a [`ToAgent::Ping`]: proof it is still alive. Carries no
+    /// data; the parent only notes that the child was heard from.
+    Pong,
 }
 
 #[cfg(test)]
@@ -191,6 +201,7 @@ mod tests {
             ToAgent::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 fn_key: "my_crate::evolve".to_string(),
+                heartbeat: crate::heartbeat::HeartbeatConfig::default(),
             },
             ToAgent::Assign {
                 task_id: 7,
@@ -212,6 +223,7 @@ mod tests {
                     mode: KillMode::AfterCurrent,
                 },
             },
+            ToAgent::Ping,
             ToAgent::Shutdown,
         ] {
             roundtrip_to_agent(&msg);
@@ -243,6 +255,7 @@ mod tests {
                 }],
             },
             FromAgent::Capacity { slots: 3 },
+            FromAgent::Pong,
         ] {
             roundtrip_from_agent(&msg);
         }
@@ -254,6 +267,7 @@ mod tests {
                 ToAgent::Hello {
                     protocol_version,
                     fn_key,
+                    heartbeat: crate::heartbeat::HeartbeatConfig::default(),
                 }
             }),
             (any::<u64>(), any::<Vec<u8>>())
@@ -275,6 +289,7 @@ mod tests {
                 ],
             )
                 .prop_map(|(target, action)| ToAgent::Control { target, action }),
+            Just(ToAgent::Ping),
             Just(ToAgent::Shutdown),
         ]
     }
@@ -315,6 +330,7 @@ mod tests {
             )
             .prop_map(|children| FromAgent::Discovered { children }),
             any::<usize>().prop_map(|slots| FromAgent::Capacity { slots }),
+            Just(FromAgent::Pong),
         ]
     }
 

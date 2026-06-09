@@ -133,6 +133,7 @@ mod tests {
         let msg = ToAgent::Hello {
             protocol_version: PROTOCOL_VERSION,
             fn_key: "my_crate::evolve".to_string(),
+            heartbeat: crate::heartbeat::HeartbeatConfig::default(),
         };
         ca.send(&msg).await.unwrap();
         let got: ToAgent = cb.recv().await.unwrap().unwrap();

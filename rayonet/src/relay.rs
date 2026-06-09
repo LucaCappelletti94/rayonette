@@ -86,6 +86,9 @@ struct Relay<S> {
     draining: Vec<bool>,
     /// How many tasks each child is currently running.
     load: Vec<usize>,
+    /// When each child was last heard from (any event, including a pong), on
+    /// tokio's clock. The heartbeat reroutes a child silent past the timeout.
+    last_activity: Vec<tokio::time::Instant>,
     /// Tasks waiting for a free child slot, with their payloads.
     pending: VecDeque<(TaskId, Vec<u8>)>,
     /// `task_id` -> (child, payload), kept so a lost child's work can be requeued.
@@ -115,6 +118,7 @@ where
             paused: vec![false; n],
             draining: vec![false; n],
             load: vec![0; n],
+            last_activity: vec![tokio::time::Instant::now(); n],
             pending: VecDeque::new(),
             inflight: HashMap::new(),
             uplink,
@@ -307,6 +311,11 @@ where
     where
         P: AsyncRead + AsyncWrite + Unpin,
     {
+        // Any event is proof of life: refresh the child's activity so the heartbeat
+        // does not reroute a busy or responsive child.
+        if let ChildEvent::Message(child, _) = &event {
+            self.last_activity[*child] = tokio::time::Instant::now();
+        }
         match event {
             ChildEvent::Message(_, FromAgent::Started { task_id }) => {
                 parent_tx.send(&FromAgent::Started { task_id }).await?;
@@ -376,6 +385,8 @@ where
                     .await?;
                 self.dispatch().await?;
             }
+            // A child's pong: a pure liveness signal, already noted as activity.
+            ChildEvent::Message(_, FromAgent::Pong) => {}
             // A child readies or describes itself only during the handshake in
             // `connect_agents`, never again on the live channel.
             ChildEvent::Message(_, FromAgent::Ready { .. } | FromAgent::Discovered { .. }) => {
@@ -520,9 +531,10 @@ where
 {
     let (mut parent_tx, mut parent_rx) = parent.split();
 
-    // Parent handshake: learn the job's function key (a leaf does the same in
-    // `agent::serve`, sharing `recv_hello`).
-    let fn_key = recv_hello(&mut parent_rx).await?;
+    // Parent handshake: learn the job's function key and the run's heartbeat
+    // cadence (a leaf does the same in `agent::serve`, sharing `recv_hello`). The
+    // cadence is passed on to this relay's own children so the whole tree agrees.
+    let (fn_key, heartbeat) = recv_hello(&mut parent_rx).await?;
 
     // The uplink carries this subtree's observability up to the parent: the
     // children's `Profiled` and provisioning ladder are emitted to it during
@@ -556,6 +568,7 @@ where
         &latencies,
         false,
         &ActivationPolicy::ApproveAll,
+        heartbeat,
     )
     .await?;
 
@@ -591,9 +604,23 @@ where
         })
         .await?;
     let mut rescan = tokio::time::interval(RESCAN_INTERVAL);
+    // The heartbeat: this relay is both child and parent. It pings its own children
+    // each interval, and gives its parent up (tearing the subtree down) if it hears
+    // nothing from it within the timeout, so a crashed coordinator does not strand
+    // this subtree. The first tick is one interval out (a fast run sends none); a
+    // disabled heartbeat uses an inert period and a guarded-off branch. The clock is
+    // tokio's, so the timeout works under virtual time too.
+    let heartbeat_on = heartbeat.is_enabled();
+    let beat = heartbeat
+        .interval()
+        .max(std::time::Duration::from_millis(1));
+    let mut heartbeat_tick = tokio::time::interval_at(tokio::time::Instant::now() + beat, beat);
+    let mut last_parent = tokio::time::Instant::now();
     loop {
         tokio::select! {
-            from_parent = parent_rx.recv::<ToAgent>() => match from_parent? {
+            from_parent = parent_rx.recv::<ToAgent>() => {
+                last_parent = tokio::time::Instant::now();
+                match from_parent? {
                 Some(ToAgent::Assign { task_id, payload }) => {
                     sched.pending.push_back((task_id, payload));
                     sched.dispatch().await?;
@@ -618,6 +645,9 @@ where
                         break;
                     }
                 }
+                // A liveness probe from the parent: answer it so the parent knows
+                // this relay is alive.
+                Some(ToAgent::Ping) => parent_tx.send(&FromAgent::Pong).await?,
                 // A clean Shutdown or a dropped parent both end the relay.
                 Some(ToAgent::Shutdown) | None => break,
                 Some(other @ (ToAgent::Hello { .. } | ToAgent::Activate { .. })) => {
@@ -626,7 +656,8 @@ where
                         format!("unexpected message from parent: {other:?}"),
                     ));
                 }
-            },
+                }
+            }
             from_child = child_events_rx.recv() => {
                 let event = from_child
                     .expect("the relay holds a child events sender for the loop's lifetime");
@@ -647,7 +678,8 @@ where
                         launch_all(std::slice::from_ref(&launcher), None, None, &uplink_sink).await;
                     guards.extend(new_guards);
                     for (label, conn) in agents {
-                        let Ok(joiner) = handshake_join(label, conn, &fn_key).await else {
+                        let Ok(joiner) = handshake_join(label, conn, &fn_key, heartbeat).await
+                        else {
                             continue;
                         };
                         let child = sched.senders.len();
@@ -659,6 +691,7 @@ where
                         sched.paused.push(false);
                         sched.draining.push(false);
                         sched.load.push(0);
+                        sched.last_activity.push(tokio::time::Instant::now());
                         readers.push(spawn_reader(joiner.rx, child, child_events_tx.clone()));
                         sched.report(child, NodeState::Idle);
                         parent_tx
@@ -667,6 +700,37 @@ where
                             })
                             .await?;
                         sched.dispatch().await?;
+                    }
+                }
+            }
+            _ = heartbeat_tick.tick(), if heartbeat_on => {
+                // Ping each live child so it knows this relay is alive...
+                for child in 0..sched.senders.len() {
+                    if sched.alive[child] {
+                        let _ = sched.senders[child].send(&ToAgent::Ping).await;
+                    }
+                }
+                // ...and give the parent up if it has gone silent, tearing this
+                // subtree down (the shutdown below) rather than stranding it.
+                if last_parent.elapsed() > heartbeat.timeout() {
+                    break;
+                }
+                // Reroute any child silent past the timeout: its work moves to the
+                // survivors, the same as a dropped child.
+                let timeout = heartbeat.timeout();
+                let stale: Vec<usize> = (0..sched.senders.len())
+                    .filter(|&c| sched.alive[c] && sched.last_activity[c].elapsed() > timeout)
+                    .collect();
+                if !stale.is_empty() {
+                    for child in stale {
+                        sched.on_lost(child);
+                        // A child lost to the heartbeat is half-open (no EOF), so end
+                        // its reader; it would otherwise stay parked until teardown.
+                        readers[child].abort();
+                    }
+                    sched.dispatch().await?;
+                    if !sched.any_alive_child() {
+                        break;
                     }
                 }
             }
@@ -762,6 +826,49 @@ mod tests {
             let client =
                 Connection::new(FaultInjector::cut_reads_after(client_raw, self.cut_after));
             let task = tokio::spawn(serve(Connection::new(server_raw), self.registry.clone()));
+            Ok((client, task))
+        }
+    }
+
+    /// A leaf that is either healthy (`Some` registry, a normal `serve`) or, with
+    /// `None`, completes the handshake and then goes silent: it reads and discards
+    /// whatever the relay sends (so the relay's pings never block) but never
+    /// answers, modelling a leaf that has hard-crashed without closing its socket.
+    struct TestLeaf {
+        label: String,
+        registry: Option<Registry>,
+    }
+
+    impl Launch for TestLeaf {
+        type Stream = DuplexStream;
+        type Guard = JoinHandle<std::io::Result<()>>;
+        type Session = ();
+
+        fn label(&self) -> String {
+            self.label.clone()
+        }
+
+        async fn connect(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        async fn activate(
+            &self,
+            _session: (),
+            _events: &dyn EventSink,
+        ) -> std::io::Result<(Connection<DuplexStream>, Self::Guard)> {
+            let (client, server) = connection_pair(256);
+            let task: JoinHandle<std::io::Result<()>> = match self.registry.clone() {
+                Some(registry) => tokio::spawn(serve(server, registry)),
+                None => tokio::spawn(async move {
+                    let (mut tx, mut rx) = server.split();
+                    if rx.recv::<ToAgent>().await?.is_some() {
+                        tx.send(&FromAgent::Ready { slots: 1 }).await?;
+                    }
+                    while rx.recv::<ToAgent>().await?.is_some() {}
+                    Ok(())
+                }),
+            };
             Ok((client, task))
         }
     }
@@ -1330,6 +1437,7 @@ mod tests {
             tx.send(&ToAgent::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 fn_key: "id".to_string(),
+                heartbeat: crate::heartbeat::HeartbeatConfig::default(),
             })
             .await
             .unwrap();
@@ -1355,6 +1463,7 @@ mod tests {
             tx.send(&ToAgent::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 fn_key: "id".to_string(),
+                heartbeat: crate::heartbeat::HeartbeatConfig::default(),
             })
             .await
             .unwrap();
@@ -1393,6 +1502,7 @@ mod tests {
             RunOptions {
                 require_redundancy: true,
                 speculative: false,
+                heartbeat: crate::heartbeat::HeartbeatConfig::default(),
             },
             &NoopSink,
         )
@@ -1422,6 +1532,7 @@ mod tests {
             RunOptions {
                 require_redundancy: true,
                 speculative: false,
+                heartbeat: crate::heartbeat::HeartbeatConfig::default(),
             },
             &NoopSink,
         )
@@ -1463,6 +1574,7 @@ mod tests {
             tx.send(&ToAgent::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 fn_key: "id".to_string(),
+                heartbeat: crate::heartbeat::HeartbeatConfig::default(),
             })
             .await
             .unwrap();
@@ -1484,6 +1596,7 @@ mod tests {
             tx.send(&ToAgent::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 fn_key: "id".to_string(),
+                heartbeat: crate::heartbeat::HeartbeatConfig::default(),
             })
             .await
             .unwrap();
@@ -1506,6 +1619,7 @@ mod tests {
             tx.send(&ToAgent::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 fn_key: "id".to_string(),
+                heartbeat: crate::heartbeat::HeartbeatConfig::default(),
             })
             .await
             .unwrap();
@@ -1547,6 +1661,7 @@ mod tests {
             tx.send(&ToAgent::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 fn_key: "id".to_string(),
+                heartbeat: crate::heartbeat::HeartbeatConfig::default(),
             })
             .await
             .unwrap();
@@ -1580,6 +1695,121 @@ mod tests {
         ];
         let (coord_side, relay_side) = connection_pair(4096);
         (coord_side, relay(relay_side, children))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_tears_down_when_its_parent_goes_silent() {
+        use crate::heartbeat::HeartbeatConfig;
+        let children = vec![LocalAgent::new(
+            "leaf",
+            Registry::new().with("id", handler(double)),
+        )];
+        let (coord_side, relay_side) = connection_pair(4096);
+        let relay_fut = relay(relay_side, children);
+        let driver = async {
+            let (mut tx, mut rx) = coord_side.split();
+            tx.send(&ToAgent::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                fn_key: "id".to_string(),
+                heartbeat: HeartbeatConfig::new(
+                    std::time::Duration::from_millis(50),
+                    std::time::Duration::from_millis(200),
+                ),
+            })
+            .await
+            .unwrap();
+            // Handshake: the relay announces its child, we activate it, it readies.
+            loop {
+                match rx.recv::<FromAgent>().await.ok().flatten() {
+                    Some(FromAgent::Discovered { children }) => {
+                        let active = children.iter().map(|c| c.label().to_string()).collect();
+                        tx.send(&ToAgent::Activate { active }).await.unwrap();
+                    }
+                    Some(FromAgent::Ready { .. }) => break,
+                    Some(_) => {}
+                    None => return,
+                }
+            }
+            // The relay answers a ping with a pong (its child-side liveness reply).
+            tx.send(&ToAgent::Ping).await.unwrap();
+            loop {
+                match rx.recv::<FromAgent>().await.ok().flatten() {
+                    Some(FromAgent::Pong) => break,
+                    Some(_) => {}
+                    None => return,
+                }
+            }
+            // Now go silent (keep the connection open). The relay gives us up within
+            // the timeout and tears its subtree down; drain until it closes.
+            while rx.recv::<FromAgent>().await.ok().flatten().is_some() {}
+        };
+        let (relay_res, ()) = tokio::join!(relay_fut, driver);
+        assert!(
+            relay_res.is_ok(),
+            "the relay tears down cleanly on parent silence: {relay_res:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_relays_healthy_leaf_absorbs_a_silent_sibling() {
+        use crate::coordinator::{
+            decode_output, run_job_raw_with_joins, serialize_inputs, RunOptions,
+        };
+        use crate::heartbeat::HeartbeatConfig;
+        use crate::observability::{NodeState, RunState};
+        use crate::testing::EventRecorder;
+        use tokio::sync::mpsc;
+
+        // A relay over a healthy leaf-a and a silent leaf-b. The heartbeat config
+        // travels down in the Hello, so the relay pings both children; leaf-b never
+        // pongs, so the relay reroutes its work to leaf-a and the run completes.
+        let children = vec![
+            TestLeaf {
+                label: "leaf-a".to_string(),
+                registry: Some(Registry::new().with("double", handler(double))),
+            },
+            TestLeaf {
+                label: "leaf-b".to_string(),
+                registry: None,
+            },
+        ];
+        let (coord_side, relay_side) = connection_pair(4096);
+        let relay_fut = relay(relay_side, children);
+        let recorder = EventRecorder::default();
+        let (joins_tx, joins_rx) = mpsc::unbounded_channel();
+        drop(joins_tx);
+        let (controls_tx, controls_rx) = mpsc::unbounded_channel();
+        drop(controls_tx);
+        let payloads = serialize_inputs(&(0..6u32).collect::<Vec<_>>()).unwrap();
+        let options = RunOptions {
+            require_redundancy: false,
+            speculative: false,
+            heartbeat: HeartbeatConfig::new(
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_millis(200),
+            ),
+        };
+        let coord_fut = run_job_raw_with_joins(
+            vec![("relay".to_string(), coord_side)],
+            "double",
+            payloads,
+            &[],
+            options,
+            joins_rx,
+            controls_rx,
+            &recorder,
+        );
+        let (relay_res, raw) = tokio::join!(relay_fut, coord_fut);
+        relay_res.unwrap();
+        let outs: Vec<Result<u32, String>> =
+            raw.unwrap().into_iter().map(decode_output::<u32>).collect();
+        assert_eq!(outs, (0..6u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+        let mut state = RunState::default();
+        for event in &recorder.events() {
+            state.apply(event);
+        }
+        assert_eq!(state.nodes()["relay/leaf-b"].state(), NodeState::Lost);
+        assert_eq!(state.nodes()["relay/leaf-a"].completed(), 6);
     }
 
     #[tokio::test]

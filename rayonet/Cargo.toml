@@ -42,6 +42,10 @@ proptest = "1"
 # JSON to read the trace. Both are test-only.
 ratatui = "0.29"
 serde_json = "1"
+# `test-util` adds `tokio::time::pause`/`advance` so the heartbeat's timeouts can
+# be tested deterministically (`#[tokio::test(start_paused = true)]`) without
+# real-time sleeps.
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [lints]
 workspace = true

@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 
 use crate::control::{Control, ControlAction, KillMode};
 use crate::framing::{Connection, Receiver, Sender};
+use crate::heartbeat::HeartbeatConfig;
 use crate::observability::{join_label, Event as Obs, EventSink, NodeState};
 use crate::protocol::{ChildAd, FromAgent, TaskId, ToAgent, PROTOCOL_VERSION};
 
@@ -178,6 +179,7 @@ pub(crate) async fn handshake_join<S>(
     label: String,
     conn: Connection<S>,
     fn_key: &str,
+    heartbeat: HeartbeatConfig,
 ) -> std::io::Result<Joiner<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -186,6 +188,7 @@ where
     tx.send(&ToAgent::Hello {
         protocol_version: PROTOCOL_VERSION,
         fn_key: fn_key.to_string(),
+        heartbeat,
     })
     .await?;
     let capacity = match rx.recv::<FromAgent>().await? {
@@ -222,6 +225,7 @@ pub(crate) async fn connect_agents<S>(
     agent_latencies: &[u64],
     require_redundancy: bool,
     policy: &ActivationPolicy,
+    heartbeat: HeartbeatConfig,
 ) -> std::io::Result<Agents<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -234,6 +238,7 @@ where
         tx.send(&ToAgent::Hello {
             protocol_version: PROTOCOL_VERSION,
             fn_key: fn_key.to_string(),
+            heartbeat,
         })
         .await?;
         let report = match rx.recv::<FromAgent>().await? {
@@ -306,6 +311,9 @@ pub(crate) struct RunOptions {
     /// When no task is pending but some are still in flight, let an idle node
     /// re-run a straggler and race it (first result wins, deduped). Off by default.
     pub(crate) speculative: bool,
+    /// The liveness heartbeat cadence for this run, carried to every node so a
+    /// crashed parent's children tear down and a crashed child is rerouted.
+    pub(crate) heartbeat: HeartbeatConfig,
 }
 
 /// Mutable scheduling state for one run.
@@ -334,6 +342,9 @@ struct Job<S> {
     /// Whether each agent is draining toward a kill: handed no new work, and
     /// dropped once its in-flight tasks finish.
     draining: Vec<bool>,
+    /// When each agent was last heard from (any message, including a pong),
+    /// on tokio's clock. The heartbeat reroutes an agent silent past the timeout.
+    last_activity: Vec<tokio::time::Instant>,
     pending: VecDeque<usize>,
     /// `task_id` -> (input index, the agents running it). Usually one agent; with
     /// speculation a straggler is raced on a second, so the first terminal frees
@@ -488,6 +499,11 @@ where
     /// # Errors
     /// Returns an error on a protocol violation or a transport failure.
     async fn on_event(&mut self, event: Event, events: &dyn EventSink) -> std::io::Result<()> {
+        // Any message is proof of life: refresh the agent's activity so the
+        // heartbeat does not reroute a busy or responsive node.
+        if let Event::Message(agent, _) = &event {
+            self.last_activity[*agent] = tokio::time::Instant::now();
+        }
         match event {
             Event::Message(_, FromAgent::Ready { .. } | FromAgent::Discovered { .. }) => {
                 // Ready and Discovered are handshake messages, so seeing one on
@@ -497,6 +513,9 @@ where
                     "agent sent a handshake message more than once",
                 ));
             }
+            // A pong is a pure liveness signal; receiving it (like any message)
+            // already refreshed the agent's activity, so nothing else to do.
+            Event::Message(_, FromAgent::Pong) => {}
             // A promoted relay reports its larger capacity after reroute: fold it
             // in and feed it the requeued work, marking it working if it took any.
             Event::Message(agent, FromAgent::Capacity { slots }) => {
@@ -567,6 +586,10 @@ where
             return Ok(());
         }
         events.emit(Obs::node(&self.labels[agent], NodeState::Lost));
+        // End the reader: on a clean drop it has already finished, but a node lost
+        // to the heartbeat is half-open (no EOF), so its reader would otherwise stay
+        // parked holding an events sender and keep the teardown drain from ending.
+        self.readers[agent].abort();
         self.requeue_lost(agent);
         self.reroute().await?;
         for survivor in 0..self.senders.len() {
@@ -792,6 +815,7 @@ where
         agent_latencies,
         options.require_redundancy,
         &ActivationPolicy::DedupById,
+        options.heartbeat,
     )
     .await?;
 
@@ -806,6 +830,7 @@ where
         alive: vec![true; agent_count],
         paused: vec![false; agent_count],
         draining: vec![false; agent_count],
+        last_activity: vec![tokio::time::Instant::now(); agent_count],
         pending: (0..num_tasks).collect(),
         assigned: HashMap::new(),
         results: (0..num_tasks).map(|_| None).collect(),
@@ -829,6 +854,16 @@ where
     // A closed controls channel returns `None` immediately, so guard the branch to
     // keep `select!` from spinning on it once no controller can send.
     let mut controls_open = true;
+    // The heartbeat: ping every live agent each interval so it knows the
+    // coordinator is alive (its first tick is one interval out, so a fast run that
+    // finishes before then sends none). A disabled heartbeat uses an inert period
+    // and a guarded-off branch.
+    let heartbeat_on = options.heartbeat.is_enabled();
+    let beat = options.heartbeat.interval();
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + beat.max(std::time::Duration::from_millis(1)),
+        beat.max(std::time::Duration::from_millis(1)),
+    );
     loop {
         if job.remaining == 0 {
             break;
@@ -864,6 +899,7 @@ where
                     job.alive.push(true);
                     job.paused.push(false);
                     job.draining.push(false);
+                    job.last_activity.push(tokio::time::Instant::now());
                     job.in_flight.push(0);
                     job.readers
                         .push(spawn_reader(joiner.rx, agent, events_tx.clone()));
@@ -874,6 +910,23 @@ where
                 }
                 None => joins_open = false,
             },
+            _ = heartbeat.tick(), if heartbeat_on => {
+                // Ping every live agent so it (and its subtree) knows we are alive.
+                for agent in 0..job.senders.len() {
+                    if job.alive[agent] {
+                        let _ = job.senders[agent].send(&ToAgent::Ping).await;
+                    }
+                }
+                // Reroute any agent silent past the timeout: it gets the same lost
+                // treatment a dropped connection would, but seconds sooner than the
+                // OS would notice a half-open socket.
+                let timeout = options.heartbeat.timeout();
+                for agent in 0..job.senders.len() {
+                    if job.alive[agent] && job.last_activity[agent].elapsed() > timeout {
+                        job.lose(agent, events).await?;
+                    }
+                }
+            }
         }
     }
 
@@ -1576,6 +1629,7 @@ mod tests {
             super::RunOptions {
                 require_redundancy: false,
                 speculative: true,
+                heartbeat: crate::heartbeat::HeartbeatConfig::default(),
             },
             joins_rx,
             no_controls(),
@@ -1634,9 +1688,14 @@ mod tests {
                 join_server,
                 Registry::new().with("slow", handler(slow_double)),
             ));
-            let joiner = super::handshake_join("joiner".to_string(), join_client, "slow")
-                .await
-                .unwrap();
+            let joiner = super::handshake_join(
+                "joiner".to_string(),
+                join_client,
+                "slow",
+                crate::heartbeat::HeartbeatConfig::default(),
+            )
+            .await
+            .unwrap();
             joins_tx.send(joiner).unwrap();
             drop(joins_tx);
         };
@@ -1714,9 +1773,14 @@ mod tests {
                     .unwrap();
                 }
             });
-            let joiner = super::handshake_join("relay".to_string(), relay_client, "slow")
-                .await
-                .unwrap();
+            let joiner = super::handshake_join(
+                "relay".to_string(),
+                relay_client,
+                "slow",
+                crate::heartbeat::HeartbeatConfig::default(),
+            )
+            .await
+            .unwrap();
             joins_tx.send(joiner).unwrap();
             drop(joins_tx);
         };
@@ -1741,7 +1805,14 @@ mod tests {
             .await
             .unwrap();
         });
-        let Err(err) = super::handshake_join("bad".to_string(), client, "id").await else {
+        let Err(err) = super::handshake_join(
+            "bad".to_string(),
+            client,
+            "id",
+            crate::heartbeat::HeartbeatConfig::default(),
+        )
+        .await
+        else {
             panic!("a bad first reply must be rejected");
         };
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -1764,7 +1835,14 @@ mod tests {
             let _activate = rx.recv::<ToAgent>().await;
             tx.send(&FromAgent::Started { task_id: 0 }).await.unwrap();
         });
-        let Err(err) = super::handshake_join("relay".to_string(), client, "id").await else {
+        let Err(err) = super::handshake_join(
+            "relay".to_string(),
+            client,
+            "id",
+            crate::heartbeat::HeartbeatConfig::default(),
+        )
+        .await
+        else {
             panic!("a relay that does not ready after activate must be rejected");
         };
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -1808,6 +1886,138 @@ mod tests {
         let (res, ()) = tokio::join!(run, driver);
         let err = res.unwrap_err();
         assert!(err.to_string().contains("no node could join"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_pong_on_the_live_channel_is_tolerated() {
+        // A liveness pong is not a task event; the run absorbs it and finishes.
+        let (client, server) = connection_pair(64);
+        let fake = tokio::spawn(async move {
+            let (mut tx, mut rx) = server.split();
+            let _hello: ToAgent = rx.recv().await.unwrap().unwrap();
+            tx.send(&FromAgent::Ready { slots: 1 }).await.unwrap();
+            tx.send(&FromAgent::Pong).await.unwrap();
+            let _assign: ToAgent = rx.recv().await.unwrap().unwrap();
+            tx.send(&FromAgent::Completed {
+                task_id: 0,
+                output: postcard::to_allocvec(&7u32).unwrap(),
+                via: String::new(),
+            })
+            .await
+            .unwrap();
+            let _shutdown: ToAgent = rx.recv().await.unwrap().unwrap();
+        });
+        let out: Vec<Result<u32, String>> = run(vec![client], "k", vec![7u32]).await.unwrap();
+        fake.await.unwrap();
+        assert_eq!(out, vec![Ok(7)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_coordinator_pings_a_live_agent() {
+        use crate::heartbeat::HeartbeatConfig;
+        // A fake agent readies and takes its task, then must receive a Ping before
+        // it completes: proof the coordinator heartbeats a live, idle-ish agent.
+        let (client, server) = connection_pair(64);
+        let fake = tokio::spawn(async move {
+            let (mut tx, mut rx) = server.split();
+            let _hello: ToAgent = rx.recv().await.unwrap().unwrap();
+            tx.send(&FromAgent::Ready { slots: 1 }).await.unwrap();
+            let _assign: ToAgent = rx.recv().await.unwrap().unwrap();
+            let next: ToAgent = rx.recv().await.unwrap().unwrap();
+            assert!(
+                matches!(next, ToAgent::Ping),
+                "expected a Ping, got {next:?}"
+            );
+            tx.send(&FromAgent::Completed {
+                task_id: 0,
+                output: postcard::to_allocvec(&0u32).unwrap(),
+                via: String::new(),
+            })
+            .await
+            .unwrap();
+            let _shutdown = rx.recv::<ToAgent>().await;
+        });
+        let (joins_tx, joins_rx) = mpsc::unbounded_channel();
+        drop(joins_tx);
+        let payloads = super::serialize_inputs(&[0u32]).unwrap();
+        let options = super::RunOptions {
+            require_redundancy: false,
+            speculative: false,
+            heartbeat: HeartbeatConfig::new(
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_secs(10),
+            ),
+        };
+        let raw = super::run_job_raw_with_joins(
+            vec![("a".to_string(), client)],
+            "k",
+            payloads,
+            &[],
+            options,
+            joins_rx,
+            no_controls(),
+            &NoopSink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(raw.len(), 1);
+        fake.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_coordinator_reroutes_an_agent_that_stops_responding() {
+        use crate::heartbeat::HeartbeatConfig;
+        use crate::observability::{NodeState, RunState};
+        use crate::testing::EventRecorder;
+        // "a" readies, then goes silent (reads but never answers, so its connection
+        // stays half-open: no EOF). "b" is healthy. The heartbeat detects "a" silent
+        // past the timeout, reroutes its work to "b", and the run still completes.
+        let (a_client, a_server) = connection_pair(256);
+        let silent_a = tokio::spawn(async move {
+            let (mut tx, mut rx) = a_server.split();
+            let _hello: ToAgent = rx.recv().await.unwrap().unwrap();
+            tx.send(&FromAgent::Ready { slots: 1 }).await.unwrap();
+            // Read and discard whatever arrives (an assign, then pings) but never
+            // answer, simulating a node that has hard-crashed without closing.
+            while rx.recv::<ToAgent>().await.unwrap_or(None).is_some() {}
+        });
+        let (b_client, b_server) = connection_pair(256);
+        tokio::spawn(serve(
+            b_server,
+            Registry::new().with("id", handler(|x: u32| x)),
+        ));
+        let recorder = EventRecorder::default();
+        let agents = vec![("a".to_string(), a_client), ("b".to_string(), b_client)];
+        let payloads = super::serialize_inputs(&(0..6u32).collect::<Vec<_>>()).unwrap();
+        let (joins_tx, joins_rx) = mpsc::unbounded_channel();
+        drop(joins_tx);
+        let options = super::RunOptions {
+            require_redundancy: false,
+            speculative: false,
+            heartbeat: HeartbeatConfig::new(
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_millis(200),
+            ),
+        };
+        let raw = super::run_job_raw_with_joins(
+            agents,
+            "id",
+            payloads,
+            &[],
+            options,
+            joins_rx,
+            no_controls(),
+            &recorder,
+        )
+        .await
+        .unwrap();
+        assert_eq!(raw.len(), 6, "every task completes once a is rerouted");
+        let mut state = RunState::default();
+        for event in &recorder.events() {
+            state.apply(event);
+        }
+        assert_eq!(state.nodes()["a"].state(), NodeState::Lost);
+        silent_a.abort();
     }
 
     #[tokio::test]

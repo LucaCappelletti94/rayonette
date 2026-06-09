@@ -79,7 +79,9 @@ pub fn fn_key<F: ?Sized>(_f: &F) -> &'static str {
 /// # Errors
 /// Returns an error on a protocol-version mismatch or any message other than
 /// `Hello` (including a closed stream).
-pub(crate) async fn recv_hello<S>(rx: &mut Receiver<S>) -> std::io::Result<String>
+pub(crate) async fn recv_hello<S>(
+    rx: &mut Receiver<S>,
+) -> std::io::Result<(String, crate::heartbeat::HeartbeatConfig)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -87,6 +89,7 @@ where
         Some(ToAgent::Hello {
             protocol_version,
             fn_key,
+            heartbeat,
         }) => {
             if protocol_version != PROTOCOL_VERSION {
                 return Err(std::io::Error::new(
@@ -94,7 +97,7 @@ where
                     format!("protocol mismatch: local {PROTOCOL_VERSION}, peer {protocol_version}"),
                 ));
             }
-            Ok(fn_key)
+            Ok((fn_key, heartbeat))
         }
         other => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -177,7 +180,7 @@ where
 {
     let (mut tx, mut rx) = conn.split();
 
-    let fn_key = recv_hello(&mut rx).await?;
+    let (fn_key, heartbeat) = recv_hello(&mut rx).await?;
 
     let handler = registry.get(&fn_key).cloned().ok_or_else(|| {
         std::io::Error::new(
@@ -193,8 +196,20 @@ where
     let mut last_sample = Instant::now();
 
     // One task at a time: read an assignment, run it on the blocking pool, and
-    // report its outcome before reading the next message.
-    while let Some(message) = rx.recv::<ToAgent>().await? {
+    // report its outcome before reading the next message. With the heartbeat on,
+    // each read is bounded by the silence timeout: if the parent sends nothing
+    // (not even a ping) within it, the parent is gone and the leaf exits rather
+    // than blocking forever on a half-open connection.
+    loop {
+        let next = if heartbeat.is_enabled() {
+            match tokio::time::timeout(heartbeat.timeout(), rx.recv::<ToAgent>()).await {
+                Ok(received) => received?,
+                Err(_elapsed) => break,
+            }
+        } else {
+            rx.recv::<ToAgent>().await?
+        };
+        let Some(message) = next else { break };
         match message {
             ToAgent::Assign { task_id, payload } => {
                 tx.send(&FromAgent::Started { task_id }).await?;
@@ -245,6 +260,8 @@ where
                         .await?;
                 }
             }
+            // A liveness probe: answer it so the parent knows the leaf is alive.
+            ToAgent::Ping => tx.send(&FromAgent::Pong).await?,
             ToAgent::Shutdown => break,
             // A leaf has no children, so it never readies via the relay handshake
             // and the coordinator never sends it an active-set, a promotion, or a
@@ -302,6 +319,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recv_hello_returns_the_heartbeat_config() {
+        use crate::heartbeat::HeartbeatConfig;
+        let config = HeartbeatConfig::new(Duration::from_secs(2), Duration::from_secs(7));
+        let (client, server) = connection_pair(64);
+        let (mut tx, _crx) = client.split();
+        tx.send(&ToAgent::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            fn_key: "k".to_string(),
+            heartbeat: config,
+        })
+        .await
+        .unwrap();
+        let (_stx, mut srx) = server.split();
+        let (fn_key, got) = super::recv_hello(&mut srx).await.unwrap();
+        assert_eq!(fn_key, "k");
+        assert_eq!(got, config);
+    }
+
+    #[tokio::test]
+    async fn a_leaf_answers_a_ping_with_a_pong() {
+        let (client, server) = connection_pair(256);
+        let agent = tokio::spawn(serve(
+            server,
+            Registry::new().with("id", handler(|x: u32| x)),
+        ));
+        let (mut tx, mut rx) = client.split();
+        tx.send(&ToAgent::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            fn_key: "id".to_string(),
+            heartbeat: crate::heartbeat::HeartbeatConfig::default(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            next_report(&mut rx).await,
+            Some(FromAgent::Ready { slots: 1 })
+        );
+        tx.send(&ToAgent::Ping).await.unwrap();
+        assert_eq!(next_report(&mut rx).await, Some(FromAgent::Pong));
+        tx.send(&ToAgent::Shutdown).await.unwrap();
+        agent.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_leaf_tears_down_when_its_parent_goes_silent() {
+        use crate::heartbeat::HeartbeatConfig;
+        let (client, server) = connection_pair(256);
+        let agent = tokio::spawn(serve(
+            server,
+            Registry::new().with("id", handler(|x: u32| x)),
+        ));
+        let (mut tx, mut rx) = client.split();
+        tx.send(&ToAgent::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            fn_key: "id".to_string(),
+            heartbeat: HeartbeatConfig::new(Duration::from_millis(100), Duration::from_millis(300)),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            next_report(&mut rx).await,
+            Some(FromAgent::Ready { slots: 1 })
+        );
+        // Send nothing more, but keep the connection open (no EOF). With paused
+        // time, awaiting the agent advances to the silence timeout, at which point
+        // the leaf gives the silent parent up and exits cleanly rather than blocking.
+        let result = agent.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "the leaf exits cleanly on silence: {result:?}"
+        );
+        drop(tx);
+    }
+
+    #[tokio::test]
     async fn serve_reports_throttled_telemetry_around_a_long_task() {
         let (client, server) = connection_pair(256);
         let registry = Registry::new().with(
@@ -317,6 +409,7 @@ mod tests {
             tx.send(&ToAgent::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 fn_key: "slow".to_string(),
+                heartbeat: crate::heartbeat::HeartbeatConfig::default(),
             })
             .await
             .unwrap();
@@ -355,6 +448,7 @@ mod tests {
             tx.send(&ToAgent::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 fn_key: "doubler".to_string(),
+                heartbeat: crate::heartbeat::HeartbeatConfig::default(),
             })
             .await
             .unwrap();
@@ -407,6 +501,7 @@ mod tests {
             tx.send(&ToAgent::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 fn_key: "boom".to_string(),
+                heartbeat: crate::heartbeat::HeartbeatConfig::default(),
             })
             .await
             .unwrap();
@@ -467,6 +562,7 @@ mod tests {
             tx.send(&ToAgent::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 fn_key: "slow".to_string(),
+                heartbeat: crate::heartbeat::HeartbeatConfig::default(),
             })
             .await
             .unwrap();
@@ -510,6 +606,7 @@ mod tests {
             tx.send(&ToAgent::Hello {
                 protocol_version: PROTOCOL_VERSION + 1,
                 fn_key: "k".to_string(),
+                heartbeat: crate::heartbeat::HeartbeatConfig::default(),
             })
             .await
             .unwrap();
@@ -539,6 +636,7 @@ mod tests {
             tx.send(&ToAgent::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 fn_key: "unknown".to_string(),
+                heartbeat: crate::heartbeat::HeartbeatConfig::default(),
             })
             .await
             .unwrap();
@@ -556,6 +654,7 @@ mod tests {
             tx.send(&ToAgent::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 fn_key: "k".to_string(),
+                heartbeat: crate::heartbeat::HeartbeatConfig::default(),
             })
             .await
             .unwrap();
@@ -564,6 +663,7 @@ mod tests {
             tx.send(&ToAgent::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 fn_key: "k".to_string(),
+                heartbeat: crate::heartbeat::HeartbeatConfig::default(),
             })
             .await
             .unwrap();
