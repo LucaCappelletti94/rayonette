@@ -4,7 +4,7 @@
 //! A task fails only by panicking: each task runs
 //! under `catch_unwind` so a panic becomes a `Failed` message rather than
 //! tearing down the agent. The registry is generated from the consumer's
-//! source (see `rayonet_build`); in tests it is built by hand.
+//! source (see `rayonette_build`); in tests it is built by hand.
 
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};

@@ -1,6 +1,6 @@
 [package]
-name = "rayonet-build"
-description = "Build-time source extraction and codegen for rayonet (used in a consumer's build.rs)."
+name = "rayonette-build"
+description = "Build-time source extraction and codegen for rayonette (used in a consumer's build.rs)."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

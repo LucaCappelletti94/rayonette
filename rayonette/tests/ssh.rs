@@ -3,20 +3,20 @@
 //! These exercise the real openssh path against `localhost`. They are
 //! `#[ignore]`d so the default `cargo test` stays ssh-free; run them with
 //! `cargo test -- --include-ignored` on a host where this user can ssh into
-//! itself with the `rayonet_localhost_ed25519` key (CI sets that up).
+//! itself with the `rayonette_localhost_ed25519` key (CI sets that up).
 
-use rayonet::capability::Os;
-use rayonet::coordinator::run_job;
-use rayonet::fleet::Launch;
-use rayonet::observability::{NodeState, NoopSink};
-use rayonet::provisioning::{remote_agent_path, Remote};
-use rayonet::ssh::{Ssh, SshConfig, SshRemote};
-use rayonet::testing::EventRecorder as Recorder;
+use rayonette::capability::Os;
+use rayonette::coordinator::run_job;
+use rayonette::fleet::Launch;
+use rayonette::observability::{NodeState, NoopSink};
+use rayonette::provisioning::{remote_agent_path, Remote};
+use rayonette::ssh::{Ssh, SshConfig, SshRemote};
+use rayonette::testing::EventRecorder as Recorder;
 
 /// The dedicated test key's path.
 fn keyfile() -> String {
     let home = std::env::var("HOME").expect("HOME is set");
-    format!("{home}/.ssh/rayonet_localhost_ed25519")
+    format!("{home}/.ssh/rayonette_localhost_ed25519")
 }
 
 /// ssh into this same machine, authenticating with the dedicated test key.
@@ -28,11 +28,11 @@ fn localhost() -> SshConfig {
 #[ignore = "needs ssh localhost self-login; run with --include-ignored"]
 async fn ssh_remote_runs_a_command() {
     let remote = SshRemote::connect(&localhost()).await.unwrap();
-    let out = remote.run("echo hello-rayonet").await.unwrap();
+    let out = remote.run("echo hello-rayonette").await.unwrap();
     assert_eq!(out.status(), 0);
     assert_eq!(
         String::from_utf8_lossy(out.stdout()).trim(),
-        "hello-rayonet"
+        "hello-rayonette"
     );
 }
 
@@ -40,7 +40,7 @@ async fn ssh_remote_runs_a_command() {
 #[ignore = "needs ssh localhost self-login; run with --include-ignored"]
 async fn ssh_remote_uploads_and_rejects_bad_paths() {
     let remote = SshRemote::connect(&localhost()).await.unwrap();
-    let dest = "/tmp/rayonet-ssh-upload-test.bin";
+    let dest = "/tmp/rayonette-ssh-upload-test.bin";
     remote.upload(b"payload-bytes", dest).await.unwrap();
     let out = remote.run(&format!("cat {dest}")).await.unwrap();
     assert_eq!(out.stdout(), b"payload-bytes");
@@ -54,7 +54,7 @@ async fn ssh_remote_uploads_and_rejects_bad_paths() {
 #[tokio::test]
 #[ignore = "needs ssh localhost self-login; run with --include-ignored"]
 async fn ssh_launch_runs_a_task_end_to_end() {
-    let agent = env!("CARGO_BIN_EXE_rayonet-test-agent");
+    let agent = env!("CARGO_BIN_EXE_rayonette-test-agent");
     let ssh = Ssh::prebuilt(localhost(), agent);
     assert!(format!("{ssh:?}").contains("Ssh"));
     assert_eq!(ssh.label(), "localhost");
@@ -101,7 +101,7 @@ async fn ssh_remote_honors_an_explicit_port() {
 #[ignore = "needs ssh localhost self-login; run with --include-ignored"]
 async fn ssh_connect_to_unknown_host_errors() {
     // `.invalid` never resolves (RFC 6761), so the session fails to open.
-    let config = SshConfig::new("rayonet.invalid").keyfile("/nonexistent");
+    let config = SshConfig::new("rayonette.invalid").keyfile("/nonexistent");
     assert!(SshRemote::connect(&config).await.is_err());
 }
 
@@ -118,37 +118,37 @@ async fn ssh_build_with_warm_cache_provisions_and_runs() {
 
     // Reach localhost via an alias defined in a config file (exercises the
     // `ProxyJump`/config-file route used by the docker harness).
-    let config_path = std::env::temp_dir().join("rayonet-build-test-ssh-config");
+    let config_path = std::env::temp_dir().join("rayonette-build-test-ssh-config");
     std::fs::write(
         &config_path,
         format!(
-            "Host rayonet-local\n  HostName localhost\n  User {user}\n  \
+            "Host rayonette-local\n  HostName localhost\n  User {user}\n  \
              IdentityFile {key}\n  IdentitiesOnly yes\n  StrictHostKeyChecking no\n  \
              UserKnownHostsFile /dev/null\n",
             key = keyfile(),
         ),
     )
     .unwrap();
-    let config = SshConfig::new("rayonet-local").config_file(&config_path);
+    let config = SshConfig::new("rayonette-local").config_file(&config_path);
 
     // Seed the content-addressed cache with the test agent so provision hits it.
     // The cache path is keyed by this host's architecture, so resolve it by
     // probing the host the same way the provisioner does.
     let tar = b"warm-cache-seed".to_vec();
     let probe = SshRemote::connect(&config).await.unwrap();
-    let remote_path = remote_agent_path(&probe, &tar, "rayonet-test-agent").await;
+    let remote_path = remote_agent_path(&probe, &tar, "rayonette-test-agent").await;
     let local_path = remote_path.replace("$HOME", &home);
     let dir = std::path::Path::new(&local_path).parent().unwrap();
     std::fs::create_dir_all(dir).unwrap();
-    std::fs::copy(env!("CARGO_BIN_EXE_rayonet-test-agent"), &local_path).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_rayonette-test-agent"), &local_path).unwrap();
 
     let events = Recorder::default();
-    let ssh = Ssh::build(config, tar, "stable", "rayonet-test-agent");
+    let ssh = Ssh::build(config, tar, "stable", "rayonette-test-agent");
 
     let session = ssh.connect().await.unwrap();
     let (connection, guard) = ssh.activate(session, &events).await.unwrap();
     let out: Vec<Result<u32, String>> = run_job(
-        vec![("rayonet-local".to_string(), connection)],
+        vec![("rayonette-local".to_string(), connection)],
         "double",
         vec![5u32],
         &NoopSink,
@@ -160,6 +160,6 @@ async fn ssh_build_with_warm_cache_provisions_and_runs() {
     assert_eq!(out, vec![Ok(10)]);
     assert_eq!(events.states(), vec![NodeState::Probing, NodeState::Ready]);
 
-    let cache_root = format!("{home}/.cache/rayonet");
+    let cache_root = format!("{home}/.cache/rayonette");
     let _ = std::fs::remove_dir_all(&cache_root);
 }

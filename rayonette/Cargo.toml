@@ -1,5 +1,5 @@
 [package]
-name = "rayonet"
+name = "rayonette"
 description = "SSH-transport task distribution: fan task-parallel work across machines."
 version.workspace = true
 edition.workspace = true

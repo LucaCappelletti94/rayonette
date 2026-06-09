@@ -22,13 +22,13 @@ use crate::ssh::{parse_host_list, Ssh, SshConfig};
 ///
 /// The `registry` runs tasks when the node is a leaf; `source`, `binary_name`,
 /// and `toolchain` are the build inputs a relay cascades to its children (a relay
-/// re-ships the very `__rayonet_source()` bundle it was itself built from, so the
+/// re-ships the very `__rayonette_source()` bundle it was itself built from, so the
 /// content-addressed cache stays consistent down the tree).
 #[derive(Debug)]
 pub struct NodeConfig {
     /// The task handlers this node serves as a leaf.
     registry: Registry,
-    /// The crate source tarball to ship to children (a relay's `__rayonet_source()`).
+    /// The crate source tarball to ship to children (a relay's `__rayonette_source()`).
     source: Vec<u8>,
     /// The agent binary name to build on children.
     binary_name: String,
@@ -56,13 +56,13 @@ impl NodeConfig {
     }
 }
 
-/// The children file path: `$RAYONET_CHILDREN` if set, else
-/// `$HOME/.config/rayonet/children`.
+/// The children file path: `$RAYONETTE_CHILDREN` if set, else
+/// `$HOME/.config/rayonette/children`.
 fn children_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("RAYONET_CHILDREN") {
+    if let Some(path) = std::env::var_os("RAYONETTE_CHILDREN") {
         return Some(PathBuf::from(path));
     }
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/rayonet/children"))
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/rayonette/children"))
 }
 
 /// Read `path` as a host list, treating an absent or unreadable file as no
@@ -170,7 +170,7 @@ fn agent_exit_code(result: io::Result<()>) -> i32 {
     match result {
         Ok(()) => 0,
         Err(error) => {
-            eprintln!("rayonet agent: {error}");
+            eprintln!("rayonette agent: {error}");
             1
         }
     }
@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn file_child_source_yields_only_children_not_already_present() {
         let dir = std::env::temp_dir();
-        let file = dir.join("rayonet-childsource-test");
+        let file = dir.join("rayonette-childsource-test");
         std::fs::write(&file, "alpha\nbeta\n").unwrap();
         let mut source = FileChildSource {
             path: Some(file.clone()),
@@ -251,21 +251,21 @@ mod tests {
 
     #[test]
     fn children_path_and_loading_follow_the_env_override() {
-        // One serial test owns the RAYONET_CHILDREN env to avoid racing peers.
+        // One serial test owns the RAYONETTE_CHILDREN env to avoid racing peers.
         let dir = std::env::temp_dir();
-        let file = dir.join("rayonet-children-test");
+        let file = dir.join("rayonette-children-test");
         std::fs::write(&file, "mac\n# comment\nbox=~/.ssh/k\n").unwrap();
 
-        std::env::set_var("RAYONET_CHILDREN", &file);
+        std::env::set_var("RAYONETTE_CHILDREN", &file);
         assert_eq!(children_path(), Some(file.clone()));
         assert_eq!(load_children().len(), 2);
 
         // Without the override the path falls back under $HOME.
-        std::env::remove_var("RAYONET_CHILDREN");
+        std::env::remove_var("RAYONETTE_CHILDREN");
         std::env::set_var("HOME", "/home/test");
         let fallback = children_path().unwrap();
         assert!(
-            fallback.ends_with(".config/rayonet/children"),
+            fallback.ends_with(".config/rayonette/children"),
             "{fallback:?}"
         );
 
@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn a_missing_children_file_means_no_children() {
-        let missing = std::path::Path::new("/no/such/rayonet/children");
+        let missing = std::path::Path::new("/no/such/rayonette/children");
         assert!(super::read_children_file(missing).is_empty());
     }
 
@@ -342,7 +342,7 @@ mod tests {
     async fn a_node_with_children_takes_the_relay_path() {
         // A child on an unresolvable host fails to launch, so the relay finds no
         // usable child and errors: this drives the relay branch of dispatch.
-        let children = vec![SshConfig::new("rayonet-child.invalid")];
+        let children = vec![SshConfig::new("rayonette-child.invalid")];
         let (coord, node_side) = connection_pair(256);
         let node = dispatch(node_side, children, config(Registry::new()));
         let driver = async {

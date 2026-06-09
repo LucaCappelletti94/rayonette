@@ -12,23 +12,23 @@ set -uo pipefail
 TOPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$TOPO_DIR/../../.." && pwd)"
 SECRETS="$(cd "$TOPO_DIR/../secrets" && pwd)"
-BIN="$ROOT/target/release/rayonet-docker-consumer"
-CACHE_VOLUME=rayonet-topo-cache
+BIN="$ROOT/target/release/rayonette-docker-consumer"
+CACHE_VOLUME=rayonette-topo-cache
 
 # The kill and join scenarios need a run long enough for the event to land
 # mid-run. Locally that is a heavy CPU task (`crunch`) with a high count; CI
 # overrides these with the wall-clock `dawdle` task and a modest count, so the
 # timing holds on a slow shared runner without minutes of compute. Set
-# RAYONET_HEAVY_TASK / RAYONET_HEAVY_COUNT (the CI workflow does) to switch.
-HEAVY_TASK="${RAYONET_HEAVY_TASK:-crunch}"
-HEAVY_COUNT="${RAYONET_HEAVY_COUNT:-400}"
+# RAYONETTE_HEAVY_TASK / RAYONETTE_HEAVY_COUNT (the CI workflow does) to switch.
+HEAVY_TASK="${RAYONETTE_HEAVY_TASK:-crunch}"
+HEAVY_COUNT="${RAYONETTE_HEAVY_COUNT:-400}"
 
 # A child file entry pointing at <name> over the shared key (the bare label keeps
-# the path segment clean: relay/<name>, not relay/rayonet@<name>).
+# the path segment clean: relay/<name>, not relay/rayonette@<name>).
 child() { echo "$1=/secrets/id_ed25519"; }
 
 topo_setup() {
-  ( cd "$ROOT" && cargo build --release -p rayonet-docker-consumer >/dev/null 2>&1 ) \
+  ( cd "$ROOT" && cargo build --release -p rayonette-docker-consumer >/dev/null 2>&1 ) \
     || { echo "consumer build failed"; exit 1; }
   docker volume create "$CACHE_VOLUME" >/dev/null
 }
@@ -38,7 +38,7 @@ topo_write_config() { # file host=port...
   local file="$1"; shift
   {
     echo "Host *"
-    echo "  User rayonet"
+    echo "  User rayonette"
     echo "  IdentityFile $SECRETS/id_ed25519"
     echo "  IdentitiesOnly yes"
     echo "  StrictHostKeyChecking no"
@@ -78,23 +78,23 @@ topo_children() { # proj container child-entry...
   local body=""; local e
   for e in "$@"; do body="${body}${e}\n"; done
   docker exec "$proj-$container-1" sh -c \
-    "mkdir -p /home/rayonet/.config/rayonet \
-     && printf '%b' '$body' > /home/rayonet/.config/rayonet/children \
-     && chown -R rayonet:rayonet /home/rayonet/.config"
+    "mkdir -p /home/rayonette/.config/rayonette \
+     && printf '%b' '$body' > /home/rayonette/.config/rayonette/children \
+     && chown -R rayonette:rayonette /home/rayonette/.config"
 }
 
 topo_drive() { # config leaves task count [require]
   local config="$1" leaves="$2" task="$3" count="$4" require="${5:-}"
-  local -a vars=(RAYONET_SSH_CONFIG="$config" RAYONET_LEAVES="$leaves"
-                 RAYONET_TOOLCHAIN=stable RAYONET_TASK="$task" RAYONET_COUNT="$count")
-  [ -n "$require" ] && vars+=(RAYONET_REQUIRE_REDUNDANCY=1)
+  local -a vars=(RAYONETTE_SSH_CONFIG="$config" RAYONETTE_LEAVES="$leaves"
+                 RAYONETTE_TOOLCHAIN=stable RAYONETTE_TASK="$task" RAYONETTE_COUNT="$count")
+  [ -n "$require" ] && vars+=(RAYONETTE_REQUIRE_REDUNDANCY=1)
   # Forward the event-recording path if the caller set one, so a run can be
   # captured for TUI replay (see examples/tui-replay) without changing scenarios.
-  [ -n "${RAYONET_EVENT_LOG:-}" ] && vars+=(RAYONET_EVENT_LOG="$RAYONET_EVENT_LOG")
+  [ -n "${RAYONETTE_EVENT_LOG:-}" ] && vars+=(RAYONETTE_EVENT_LOG="$RAYONETTE_EVENT_LOG")
   # Forward the control socket if set, so a TUI attached with `--control` can
   # pause or kill nodes in this live run (the coordinator runs on the host, so the
   # socket is a host path the viewer can connect to).
-  [ -n "${RAYONET_CONTROL_SOCKET:-}" ] && vars+=(RAYONET_CONTROL_SOCKET="$RAYONET_CONTROL_SOCKET")
+  [ -n "${RAYONETTE_CONTROL_SOCKET:-}" ] && vars+=(RAYONETTE_CONTROL_SOCKET="$RAYONETTE_CONTROL_SOCKET")
   # Line-buffer stdout so the per-node state lines reach a piped log promptly,
   # which is what lets a kill scenario detect "Working" and fire mid-run. The
   # timeout is a backstop: a correct run finishes or fails in seconds, so if a
@@ -107,14 +107,14 @@ topo_drive() { # config leaves task count [require]
 # afterward provisions by cache hit (no recompiling, no concurrent-build races).
 # Idempotent: once the volume holds the binary this is a fast cache hit.
 topo_warm() {
-  local proj=rayonet-warm config=/tmp/rayonet-warm-config
+  local proj=rayonette-warm config=/tmp/rayonette-warm-config
   echo "warming the shared build cache (first time compiles, then cached)..."
   docker compose -p "$proj" -f "$TOPO_DIR/warm/compose.yml" up -d >/dev/null 2>&1
   topo_write_config "$config" "warm=2299"
   topo_wait "$config" warm || return 1
   topo_seed_ids "$proj" warm
-  topo_drive "$config" warm double 1 >/tmp/rayonet-warm.log 2>&1
+  topo_drive "$config" warm double 1 >/tmp/rayonette-warm.log 2>&1
   local rc=$?
   docker compose -p "$proj" -f "$TOPO_DIR/warm/compose.yml" down -t 2 >/dev/null 2>&1
-  [ "$rc" = 0 ] || { echo "warm-up failed (see /tmp/rayonet-warm.log)"; return 1; }
+  [ "$rc" = 0 ] || { echo "warm-up failed (see /tmp/rayonette-warm.log)"; return 1; }
 }

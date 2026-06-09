@@ -46,10 +46,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y openssh-server
           sudo service ssh start
-          ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/rayonet_localhost_ed25519"
-          cat "$HOME/.ssh/rayonet_localhost_ed25519.pub" >> "$HOME/.ssh/authorized_keys"
+          ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/rayonette_localhost_ed25519"
+          cat "$HOME/.ssh/rayonette_localhost_ed25519.pub" >> "$HOME/.ssh/authorized_keys"
           chmod 600 "$HOME/.ssh/authorized_keys"
-          ssh -i "$HOME/.ssh/rayonet_localhost_ed25519" -o StrictHostKeyChecking=accept-new -o BatchMode=yes localhost true
+          ssh -i "$HOME/.ssh/rayonette_localhost_ed25519" -o StrictHostKeyChecking=accept-new -o BatchMode=yes localhost true
       # 100% functions and ~100% lines are attainable; region coverage is
       # capped below 100% by generic monomorphization (per-type encode/decode
       # error arms that protocol types never exercise), not by dead code.

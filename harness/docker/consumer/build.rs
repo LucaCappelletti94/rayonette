@@ -1,6 +1,6 @@
 //! Build script: extracts the agent registry and source bundle this docker
-//! harness consumer embeds with `rayonet::embed_microcrates!()`.
+//! harness consumer embeds with `rayonette::embed_microcrates!()`.
 
 fn main() {
-    rayonet_build::extract().expect("rayonet_build::extract failed");
+    rayonette_build::extract().expect("rayonette_build::extract failed");
 }

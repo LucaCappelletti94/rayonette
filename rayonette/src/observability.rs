@@ -234,7 +234,7 @@ impl Event {
 /// One line of a recorded event stream: an [`Event`] plus the time it was emitted.
 ///
 /// A run can append these to a file (the docker consumer does, behind
-/// `RAYONET_EVENT_LOG`), and a viewer can replay them, pacing playback by
+/// `RAYONETTE_EVENT_LOG`), and a viewer can replay them, pacing playback by
 /// `elapsed_ms` (milliseconds since the run started), to watch the run unfold. The
 /// timestamp lives here rather than on [`Event`] so the live protocol is unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

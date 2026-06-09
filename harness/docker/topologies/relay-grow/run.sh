@@ -4,9 +4,9 @@
 # relay's file, and the relay's re-read launches it and splices it into the
 # subtree. This is R6 elastic membership one level below the coordinator's rejoin.
 source "$(dirname "$0")/../lib.sh"
-PROJ=rayonet-relay-grow
+PROJ=rayonette-relay-grow
 COMPOSE="$(dirname "$0")/compose.yml"
-config=/tmp/rayonet-relay-grow-config
+config=/tmp/rayonette-relay-grow-config
 fails=0
 cleanup() { [ "${KEEP:-0}" = 1 ] || docker compose -p "$PROJ" -f "$COMPOSE" down -t 2 >/dev/null 2>&1; }
 trap cleanup EXIT

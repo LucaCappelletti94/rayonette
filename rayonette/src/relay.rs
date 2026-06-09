@@ -766,7 +766,7 @@ fn no_usable_children(failures: &[io::Error]) -> io::Error {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("; ");
-    io::Error::other(format!("rayonet: relay has no usable children: {detail}"))
+    io::Error::other(format!("rayonette: relay has no usable children: {detail}"))
 }
 
 /// Send any queued subtree events (the `Done` reports `shutdown` just emitted) up

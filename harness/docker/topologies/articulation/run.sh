@@ -5,9 +5,9 @@
 # compute (the shared leaf via relayB), so the run still completes: losing an
 # articulation relay degrades gracefully as long as some compute survives.
 source "$(dirname "$0")/../lib.sh"
-PROJ=rayonet-articulation
+PROJ=rayonette-articulation
 COMPOSE="$(dirname "$0")/compose.yml"
-config=/tmp/rayonet-articulation-config
+config=/tmp/rayonette-articulation-config
 fails=0
 cleanup() { [ "${KEEP:-0}" = 1 ] || docker compose -p "$PROJ" -f "$COMPOSE" down -t 2 >/dev/null 2>&1; }
 trap cleanup EXIT

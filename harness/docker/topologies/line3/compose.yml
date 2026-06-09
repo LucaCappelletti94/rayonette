@@ -1,10 +1,10 @@
 # line3: coordinator -> relay1 -> relay2 -> leaf. A depth-3 cascade where each
 # relay bridges one network to the next, so the leaf is two hops from the
 # coordinator. relay2 is an interior bridge: killing it strands the leaf.
-name: rayonet-line3
+name: rayonette-line3
 
 volumes:
-  rayonet-topo-cache:
+  rayonette-topo-cache:
     external: true
 
 networks:
@@ -13,10 +13,10 @@ networks:
 
 x-agent: &agent
   init: true
-  image: rayonet-harness-base:latest
+  image: rayonette-harness-base:latest
   volumes:
     - ../../secrets:/secrets:ro
-    - rayonet-topo-cache:/home/rayonet/.cache
+    - rayonette-topo-cache:/home/rayonette/.cache
 
 services:
   relay1:

@@ -168,7 +168,10 @@ mod tests {
     async fn a_control_sent_over_the_socket_arrives_on_the_channel() {
         let dir = std::env::temp_dir();
         // A unique-enough path for this test process; the listener clears a stale one.
-        let path = dir.join(format!("rayonet-control-test-{}.sock", std::process::id()));
+        let path = dir.join(format!(
+            "rayonette-control-test-{}.sock",
+            std::process::id()
+        ));
         let (listener, mut rx) = ControlListener::bind(&path).unwrap();
         assert!(format!("{listener:?}").contains("ControlListener"));
 

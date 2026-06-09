@@ -19,7 +19,7 @@ CI runs all four (decision 29).
 
 **Goal:** the workspace, CI, and the encoding/framing every later test depends on.
 
-**Deliverables:** `rayonet` + `rayonet-build` workspace; CI skeleton; the `ToAgent`/`FromAgent` message enums (decision 23); postcard encoding + `tokio_util` length-delimited framing (decision 22); the in-process duplex transport and its fault-injecting wrapper.
+**Deliverables:** `rayonette` + `rayonette-build` workspace; CI skeleton; the `ToAgent`/`FromAgent` message enums (decision 23); postcard encoding + `tokio_util` length-delimited framing (decision 22); the in-process duplex transport and its fault-injecting wrapper.
 
 **Tests**
 - Unit/proptest: every message variant round-trips through postcard (`encode` then `decode` is identity), including edge payloads (empty, large, nested, non-string map keys, byte vectors).
@@ -69,14 +69,14 @@ CI runs all four (decision 29).
 
 **Goal:** the public surface and the codegen that makes it work, validated without shipping anything.
 
-**Deliverables:** `rayonet_build::extract()` (parse the consumer crate via `cargo metadata`/syn, bundle whole-crate source + Cargo.lock, build the `type_name` registry, write the `OUT_DIR` blob, emit rerun-if-changed); `embed_microcrates!()` (decision 11); the `.net_map` lazy job builder with `fn(T)->U` typing and `type_name` keying (decisions 5, 12); rayon composition (decision 6).
+**Deliverables:** `rayonette_build::extract()` (parse the consumer crate via `cargo metadata`/syn, bundle whole-crate source + Cargo.lock, build the `type_name` registry, write the `OUT_DIR` blob, emit rerun-if-changed); `embed_microcrates!()` (decision 11); the `.net_map` lazy job builder with `fn(T)->U` typing and `type_name` keying (decisions 5, 12); rayon composition (decision 6).
 
 **Tests (fixture consumer crate + in-process/subprocess)**
 - `extract()` on a fixture crate produces a blob containing the crate source and a copied lockfile; the generated registry maps `type_name::<evolve>()` to glue that deserializes, calls, and re-serializes.
 - A capturing closure fails to compile against `.net_map` (a `compile_fail` trybuild test), confirming decision 8.
 - `.net_map(evolve)` end to end (over the in-process or subprocess transport) returns an ordered `Vec` equal to a local `map`.
 - `.net_map` composes inside a rayon chain: `into_par_iter().map(..).net_map(..).map(..).reduce(..)` produces the correct reduction.
-- A fixture crate with a non-rayonet local `path = ".."` dependency makes `extract()` error with a message naming the offending crate (decision 15).
+- A fixture crate with a non-rayonette local `path = ".."` dependency makes `extract()` error with a message naming the offending crate (decision 15).
 
 **Done when:** a user can write `.net_map(f)` plus the one-line build.rs, and the produced bundle compiles and runs locally with correct ordered results and clear errors on the unsupported cases.
 
@@ -144,7 +144,7 @@ CI runs all four (decision 29).
 - Doc examples compile and run (`cargo test --doc`).
 - A soak test: a long multi-host run with periodic induced host kills finishes complete and correct.
 
-**Done when:** the Monte Carlo example runs on rayonet end to end, docs match behavior, and the full pyramid is green in CI.
+**Done when:** the Monte Carlo example runs on rayonette end to end, docs match behavior, and the full pyramid is green in CI.
 
 ---
 
@@ -187,8 +187,8 @@ Builds the relay tree of `DECISIONS.md` 32-43. The cross-phase criteria above st
 **Deliverables (delivered):**
 - The relay role (`relay.rs`): a node is an agent to its parent and a coordinator to its own children, splicing work down and `Started`/`Completed`/`Failed` straight up (task ids pass through), with a child's loss requeued onto its surviving siblings.
 - Per-agent capacity in the protocol: `Ready { slots }` plus a capacity-filled coordinator scheduler, so a relay keeps its whole subtree fed (demand-pull at the relay boundary).
-- The children file (`~/.config/rayonet/children`, or `$RAYONET_CHILDREN`) and boot-time role dispatch (`node::run_node`): a node with no children serves as a leaf, one with children runs the relay.
-- The provisioning cascade: a relay re-ships the `__rayonet_source()` bundle it was built from to its children and builds them with `Ssh::build`.
+- The children file (`~/.config/rayonette/children`, or `$RAYONETTE_CHILDREN`) and boot-time role dispatch (`node::run_node`): a node with no children serves as a leaf, one with children runs the relay.
+- The provisioning cascade: a relay re-ships the `__rayonette_source()` bundle it was built from to its children and builds them with `Ssh::build`.
 - `RelayOnly` honored: a relay forwards, it runs no tasks of its own.
 - No redundancy yet, so a relay whose subtree dies fails it (until R5).
 
@@ -210,7 +210,7 @@ Builds the relay tree of `DECISIONS.md` 32-43. The cross-phase criteria above st
 **Goal:** recursion to any depth.
 
 **Deliverables (delivered by R2's design, confirmed here):**
-- A relay's child may itself be a relay. This falls out of R2 with no new code: a relay launches each child with `Ssh::build` and the child boots through `node::run_node`, which reads its own children file and becomes a relay if it has one. Capacity (the `slots` sum) and results pass through each hop transparently, and a relay re-ships the `__rayonet_source()` it was built from, so the cascade recurses to any depth.
+- A relay's child may itself be a relay. This falls out of R2 with no new code: a relay launches each child with `Ssh::build` and the child boots through `node::run_node`, which reads its own children file and becomes a relay if it has one. Capacity (the `slots` sum) and results pass through each hop transparently, and a relay re-ships the `__rayonette_source()` it was built from, so the cascade recurses to any depth.
 - Provisioning order is respected for free: the cascade is recursively decentralized, so a node is built and running before it builds its own children. There is no central build DAG to order.
 - Nothing in R2 assumes depth 2 (the relay and node code are depth-agnostic).
 

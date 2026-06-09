@@ -398,7 +398,7 @@ pub(crate) fn no_eligible_host(failures: &[std::io::Error]) -> std::io::Error {
         .collect::<Vec<_>>()
         .join("; ");
     std::io::Error::other(format!(
-        "rayonet: no eligible host (every host failed to launch or was filtered out): {detail}"
+        "rayonette: no eligible host (every host failed to launch or was filtered out): {detail}"
     ))
 }
 
@@ -502,7 +502,7 @@ impl<L: Launch + Send + Sync> ErasedFleet for Fleet<L> {
 
 /// The control receiver that feeds the run loop, plus a guard to keep it alive.
 ///
-/// When `RAYONET_CONTROL_SOCKET` is set, binds a [`ControlListener`] there so a
+/// When `RAYONETTE_CONTROL_SOCKET` is set, binds a [`ControlListener`] there so a
 /// client can pause or kill nodes mid-run (the returned guard holds it open).
 /// Otherwise, or if binding fails, returns a closed channel that never yields, so
 /// the run behaves exactly as it did without control.
@@ -510,7 +510,7 @@ fn control_channel() -> (
     Option<crate::control::ControlListener>,
     mpsc::UnboundedReceiver<crate::control::Control>,
 ) {
-    if let Some(path) = std::env::var_os("RAYONET_CONTROL_SOCKET") {
+    if let Some(path) = std::env::var_os("RAYONETTE_CONTROL_SOCKET") {
         if let Ok((listener, rx)) = crate::control::ControlListener::bind(path) {
             return (Some(listener), rx);
         }
@@ -649,7 +649,7 @@ where
             RunnerRef::Global => {
                 let fleet = global_fleet().ok_or_else(|| {
                     std::io::Error::other(
-                        "rayonet: no global fleet installed; call rayonet::install_fleet(fleet) or use net_map_with_fleet",
+                        "rayonette: no global fleet installed; call rayonette::install_fleet(fleet) or use net_map_with_fleet",
                     )
                 })?;
                 fleet
@@ -742,7 +742,7 @@ pub trait NetMapExt: IntoIterator + Sized {
     /// # Examples
     /// A capturing closure is rejected at compile time:
     /// ```compile_fail
-    /// use rayonet::fleet::NetMapExt;
+    /// use rayonette::fleet::NetMapExt;
     /// let captured = 10u32;
     /// let _ = std::iter::once(1u32).net_map(move |x: u32| x + captured);
     /// ```

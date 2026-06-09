@@ -14,9 +14,9 @@ use tokio::task::JoinHandle;
 use crate::framing::Connection;
 
 /// Environment marker the coordinator sets when launching an agent.
-pub(crate) const AGENT_ENV: &str = "RAYONET_AGENT";
+pub(crate) const AGENT_ENV: &str = "RAYONETTE_AGENT";
 
-/// True when this process was launched as a rayonet agent.
+/// True when this process was launched as a rayonette agent.
 #[must_use]
 pub fn is_agent() -> bool {
     std::env::var_os(AGENT_ENV).is_some()
@@ -85,7 +85,7 @@ impl AgentProcess {
     }
 }
 
-/// Launch `command` as a rayonet agent: set the agent marker, pipe stdio, and
+/// Launch `command` as a rayonette agent: set the agent marker, pipe stdio, and
 /// return a connection over the child plus its captured-stderr handle.
 ///
 /// # Errors

@@ -1,12 +1,12 @@
-# Monte Carlo with rayonet
+# Monte Carlo with rayonette
 
-Estimate pi by Monte Carlo, distributed across a small local docker "swarm" with rayonet. Each task draws millions of random points and counts how many land in the unit quarter circle, and summing the hits gives pi. The tasks are independent and compute-bound, exactly what rayonet is for.
+Estimate pi by Monte Carlo, distributed across a small local docker "swarm" with rayonette. Each task draws millions of random points and counts how many land in the unit quarter circle, and summing the hits gives pi. The tasks are independent and compute-bound, exactly what rayonette is for.
 
-This one program is the whole rayonet contract:
+This one program is the whole rayonette contract:
 
-- **One binary, two roles.** Run normally it is the coordinator, and rayonet launches the same binary on each worker as the agent.
-- **One line of build glue.** `build.rs` calls `rayonet_build::extract()`, which finds the `.net_map(sample)` call and generates the agent's task registry, and `rayonet::embed_microcrates!()` pulls it in.
-- **Blank hosts, no manual deploy.** The workers are bare ssh containers with no rust. rayonet provisions each one from cold: install rust, ship the source, build the agent, launch it.
+- **One binary, two roles.** Run normally it is the coordinator, and rayonette launches the same binary on each worker as the agent.
+- **One line of build glue.** `build.rs` calls `rayonette_build::extract()`, which finds the `.net_map(sample)` call and generates the agent's task registry, and `rayonette::embed_microcrates!()` pulls it in.
+- **Blank hosts, no manual deploy.** The workers are bare ssh containers with no rust. rayonette provisions each one from cold: install rust, ship the source, build the agent, launch it.
 
 ## Run it
 
@@ -17,7 +17,7 @@ The swarm is three blank ssh containers managed by `docker compose`. Docker is r
 #    throwaway key plus the fleet list the example reads.
 examples/montecarlo/cluster/up.sh
 
-# 2. Run the coordinator. It ships this workspace to each worker, rayonet
+# 2. Run the coordinator. It ships this workspace to each worker, rayonette
 #    provisions and builds the agent there, then distributes the tasks. You will
 #    watch each host climb the ladder Probing -> Installing -> Syncing ->
 #    Building -> Ready, then run the work, and finally print the estimate.
@@ -41,4 +41,4 @@ To use more or fewer workers, add or remove services in `compose.yml` (with matc
 
 ## What gets shipped
 
-rayonet ships the whole workspace as the source bundle (because rayonet itself is an unpublished path dependency here) and builds only this package on each worker (`cargo build -p montecarlo`). A real consumer that depends on a published rayonet would ship just its own crate.
+rayonette ships the whole workspace as the source bundle (because rayonette itself is an unpublished path dependency here) and builds only this package on each worker (`cargo build -p montecarlo`). A real consumer that depends on a published rayonette would ship just its own crate.

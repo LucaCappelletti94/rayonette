@@ -104,7 +104,7 @@ fn content_hash(bytes: &[u8]) -> String {
 /// with the same source).
 fn remote_cache_dir(source_tar: &[u8], variant: &str) -> String {
     format!(
-        "$HOME/.cache/rayonet/{}-{variant}",
+        "$HOME/.cache/rayonette/{}-{variant}",
         content_hash(source_tar)
     )
 }
@@ -128,10 +128,10 @@ fn build_variant(arch: &CpuArch, target_cpu: &str) -> String {
 }
 
 /// The agent build's `-C target-cpu` value: `native` by default (squeeze every
-/// instruction the host offers), overridable with `RAYONET_TARGET_CPU` (for
+/// instruction the host offers), overridable with `RAYONETTE_TARGET_CPU` (for
 /// example `x86-64-v2` for a portable build).
 fn target_cpu() -> String {
-    std::env::var("RAYONET_TARGET_CPU").unwrap_or_else(|_| "native".to_string())
+    std::env::var("RAYONETTE_TARGET_CPU").unwrap_or_else(|_| "native".to_string())
 }
 
 /// Probe a host and return its build target: the cache `variant` (architecture
@@ -167,7 +167,7 @@ fn require_success(host: &str, step: &str, out: &CommandOutput) -> io::Result<()
     }
     let stderr = String::from_utf8_lossy(out.stderr());
     Err(io::Error::other(format!(
-        "rayonet: {host}: {step} failed (exit {}): {}",
+        "rayonette: {host}: {step} failed (exit {}): {}",
         out.status(),
         stderr.trim()
     )))
@@ -328,7 +328,7 @@ const NODE_ID_COMMAND: &str = "\
       || ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null \
          | sed -n 's/.*\"IOPlatformUUID\" = \"\\(.*\\)\"/\\1/p'; } \
     | grep -m1 . \
-    || { d=\"$HOME/.cache/rayonet\"; mkdir -p \"$d\"; f=\"$d/node-id\"; \
+    || { d=\"$HOME/.cache/rayonette\"; mkdir -p \"$d\"; f=\"$d/node-id\"; \
          cat \"$f\" 2>/dev/null \
          || { id=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \\n'); echo \"$id\" >\"$f\"; echo \"$id\"; }; }";
 

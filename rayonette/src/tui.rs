@@ -361,7 +361,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         app.elapsed.as_secs_f64(),
     );
     frame.render_widget(
-        Paragraph::new(summary).block(Block::default().borders(Borders::ALL).title(" rayonet ")),
+        Paragraph::new(summary).block(Block::default().borders(Borders::ALL).title(" rayonette ")),
         cells[0],
     );
 
@@ -1885,7 +1885,7 @@ mod tests {
 
         // A live run of two agents with a control socket bound.
         let socket =
-            std::env::temp_dir().join(format!("rayonet-tui-control-{}.sock", std::process::id()));
+            std::env::temp_dir().join(format!("rayonette-tui-control-{}.sock", std::process::id()));
         let (listener, controls_rx) = ControlListener::bind(&socket).unwrap();
         let (a_client, a_server) = connection_pair(256);
         let (b_client, b_server) = connection_pair(256);

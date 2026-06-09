@@ -1,4 +1,4 @@
-# rayonet docker harness (test pyramid level 4)
+# rayonette docker harness (test pyramid level 4)
 
 A deliberately segmented multi-host network for exercising the real provisioning
 ladder and ssh transport (PLAN.md Phase 4). The point is partial connectivity:
@@ -38,7 +38,7 @@ node from inside a network it shares, so it must hop):
 ```
 
 `up.sh` generates a throwaway ed25519 key into `secrets/` (gitignored) and a
-coordinator-side `secrets/ssh_config`. Point rayonet at a node with that config
+coordinator-side `secrets/ssh_config`. Point rayonette at a node with that config
 plus the node name, for example `leaf-deep`, and ssh handles the jump chain.
 
 ## Notes
@@ -47,4 +47,4 @@ plus the node name, for example `leaf-deep`, and ssh handles the jump chain.
 - `leaf-blocked` is on an `internal` network with no egress, so rustup cannot
   fetch the toolchain there: that is the per-host failure case (decision 18).
 - The whole workspace source is shipped and built on each host (so the agent's
-  path dependency on rayonet resolves without rayonet being published).
+  path dependency on rayonette resolves without rayonette being published).

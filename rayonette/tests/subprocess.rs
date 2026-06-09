@@ -1,13 +1,13 @@
 //! Phase 2: the protocol running over a real spawned process's stdio.
 
-use rayonet::coordinator::run_job;
-use rayonet::framing::Connection;
-use rayonet::observability::NoopSink;
-use rayonet::process;
+use rayonette::coordinator::run_job;
+use rayonette::framing::Connection;
+use rayonette::observability::NoopSink;
+use rayonette::process;
 use tokio::process::Command;
 
 fn agent_command() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rayonet-test-agent"))
+    Command::new(env!("CARGO_BIN_EXE_rayonette-test-agent"))
 }
 
 /// One labeled agent, for the single-agent subprocess jobs.
@@ -54,9 +54,9 @@ async fn a_killed_agent_is_observed_as_a_failure() {
 
 #[tokio::test]
 async fn subprocess_launcher_connects_and_runs() {
-    use rayonet::fleet::{Launch, Subprocess};
+    use rayonette::fleet::{Launch, Subprocess};
 
-    let launcher = Subprocess::command(env!("CARGO_BIN_EXE_rayonet-test-agent"));
+    let launcher = Subprocess::command(env!("CARGO_BIN_EXE_rayonette-test-agent"));
     assert!(format!("{launcher:?}").contains("Subprocess"));
 
     let () = launcher.connect().await.expect("connect");
@@ -74,7 +74,7 @@ async fn subprocess_launcher_connects_and_runs() {
 #[tokio::test]
 async fn the_binary_exits_when_not_in_agent_mode() {
     // Launched directly, without the agent marker the coordinator would set.
-    let status = Command::new(env!("CARGO_BIN_EXE_rayonet-test-agent"))
+    let status = Command::new(env!("CARGO_BIN_EXE_rayonette-test-agent"))
         .status()
         .await
         .expect("run binary");

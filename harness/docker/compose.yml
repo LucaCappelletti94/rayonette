@@ -1,4 +1,4 @@
-# Segmented multi-host network for rayonet's level-4 tests (PLAN.md Phase 4).
+# Segmented multi-host network for rayonette's level-4 tests (PLAN.md Phase 4).
 #
 # The coordinator runs on the host and can only reach `bastion` (the one
 # published port). Every other node is reachable solely by name through an ssh
@@ -11,7 +11,7 @@
 #
 # See README.md for the full rationale.
 
-name: rayonet-harness
+name: rayonette-harness
 
 networks:
   frontnet: {}
@@ -28,7 +28,7 @@ x-agent: &agent
 services:
   bastion:
     <<: *agent
-    image: rayonet-harness-base:latest
+    image: rayonette-harness-base:latest
     build:
       context: .
       dockerfile: Dockerfile.base
@@ -38,17 +38,17 @@ services:
 
   relay:
     <<: *agent
-    image: rayonet-harness-base:latest
+    image: rayonette-harness-base:latest
     networks: [backnet, deepnet]
 
   leaf-a:
     <<: *agent
-    image: rayonet-harness-base:latest
+    image: rayonette-harness-base:latest
     networks: [backnet]
 
   leaf-b:
     <<: *agent
-    image: rayonet-harness-rust:latest
+    image: rayonette-harness-rust:latest
     build:
       context: .
       dockerfile: Dockerfile.rust
@@ -56,12 +56,12 @@ services:
 
   leaf-deep:
     <<: *agent
-    image: rayonet-harness-base:latest
+    image: rayonette-harness-base:latest
     networks: [deepnet]
 
   leaf-blocked:
     <<: *agent
-    image: rayonet-harness-base:latest
+    image: rayonette-harness-base:latest
     networks: [blockednet]
 
   # A fast/slow pair (identical but for a CPU cap) for the work-share scenario:
@@ -72,12 +72,12 @@ services:
   # not the one-time compile.
   leaf-fast:
     <<: *agent
-    image: rayonet-harness-rust:latest
+    image: rayonette-harness-rust:latest
     networks: [backnet]
 
   leaf-slow:
     <<: *agent
-    image: rayonet-harness-rust:latest
+    image: rayonette-harness-rust:latest
     networks: [backnet]
     deploy:
       resources:

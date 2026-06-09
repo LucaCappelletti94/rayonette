@@ -4,9 +4,9 @@
 # underway, and the rejoin driver discovers it, provisions it by cache hit, and
 # it pulls pending work. Mirrors R5's leave path: here the fleet grows.
 source "$(dirname "$0")/../lib.sh"
-PROJ=rayonet-elastic
+PROJ=rayonette-elastic
 COMPOSE="$(dirname "$0")/compose.yml"
-config=/tmp/rayonet-elastic-config
+config=/tmp/rayonette-elastic-config
 fails=0
 cleanup() { [ "${KEEP:-0}" = 1 ] || docker compose -p "$PROJ" -f "$COMPOSE" down -t 2 >/dev/null 2>&1; }
 trap cleanup EXIT

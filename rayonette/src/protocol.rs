@@ -1,4 +1,4 @@
-//! The rayonet wire message set.
+//! The rayonette wire message set.
 
 use serde::{Deserialize, Serialize};
 

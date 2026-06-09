@@ -10,12 +10,12 @@ CONFIG="$SECRETS/ssh_config"
 
 mkdir -p "$SECRETS"
 if [ ! -f "$KEY" ]; then
-  ssh-keygen -t ed25519 -N "" -C rayonet-harness -f "$KEY" >/dev/null
+  ssh-keygen -t ed25519 -N "" -C rayonette-harness -f "$KEY" >/dev/null
 fi
 cp "$KEY.pub" "$SECRETS/authorized_keys"
 
 # Base image first (the rust image derives from it), then the rest via compose.
-docker build -f Dockerfile.base -t rayonet-harness-base:latest .
+docker build -f Dockerfile.base -t rayonette-harness-base:latest .
 docker compose build
 docker compose up -d
 
@@ -23,7 +23,7 @@ docker compose up -d
 # reached by name through a ProxyJump chain.
 cat > "$CONFIG" <<EOF
 Host *
-  User rayonet
+  User rayonette
   IdentityFile $(cd "$SECRETS" && pwd)/id_ed25519
   IdentitiesOnly yes
   StrictHostKeyChecking no

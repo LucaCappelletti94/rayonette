@@ -8,7 +8,7 @@ set -uo pipefail
 cd "$(dirname "$0")"
 ROOT=../..
 CONFIG="$(pwd)/secrets/ssh_config"
-BIN="$ROOT/target/release/rayonet-docker-consumer"
+BIN="$ROOT/target/release/rayonette-docker-consumer"
 
 # Start from fresh containers so "cold host" means cold (no rust, no cache).
 # leaf-b keeps the rust baked into its image; the rest start bare.
@@ -20,20 +20,20 @@ for _ in $(seq 1 60); do
 done
 
 # The consumer's build.rs bundles the workspace source (embedded via
-# __rayonet_source), so the script no longer needs to tar anything.
-( cd "$ROOT" && cargo build --release -p rayonet-docker-consumer >/dev/null 2>&1 )
+# __rayonette_source), so the script no longer needs to tar anything.
+( cd "$ROOT" && cargo build --release -p rayonette-docker-consumer >/dev/null 2>&1 )
 
 fails=0
 run() { # name, leaves, [task=double], [count=10]
   local name="$1" leaves="$2" task="${3:-double}" count="${4:-10}"
   echo "=== scenario: $name (leaves=$leaves task=$task count=$count) ==="
-  RAYONET_SSH_CONFIG="$CONFIG" RAYONET_LEAVES="$leaves" \
-    RAYONET_TOOLCHAIN=stable \
-    RAYONET_TASK="$task" RAYONET_COUNT="$count" \
-    "$BIN" 2>&1 | tee "/tmp/rayonet-scenario-$name.log"
+  RAYONETTE_SSH_CONFIG="$CONFIG" RAYONETTE_LEAVES="$leaves" \
+    RAYONETTE_TOOLCHAIN=stable \
+    RAYONETTE_TASK="$task" RAYONETTE_COUNT="$count" \
+    "$BIN" 2>&1 | tee "/tmp/rayonette-scenario-$name.log"
 }
 expect() { # name, pattern, description
-  if grep -qE "$2" "/tmp/rayonet-scenario-$1.log"; then
+  if grep -qE "$2" "/tmp/rayonette-scenario-$1.log"; then
     echo "  PASS: $3"
   else
     echo "  FAIL: $3 (expected /$2/)"; fails=$((fails + 1))
@@ -48,7 +48,7 @@ expect cold 'ok: 10 results'          'job completed'
 
 run cache leaf-a
 expect cache 'state leaf-a Ready' 'second run reaches ready'
-if grep -qE 'state leaf-a Building' "/tmp/rayonet-scenario-cache.log"; then
+if grep -qE 'state leaf-a Building' "/tmp/rayonette-scenario-cache.log"; then
   echo "  FAIL: cache hit should skip Building"; fails=$((fails + 1))
 else
   echo "  PASS: cache hit skips Building"
@@ -56,7 +56,7 @@ fi
 expect cache 'ok: 10 results' 'cached job completed'
 
 run skip-install leaf-b
-if grep -qE 'state leaf-b Installing' "/tmp/rayonet-scenario-skip-install.log"; then
+if grep -qE 'state leaf-b Installing' "/tmp/rayonette-scenario-skip-install.log"; then
   echo "  FAIL: host with rust should skip Installing"; fails=$((fails + 1))
 else
   echo "  PASS: host with rust skips Installing"
@@ -71,7 +71,7 @@ expect multihop 'ok: 10 results'        'multi-hop job completed'
 run blocked "leaf-b,leaf-blocked"
 expect blocked 'ok: 10 results'             'survivor completes despite blocked host'
 expect blocked 'state leaf-blocked Installing' 'blocked host reached install'
-if grep -qE 'state leaf-blocked Ready' "/tmp/rayonet-scenario-blocked.log"; then
+if grep -qE 'state leaf-blocked Ready' "/tmp/rayonette-scenario-blocked.log"; then
   echo "  FAIL: blocked host should never become Ready"; fails=$((fails + 1))
 else
   echo "  PASS: blocked host never becomes Ready"
@@ -87,8 +87,8 @@ run fastslow-warmup "leaf-fast,leaf-slow" double 1
 # does not bite a short CPU burst, so a full run splits roughly evenly there.
 run fastslow "leaf-fast,leaf-slow" crunch 40
 expect fastslow 'ok: 40 results' 'every task completed'
-fast=$(grep 'share leaf-fast ' "/tmp/rayonet-scenario-fastslow.log" | awk '{print $NF}')
-slow=$(grep 'share leaf-slow ' "/tmp/rayonet-scenario-fastslow.log" | awk '{print $NF}')
+fast=$(grep 'share leaf-fast ' "/tmp/rayonette-scenario-fastslow.log" | awk '{print $NF}')
+slow=$(grep 'share leaf-slow ' "/tmp/rayonette-scenario-fastslow.log" | awk '{print $NF}')
 if [ -n "${fast:-}" ] && [ -n "${slow:-}" ] && [ "$fast" -ge "$slow" ]; then
   echo "  PASS: throttled host took no larger a share than the fast host ($fast vs $slow)"
 else
@@ -99,14 +99,14 @@ fi
 # Fault tolerance: a host is killed mid-run; the survivor must finish every
 # task (the caches are already warm from the fast/slow run above).
 echo "=== scenario: kill (leaf-slow dies mid-run) ==="
-RAYONET_SSH_CONFIG="$CONFIG" RAYONET_LEAVES="leaf-fast,leaf-slow" \
-  RAYONET_TOOLCHAIN=stable RAYONET_TASK=crunch RAYONET_COUNT=120 \
-  "$BIN" >/tmp/rayonet-scenario-kill.log 2>&1 &
+RAYONETTE_SSH_CONFIG="$CONFIG" RAYONETTE_LEAVES="leaf-fast,leaf-slow" \
+  RAYONETTE_TOOLCHAIN=stable RAYONETTE_TASK=crunch RAYONETTE_COUNT=120 \
+  "$BIN" >/tmp/rayonette-scenario-kill.log 2>&1 &
 consumer_pid=$!
 sleep 3 # provisioning is a cache hit, so the run is underway by now
-docker kill rayonet-harness-leaf-slow-1 >/dev/null 2>&1 && echo "  killed leaf-slow"
+docker kill rayonette-harness-leaf-slow-1 >/dev/null 2>&1 && echo "  killed leaf-slow"
 wait "$consumer_pid"
-grep -E 'state leaf-slow|ok:|share' /tmp/rayonet-scenario-kill.log | tail -5
+grep -E 'state leaf-slow|ok:|share' /tmp/rayonette-scenario-kill.log | tail -5
 expect kill 'state leaf-slow Lost' 'killed host is marked Lost'
 expect kill 'ok: 120 results'      'survivor finished every task'
 

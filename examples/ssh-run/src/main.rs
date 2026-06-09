@@ -1,6 +1,6 @@
-//! Run a trivial task across the ssh hosts named in `RAYONET_HOSTS`.
+//! Run a trivial task across the ssh hosts named in `RAYONETTE_HOSTS`.
 //!
-//! `RAYONET_HOSTS` is a space- or comma-separated list of ssh destinations, each
+//! `RAYONETTE_HOSTS` is a space- or comma-separated list of ssh destinations, each
 //! an alias from `~/.ssh/config` (for example `mac`) or a `user@host`, optionally
 //! suffixed `=<keyfile>` to authenticate with an explicit private key. The hosts
 //! populate the process-global fleet (`install_fleet`), so the task is a bare
@@ -8,28 +8,28 @@
 //! the run proceeds on whoever is left.
 //!
 //! ```text
-//! RAYONET_HOSTS="mac localhost=~/.ssh/rayonet_localhost_ed25519" cargo run -p ssh-run
+//! RAYONETTE_HOSTS="mac localhost=~/.ssh/rayonette_localhost_ed25519" cargo run -p ssh-run
 //! ```
 //!
-//! Set `RAYONET_FILTER=no-macos` to apply a fleet role filter that excludes
+//! Set `RAYONETTE_FILTER=no-macos` to apply a fleet role filter that excludes
 //! macOS hosts (they are profiled, then dropped before provisioning); any other
 //! value, or unset, keeps every host as compute.
 
 use std::sync::Arc;
 
-use rayonet::capability::{pred, Filter, Os, Role};
-use rayonet::fleet::{Fleet, NetMapExt};
-use rayonet::node::{agent_main, NodeConfig};
-use rayonet::observability::{depth, leaf_of, Event, EventSink};
-use rayonet::process;
-use rayonet::ssh::{parse_host_spec, Ssh};
+use rayonette::capability::{pred, Filter, Os, Role};
+use rayonette::fleet::{Fleet, NetMapExt};
+use rayonette::node::{agent_main, NodeConfig};
+use rayonette::observability::{depth, leaf_of, Event, EventSink};
+use rayonette::process;
+use rayonette::ssh::{parse_host_spec, Ssh};
 
 /// The distributed task: doubles its input.
 const fn double(x: u32) -> u32 {
     x * 2
 }
 
-rayonet::embed_microcrates!();
+rayonette::embed_microcrates!();
 
 /// Prints each node's provisioning ladder and capability/role so the run is
 /// visible, indented by tree depth so a relay's subtree is shown beneath it.
@@ -64,9 +64,9 @@ impl EventSink for Progress {
     }
 }
 
-/// The fleet role filter selected by `RAYONET_FILTER`, if any.
+/// The fleet role filter selected by `RAYONETTE_FILTER`, if any.
 fn filter_from_env() -> Option<Filter> {
-    match std::env::var("RAYONET_FILTER").ok()?.as_str() {
+    match std::env::var("RAYONETTE_FILTER").ok()?.as_str() {
         "no-macos" => Some(
             Filter::new()
                 .exclude(pred::os_is(Os::MacOs))
@@ -82,8 +82,8 @@ async fn main() {
         // As an agent: a leaf, or a relay if this host has a children file. A
         // relay re-ships this same source bundle down to its own children.
         let config = NodeConfig::new(
-            __rayonet_registry(),
-            __rayonet_source(),
+            __rayonette_registry(),
+            __rayonette_source(),
             "ssh-run".to_string(),
             "stable".to_string(),
         );
@@ -91,24 +91,24 @@ async fn main() {
         agent_main(config).await;
     }
 
-    let spec = std::env::var("RAYONET_HOSTS")
-        .expect("set RAYONET_HOSTS to a space/comma list of ssh destinations");
-    let source = __rayonet_source();
+    let spec = std::env::var("RAYONETTE_HOSTS")
+        .expect("set RAYONETTE_HOSTS to a space/comma list of ssh destinations");
+    let source = __rayonette_source();
     let launchers: Vec<Ssh> = spec
         .split([' ', ','])
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
         .map(|entry| Ssh::build(parse_host_spec(entry), source.clone(), "stable", "ssh-run"))
         .collect();
-    assert!(!launchers.is_empty(), "RAYONET_HOSTS named no hosts");
+    assert!(!launchers.is_empty(), "RAYONETTE_HOSTS named no hosts");
     let hosts = launchers.len();
 
     let mut fleet = Fleet::observed(launchers, Arc::new(Progress));
     if let Some(filter) = filter_from_env() {
-        println!("applying RAYONET_FILTER role policy");
+        println!("applying RAYONETTE_FILTER role policy");
         fleet = fleet.with_filter(filter);
     }
-    rayonet::install_fleet(fleet);
+    rayonette::install_fleet(fleet);
 
     println!("running across up to {hosts} host(s)...");
     match (0..8u32).net_map(double).collect::<u32>().await {

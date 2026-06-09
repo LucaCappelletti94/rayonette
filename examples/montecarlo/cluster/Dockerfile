@@ -1,4 +1,4 @@
-# A blank worker for the Monte Carlo swarm: an ssh server with NO rust. rayonet
+# A blank worker for the Monte Carlo swarm: an ssh server with NO rust. rayonette
 # provisions it from cold (install rust, ship the source, build the agent,
 # launch it). The only things baked in are sshd and the tools rustup and the
 # compiler need.

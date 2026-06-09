@@ -2,14 +2,14 @@
 //! mode it serves a small registry over stdio; otherwise it exits with code 2.
 //! (Test scaffolding; Phase 7 will feature-gate or relocate it.)
 
-use rayonet::agent::{handler, Registry};
-use rayonet::node::{agent_main, NodeConfig};
-use rayonet::process;
+use rayonette::agent::{handler, Registry};
+use rayonette::node::{agent_main, NodeConfig};
+use rayonette::process;
 
 #[tokio::main]
 async fn main() {
     if !process::is_agent() {
-        eprintln!("rayonet-test-agent: not launched as an agent");
+        eprintln!("rayonette-test-agent: not launched as an agent");
         std::process::exit(2);
     }
 
@@ -28,10 +28,10 @@ async fn main() {
     let config = NodeConfig::new(
         registry,
         Vec::new(),
-        "rayonet-test-agent".to_string(),
+        "rayonette-test-agent".to_string(),
         "stable".to_string(),
     );
     // Serve, then exit the process (an agent must not linger on its parent's
-    // stdin; see rayonet::node::agent_main).
+    // stdin; see rayonette::node::agent_main).
     agent_main(config).await;
 }

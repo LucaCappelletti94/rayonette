@@ -2,9 +2,9 @@
 # line2: coordinator -> relay -> {leaf-a, leaf-b}. The cascade runs, and killing
 # the sole relay strands the subtree (no alternate path) so the run fails clearly.
 source "$(dirname "$0")/../lib.sh"
-PROJ=rayonet-line2
+PROJ=rayonette-line2
 COMPOSE="$(dirname "$0")/compose.yml"
-config=/tmp/rayonet-line2-config
+config=/tmp/rayonette-line2-config
 fails=0
 cleanup() { [ "${KEEP:-0}" = 1 ] || docker compose -p "$PROJ" -f "$COMPOSE" down -t 2 >/dev/null 2>&1; }
 trap cleanup EXIT

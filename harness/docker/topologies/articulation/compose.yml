@@ -12,10 +12,10 @@
 #     v   v                v
 #   solo  shared <---------+
 #   (netA)(netA+netB)
-name: rayonet-articulation
+name: rayonette-articulation
 
 volumes:
-  rayonet-topo-cache:
+  rayonette-topo-cache:
     external: true
 
 networks:
@@ -24,10 +24,10 @@ networks:
 
 x-agent: &agent
   init: true
-  image: rayonet-harness-base:latest
+  image: rayonette-harness-base:latest
   volumes:
     - ../../secrets:/secrets:ro
-    - rayonet-topo-cache:/home/rayonet/.cache
+    - rayonette-topo-cache:/home/rayonette/.cache
 
 services:
   relayA:

@@ -2,9 +2,9 @@
 # line3: coordinator -> relay1 -> relay2 -> leaf. A depth-3 cascade completes,
 # and killing the interior relay (relay2) strands the leaf so the run fails.
 source "$(dirname "$0")/../lib.sh"
-PROJ=rayonet-line3
+PROJ=rayonette-line3
 COMPOSE="$(dirname "$0")/compose.yml"
-config=/tmp/rayonet-line3-config
+config=/tmp/rayonette-line3-config
 fails=0
 cleanup() { [ "${KEEP:-0}" = 1 ] || docker compose -p "$PROJ" -f "$COMPOSE" down -t 2 >/dev/null 2>&1; }
 trap cleanup EXIT

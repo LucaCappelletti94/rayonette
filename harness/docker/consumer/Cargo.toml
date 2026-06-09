@@ -1,20 +1,20 @@
 [package]
-name = "rayonet-docker-consumer"
+name = "rayonette-docker-consumer"
 version = "0.0.0"
 edition = "2021"
 publish = false
 
 [[bin]]
-name = "rayonet-docker-consumer"
+name = "rayonette-docker-consumer"
 path = "src/main.rs"
 
 [dependencies]
-rayonet = { path = "../../../rayonet" }
+rayonette = { path = "../../../rayonette" }
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 
 [build-dependencies]
-rayonet-build = { path = "../../../rayonet-build" }
+rayonette-build = { path = "../../../rayonette-build" }
 
 [lints]
 workspace = true

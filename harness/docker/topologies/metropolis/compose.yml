@@ -13,10 +13,10 @@
 # mid-run, so the coordinator's rejoin driver absorbs a new top-level node and the
 # network visibly grows. Then the primary gateway for shared is killed and shared
 # reroutes onto the standby. The gateways relay and never compute.
-name: rayonet-metropolis
+name: rayonette-metropolis
 
 volumes:
-  rayonet-topo-cache:
+  rayonette-topo-cache:
     external: true
 
 networks:
@@ -26,10 +26,10 @@ networks:
 
 x-agent: &agent
   init: true
-  image: rayonet-harness-base:latest
+  image: rayonette-harness-base:latest
   volumes:
     - ../../secrets:/secrets:ro
-    - rayonet-topo-cache:/home/rayonet/.cache
+    - rayonette-topo-cache:/home/rayonette/.cache
 
 # Each container is given a friendly hostname (uname -n) distinct from its ssh
 # label, so the dashboard can show the machine's own name (e.g. "relay-east")

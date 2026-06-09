@@ -2,9 +2,9 @@
 # Diamond: a leaf reachable through two relays is deduped to one primary, and
 # killing that primary (a bridge to the leaf) mid-run reroutes onto the standby.
 source "$(dirname "$0")/../lib.sh"
-PROJ=rayonet-diamond
+PROJ=rayonette-diamond
 COMPOSE="$(dirname "$0")/compose.yml"
-config=/tmp/rayonet-diamond-config
+config=/tmp/rayonette-diamond-config
 fails=0
 cleanup() { [ "${KEEP:-0}" = 1 ] || docker compose -p "$PROJ" -f "$COMPOSE" down -t 2 >/dev/null 2>&1; }
 trap cleanup EXIT

@@ -1,8 +1,8 @@
-//! Replay a recorded rayonet event log into the live, interactive terminal TUI.
+//! Replay a recorded rayonette event log into the live, interactive terminal TUI.
 //!
-//! A run records its event stream when `RAYONET_EVENT_LOG` is set (the docker
+//! A run records its event stream when `RAYONETTE_EVENT_LOG` is set (the docker
 //! consumer does, and the topology harness forwards it). This renders that trace
-//! through the same `rayonet::tui` dashboard the live run would use, so you can
+//! through the same `rayonette::tui` dashboard the live run would use, so you can
 //! watch the run unfold and refine the view against a real, evolving topology.
 //!
 //! ```text
@@ -14,7 +14,7 @@
 //! Controls: Tab / Shift-Tab (or the arrow keys) select a node, the mouse selects
 //! a node or hovers a link, Esc clears the selection, `space` pauses playback, and
 //! `q` quits. With a control socket attached (`--control <path>`, or the
-//! `RAYONET_CONTROL_SOCKET` env var) the selected node can be steered live: `p`
+//! `RAYONETTE_CONTROL_SOCKET` env var) the selected node can be steered live: `p`
 //! pauses or resumes a compute leaf, `k` kills the node now, and `d` kills it after
 //! its current tasks drain. Without a socket those keys do nothing. The terminal is
 //! restored on exit.
@@ -34,9 +34,9 @@ use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::Terminal;
-use rayonet::control::{Control, ControlClient};
-use rayonet::observability::RecordedEvent;
-use rayonet::tui::{Action, App, Input};
+use rayonette::control::{Control, ControlClient};
+use rayonette::observability::RecordedEvent;
+use rayonette::tui::{Action, App, Input};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -84,8 +84,8 @@ fn main() -> io::Result<()> {
     let mut follow = false;
     let mut path: Option<String> = None;
     let mut speed = 1.0_f64;
-    // The control socket: a `--control <path>` flag, else `RAYONET_CONTROL_SOCKET`.
-    let mut control = std::env::var_os("RAYONET_CONTROL_SOCKET").map(PathBuf::from);
+    // The control socket: a `--control <path>` flag, else `RAYONETTE_CONTROL_SOCKET`.
+    let mut control = std::env::var_os("RAYONETTE_CONTROL_SOCKET").map(PathBuf::from);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -190,9 +190,9 @@ fn replay(
 
     // Hold each event on screen for at least this long, so a burst of events
     // recorded in the same instant does not flash by faster than the eye can
-    // follow. Override with RAYONET_REPLAY_MIN_DWELL_MS.
+    // follow. Override with RAYONETTE_REPLAY_MIN_DWELL_MS.
     let min_dwell = Duration::from_millis(
-        std::env::var("RAYONET_REPLAY_MIN_DWELL_MS")
+        std::env::var("RAYONETTE_REPLAY_MIN_DWELL_MS")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(120),
@@ -205,7 +205,7 @@ fn replay(
         if pump_input(&mut app, controller)? == Action::Quit {
             return Ok(());
         }
-        terminal.draw(|frame| rayonet::tui::draw(frame, &mut app))?;
+        terminal.draw(|frame| rayonette::tui::draw(frame, &mut app))?;
 
         // While paused, keep the view interactive but hold the trace position.
         if app.paused() {
@@ -234,7 +234,7 @@ fn replay(
             if pump_input(&mut app, controller)? == Action::Quit {
                 return Ok(());
             }
-            terminal.draw(|frame| rayonet::tui::draw(frame, &mut app))?;
+            terminal.draw(|frame| rayonette::tui::draw(frame, &mut app))?;
             std::thread::sleep(Duration::from_millis(10));
         }
         app.apply(record.event());

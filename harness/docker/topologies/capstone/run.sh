@@ -6,9 +6,9 @@
 # gateway is killed and its shared subtree reroutes onto the standby. Everything
 # completes once, deduplicated, through both the join and the kill.
 source "$(dirname "$0")/../lib.sh"
-PROJ=rayonet-capstone
+PROJ=rayonette-capstone
 COMPOSE="$(dirname "$0")/compose.yml"
-config=/tmp/rayonet-capstone-config
+config=/tmp/rayonette-capstone-config
 fails=0
 cleanup() { [ "${KEEP:-0}" = 1 ] || docker compose -p "$PROJ" -f "$COMPOSE" down -t 2 >/dev/null 2>&1; }
 trap cleanup EXIT

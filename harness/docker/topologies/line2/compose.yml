@@ -1,10 +1,10 @@
 # line2: coordinator -> relay -> {leaf-a, leaf-b}. The relay is the sole bridge
 # to its leaves (which are published nowhere), so killing it strands the whole
 # subtree with no alternate path: the run must fail legibly.
-name: rayonet-line2
+name: rayonette-line2
 
 volumes:
-  rayonet-topo-cache:
+  rayonette-topo-cache:
     external: true
 
 networks:
@@ -12,10 +12,10 @@ networks:
 
 x-agent: &agent
   init: true
-  image: rayonet-harness-base:latest
+  image: rayonette-harness-base:latest
   volumes:
     - ../../secrets:/secrets:ro
-    - rayonet-topo-cache:/home/rayonet/.cache
+    - rayonette-topo-cache:/home/rayonette/.cache
 
 services:
   relay:

@@ -33,13 +33,13 @@ KEEP=1 ./diamond/run.sh  # keep the containers up afterward (fast re-runs)
 # For a faster pass, run the kill/join scenarios with the wall-clock `dawdle`
 # task at a modest count, so an event lands mid-run in a couple of seconds
 # instead of the heavy CPU-bound `crunch` used by default:
-RAYONET_HEAVY_TASK=dawdle RAYONET_HEAVY_COUNT=300 ./run-all.sh
+RAYONETTE_HEAVY_TASK=dawdle RAYONETTE_HEAVY_COUNT=300 ./run-all.sh
 ```
 
 ## How it stays fast
 
 Every container mounts a shared, architecture-keyed cache volume
-(`rayonet-topo-cache`). `topo_warm` builds the agent once, sequentially, into
+(`rayonette-topo-cache`). `topo_warm` builds the agent once, sequentially, into
 that volume; afterward every node provisions by cache hit instead of
 recompiling. This is safe because all the containers share the host CPU, so the
 `target-cpu=native` binary is valid on all of them, which is exactly what the
@@ -59,7 +59,7 @@ Tailscale ssh, using the `ssh-run` example (`examples/ssh-run`).
 Flat, cross-architecture (this Linux box -> a macOS arm64 host as a compute leaf):
 
 ```sh
-RAYONET_HOSTS="mac" cargo run -p ssh-run --release
+RAYONETTE_HOSTS="mac" cargo run -p ssh-run --release
 # mac: Compute (MacOs, 18 cores, 24576 MB RAM, 1 GPUs)
 # mac: Probing -> Syncing -> Building -> Ready -> Working -> Done
 # results: [Ok(0), Ok(2), ...]  8/8 tasks succeeded
@@ -70,9 +70,9 @@ hop reaching the next with its own credentials (decentralized discovery): set th
 gateway's children file on the gateway itself, then drive through it.
 
 ```sh
-ssh mac 'mkdir -p ~/.config/rayonet && printf "pippo\n" > ~/.config/rayonet/children'
-RAYONET_HOSTS="mac" cargo run -p ssh-run --release
-ssh mac 'rm -f ~/.config/rayonet/children'   # always remove it afterward
+ssh mac 'mkdir -p ~/.config/rayonette && printf "pippo\n" > ~/.config/rayonette/children'
+RAYONETTE_HOSTS="mac" cargo run -p ssh-run --release
+ssh mac 'rm -f ~/.config/rayonette/children'   # always remove it afterward
 # mac: Compute (MacOs, ...) -> Probing -> Ready -> Working          (the gateway)
 #   pippo: Compute (Linux, 64 cores, ...) -> Probing -> Syncing -> Building -> Ready
 #   pippo: Working ... Done                                          (the leaf the gateway built)
@@ -88,10 +88,10 @@ done, or later agent runs on that host will try to relay.
 
 ## Watching and refining the TUI
 
-The consumer records its full event stream when `RAYONET_EVENT_LOG` is set, and
+The consumer records its full event stream when `RAYONETTE_EVENT_LOG` is set, and
 `topo_drive` forwards it, so any scenario can be captured or watched. The
 `tui-replay` example (`examples/tui-replay`) renders a recording through the same
-interactive `rayonet::tui` dashboard the live run uses: the relay tree drawn as a
+interactive `rayonette::tui` dashboard the live run uses: the relay tree drawn as a
 node-link graph (nodes coloured by state, active versus standby links, single
 points of failure flagged), a progress header, a per-node table, an event log,
 and an info panel. Tab or the arrow keys (and the mouse) select a node to see its
@@ -100,10 +100,10 @@ a link shows its latency and whether it is the primary or a standby. Esc clears,
 `p` pauses, `q` quits.
 
 Watch a finished trace (a committed capstone recording lives at
-`rayonet/tests/fixtures/capstone.jsonl`), paced by its own timestamps at 4x:
+`rayonette/tests/fixtures/capstone.jsonl`), paced by its own timestamps at 4x:
 
 ```sh
-cargo run -p tui-replay -- rayonet/tests/fixtures/capstone.jsonl 4
+cargo run -p tui-replay -- rayonette/tests/fixtures/capstone.jsonl 4
 ```
 
 The capstone trace is recorded with the build cache warm, so every node provisions
@@ -112,23 +112,23 @@ by cache hit and jumps straight to Ready. To watch the full provisioning ladder
 cold recording, where the relay was built from scratch:
 
 ```sh
-cargo run -p tui-replay -- rayonet/tests/fixtures/cold-provisioning.jsonl 1
+cargo run -p tui-replay -- rayonette/tests/fixtures/cold-provisioning.jsonl 1
 ```
 
 To watch a richer network grow, replay the metropolis recording: two gateways
 front a redundant shared leaf and a leaf each, a third compute node joins the
 fleet mid-run, and then the primary gateway is killed so the shared leaf
-reroutes. Re-record it with `RAYONET_EVENT_LOG=/tmp/m.jsonl RAYONET_HEAVY_COUNT=600 ./metropolis/run.sh`.
+reroutes. Re-record it with `RAYONETTE_EVENT_LOG=/tmp/m.jsonl RAYONETTE_HEAVY_COUNT=600 ./metropolis/run.sh`.
 
 ```sh
-cargo run -p tui-replay -- rayonet/tests/fixtures/metropolis.jsonl 4
+cargo run -p tui-replay -- rayonette/tests/fixtures/metropolis.jsonl 4
 ```
 
 Watch a run live: set the log, run the scenario, and follow the log from another
 terminal (it renders events as they are written):
 
 ```sh
-RAYONET_EVENT_LOG=/tmp/run.jsonl KEEP=1 ./capstone/run.sh    # one terminal
+RAYONETTE_EVENT_LOG=/tmp/run.jsonl KEEP=1 ./capstone/run.sh    # one terminal
 cargo run -p tui-replay -- --follow /tmp/run.jsonl           # another terminal
 ```
 
@@ -139,16 +139,16 @@ drain (the buttons for these sit at the bottom of the node detail panel). The
 coordinator runs on the host, so the socket is a host path:
 
 ```sh
-RAYONET_EVENT_LOG=/tmp/run.jsonl RAYONET_CONTROL_SOCKET=/tmp/run.sock \
-  RAYONET_HEAVY_COUNT=1400 KEEP=1 ./metropolis/run.sh                  # one terminal
+RAYONETTE_EVENT_LOG=/tmp/run.jsonl RAYONETTE_CONTROL_SOCKET=/tmp/run.sock \
+  RAYONETTE_HEAVY_COUNT=1400 KEEP=1 ./metropolis/run.sh                  # one terminal
 cargo run -p tui-replay -- --follow /tmp/run.jsonl --control /tmp/run.sock  # another
 ```
 
-Refine the TUI against a real run: edit `rayonet/src/tui.rs`, run the snapshot
+Refine the TUI against a real run: edit `rayonette/src/tui.rs`, run the snapshot
 test, read the text diff of how the captured capstone now renders at 25 / 50 / 75
 / 100% of the run, and re-bless the golden when the change is intended:
 
 ```sh
-cargo test -p rayonet --features tui --test tui_snapshot      # diff against the golden
-RAYONET_TUI_BLESS=1 cargo test -p rayonet --features tui --test tui_snapshot  # accept changes
+cargo test -p rayonette --features tui --test tui_snapshot      # diff against the golden
+RAYONETTE_TUI_BLESS=1 cargo test -p rayonette --features tui --test tui_snapshot  # accept changes
 ```

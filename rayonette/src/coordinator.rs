@@ -258,7 +258,7 @@ where
         let gaps = crate::graph::redundancy_gaps(&relays);
         if !gaps.is_empty() {
             return Err(std::io::Error::other(format!(
-                "rayonet: require_redundancy: compute reachable through only one relay: {}",
+                "rayonette: require_redundancy: compute reachable through only one relay: {}",
                 gaps.join(", ")
             )));
         }

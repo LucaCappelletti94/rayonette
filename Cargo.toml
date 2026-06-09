@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "rayonet",
-    "rayonet-build",
+    "rayonette",
+    "rayonette-build",
     "fixtures/consumer",
     "harness/docker/consumer",
     "examples/montecarlo",
@@ -15,7 +15,7 @@ version = "0.0.0"
 edition = "2021"
 authors = ["Luca Cappelletti"]
 license = "MIT"
-repository = "https://github.com/LucaCappelletti94/rayonet"
+repository = "https://github.com/LucaCappelletti94/rayonette"
 readme = "README.md"
 keywords = ["distributed", "ssh", "parallel", "rayon", "tasks"]
 categories = ["concurrency"]

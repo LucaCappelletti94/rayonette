@@ -1,9 +1,9 @@
 //! The docker harness consumer: one binary, two roles.
 //!
 //! Built and shipped to the leaf containers, where it runs as an agent. Run on
-//! the host (coordinator role) it provisions the leaves named in `RAYONET_LEAVES`
+//! the host (coordinator role) it provisions the leaves named in `RAYONETTE_LEAVES`
 //! over ssh, ships the workspace source bundle that `build.rs` embedded (via
-//! `__rayonet_source`), builds itself on each leaf, then runs a distributed
+//! `__rayonette_source`), builds itself on each leaf, then runs a distributed
 //! `.net_map`. It prints each
 //! node-state transition (so the harness can assert the ladder) and, at the end,
 //! a per-host completed-task count (so the harness can assert work-share).
@@ -11,10 +11,10 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use rayonet::fleet::{Fleet, NetMapExt};
-use rayonet::observability::{Event, EventSink, RecordedEvent, RunState};
-use rayonet::process;
-use rayonet::ssh::{Ssh, SshConfig};
+use rayonette::fleet::{Fleet, NetMapExt};
+use rayonette::observability::{Event, EventSink, RecordedEvent, RunState};
+use rayonette::process;
+use rayonette::ssh::{Ssh, SshConfig};
 
 const fn double(x: u32) -> u32 {
     x * 2
@@ -40,9 +40,9 @@ fn dawdle(x: u32) -> u32 {
     x
 }
 
-rayonet::embed_microcrates!();
+rayonette::embed_microcrates!();
 
-/// Appends each event to the `RAYONET_EVENT_LOG` file as JSONL, timestamped from
+/// Appends each event to the `RAYONETTE_EVENT_LOG` file as JSONL, timestamped from
 /// the run's start, so a run can be replayed into the TUI (see examples/tui-replay).
 struct Recorder {
     file: std::fs::File,
@@ -60,7 +60,7 @@ impl Recorder {
 }
 
 /// Prints each node-state transition, reduces the stream so the run's per-host
-/// work-share can be reported when it finishes, and (when `RAYONET_EVENT_LOG` is
+/// work-share can be reported when it finishes, and (when `RAYONETTE_EVENT_LOG` is
 /// set) records the full event stream for TUI replay.
 struct ConsoleSink {
     state: Mutex<RunState>,
@@ -69,8 +69,9 @@ struct ConsoleSink {
 
 impl ConsoleSink {
     fn new() -> Self {
-        let recorder = std::env::var_os("RAYONET_EVENT_LOG").map(|path| {
-            let file = std::fs::File::create(&path).expect("cannot create RAYONET_EVENT_LOG file");
+        let recorder = std::env::var_os("RAYONETTE_EVENT_LOG").map(|path| {
+            let file =
+                std::fs::File::create(&path).expect("cannot create RAYONETTE_EVENT_LOG file");
             Mutex::new(Recorder {
                 file,
                 start: std::time::Instant::now(),
@@ -106,21 +107,21 @@ async fn main() {
         // without one it serves as a leaf. This is what lets the harness build
         // real relay trees, not just a flat star. agent_main serves, then exits
         // the process (an agent must not linger on its parent's stdin).
-        rayonet::node::agent_main(rayonet::node::NodeConfig::new(
-            __rayonet_registry(),
-            __rayonet_source(),
-            "rayonet-docker-consumer".to_string(),
-            std::env::var("RAYONET_TOOLCHAIN").unwrap_or_else(|_| "stable".to_string()),
+        rayonette::node::agent_main(rayonette::node::NodeConfig::new(
+            __rayonette_registry(),
+            __rayonette_source(),
+            "rayonette-docker-consumer".to_string(),
+            std::env::var("RAYONETTE_TOOLCHAIN").unwrap_or_else(|_| "stable".to_string()),
         ))
         .await;
     }
 
-    let config_path = env("RAYONET_SSH_CONFIG");
-    let leaves = env("RAYONET_LEAVES");
-    let tar = __rayonet_source();
-    let toolchain = std::env::var("RAYONET_TOOLCHAIN").unwrap_or_else(|_| "stable".to_string());
-    let task = std::env::var("RAYONET_TASK").unwrap_or_else(|_| "double".to_string());
-    let count: u32 = std::env::var("RAYONET_COUNT")
+    let config_path = env("RAYONETTE_SSH_CONFIG");
+    let leaves = env("RAYONETTE_LEAVES");
+    let tar = __rayonette_source();
+    let toolchain = std::env::var("RAYONETTE_TOOLCHAIN").unwrap_or_else(|_| "stable".to_string());
+    let task = std::env::var("RAYONETTE_TASK").unwrap_or_else(|_| "double".to_string());
+    let count: u32 = std::env::var("RAYONETTE_COUNT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
@@ -135,7 +136,7 @@ async fn main() {
                 SshConfig::new(leaf).config_file(&config_path),
                 tar.clone(),
                 toolchain.clone(),
-                "rayonet-docker-consumer",
+                "rayonette-docker-consumer",
             )
         })
         .collect();
@@ -144,7 +145,7 @@ async fn main() {
     let inputs: Vec<u32> = (0..count).collect();
     // Task functions must appear literally in `net_map_with_fleet(<fn>, ...)` so
     // the build-time extractor registers them, hence the duplicated branches.
-    let require_redundancy = std::env::var("RAYONET_REQUIRE_REDUNDANCY").is_ok();
+    let require_redundancy = std::env::var("RAYONETTE_REQUIRE_REDUNDANCY").is_ok();
     let result = if task == "crunch" {
         let job = inputs.clone().net_map_with_fleet(crunch, &fleet);
         if require_redundancy {

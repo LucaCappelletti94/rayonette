@@ -103,7 +103,7 @@ fn expand_tilde(path: &str) -> String {
 ///
 /// A bare entry is a destination on the ambient ssh configuration; `dest=keyfile`
 /// authenticates with an explicit private key (a leading `~/` is expanded). This
-/// is the form used by both `RAYONET_HOSTS` and the children file.
+/// is the form used by both `RAYONETTE_HOSTS` and the children file.
 #[must_use]
 pub fn parse_host_spec(entry: &str) -> SshConfig {
     match entry.split_once('=') {
@@ -115,7 +115,7 @@ pub fn parse_host_spec(entry: &str) -> SshConfig {
 /// Parse a host list: `dest[=keyfile]` entries separated by newlines, spaces, or
 /// commas, with blank lines and `#` comments (whole-line or trailing) ignored.
 ///
-/// Shared by the `RAYONET_HOSTS` env var and the children file (decentralized
+/// Shared by the `RAYONETTE_HOSTS` env var and the children file (decentralized
 /// per-node child list).
 #[must_use]
 pub fn parse_host_list(content: &str) -> Vec<SshConfig> {
@@ -184,7 +184,7 @@ impl Remote for SshRemote {
             return Ok(());
         }
         Err(io::Error::other(format!(
-            "rayonet: upload to {dest} failed: {}",
+            "rayonette: upload to {dest} failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )))
     }

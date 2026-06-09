@@ -170,8 +170,8 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 name = "consumer"
 version = "0.0.0"
 dependencies = [
- "rayonet",
- "rayonet-build",
+ "rayonette",
+ "rayonette-build",
  "tokio",
 ]
 
@@ -694,8 +694,8 @@ dependencies = [
 name = "montecarlo"
 version = "0.0.0"
 dependencies = [
- "rayonet",
- "rayonet-build",
+ "rayonette",
+ "rayonette-build",
  "tokio",
 ]
 
@@ -962,7 +962,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rayonet"
+name = "rayonette"
 version = "0.0.0"
 dependencies = [
  "blake3",
@@ -981,7 +981,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rayonet-build"
+name = "rayonette-build"
 version = "0.0.0"
 dependencies = [
  "syn",
@@ -991,11 +991,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "rayonet-docker-consumer"
+name = "rayonette-docker-consumer"
 version = "0.0.0"
 dependencies = [
- "rayonet",
- "rayonet-build",
+ "rayonette",
+ "rayonette-build",
  "serde_json",
  "tokio",
 ]
@@ -1222,8 +1222,8 @@ dependencies = [
 name = "ssh-run"
 version = "0.0.0"
 dependencies = [
- "rayonet",
- "rayonet-build",
+ "rayonette",
+ "rayonette-build",
  "tokio",
 ]
 
@@ -1421,7 +1421,7 @@ name = "tui-replay"
 version = "0.0.0"
 dependencies = [
  "ratatui",
- "rayonet",
+ "rayonette",
  "serde_json",
  "tokio",
 ]

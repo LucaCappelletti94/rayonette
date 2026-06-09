@@ -14,10 +14,10 @@
 # the standby re-reads and absorbs it. Killing the primary gateway then reroutes
 # shared onto the standby. The gateways relay and never compute, so they are
 # relay-only by construction.
-name: rayonet-capstone
+name: rayonette-capstone
 
 volumes:
-  rayonet-topo-cache:
+  rayonette-topo-cache:
     external: true
 
 networks:
@@ -26,10 +26,10 @@ networks:
 
 x-agent: &agent
   init: true
-  image: rayonet-harness-base:latest
+  image: rayonette-harness-base:latest
   volumes:
     - ../../secrets:/secrets:ro
-    - rayonet-topo-cache:/home/rayonet/.cache
+    - rayonette-topo-cache:/home/rayonette/.cache
 
 services:
   gatewayA:

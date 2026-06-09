@@ -6,9 +6,9 @@
 # gateway for shared is killed and shared reroutes onto the standby. Everything
 # completes once.
 source "$(dirname "$0")/../lib.sh"
-PROJ=rayonet-metropolis
+PROJ=rayonette-metropolis
 COMPOSE="$(dirname "$0")/compose.yml"
-config=/tmp/rayonet-metropolis-config
+config=/tmp/rayonette-metropolis-config
 fails=0
 cleanup() { [ "${KEEP:-0}" = 1 ] || docker compose -p "$PROJ" -f "$COMPOSE" down -t 2 >/dev/null 2>&1; }
 trap cleanup EXIT

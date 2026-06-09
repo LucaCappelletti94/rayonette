@@ -9,9 +9,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd \
     && ssh-keygen -A \
-    && useradd -m -s /bin/bash rayonet \
+    && useradd -m -s /bin/bash rayonette \
     && printf 'PasswordAuthentication no\nPermitRootLogin no\n' \
-        > /etc/ssh/sshd_config.d/rayonet.conf
+        > /etc/ssh/sshd_config.d/rayonette.conf
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

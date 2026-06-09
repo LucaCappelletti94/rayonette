@@ -5,7 +5,7 @@
 //! the TUI at several points across the run, diffing the result against a
 //! committed text golden. This is the loop for refining the TUI: edit
 //! `tui::draw`, run this test, read the visual diff, and regenerate the golden
-//! with `RAYONET_TUI_BLESS=1` once the change is intended.
+//! with `RAYONETTE_TUI_BLESS=1` once the change is intended.
 #![cfg(feature = "tui")]
 
 use std::fmt::Write as _;
@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::Terminal;
-use rayonet::observability::RecordedEvent;
-use rayonet::tui::App;
+use rayonette::observability::RecordedEvent;
+use rayonette::tui::App;
 
 /// A fixed frame size, so the rendered text is stable across machines.
 const WIDTH: u16 = 120;
@@ -47,7 +47,7 @@ fn render(app: &App) -> String {
     let mut app = app.clone();
     let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
     terminal
-        .draw(|frame| rayonet::tui::draw(frame, &mut app))
+        .draw(|frame| rayonette::tui::draw(frame, &mut app))
         .unwrap();
     rows(terminal.backend().buffer()).join("\n")
 }
@@ -78,15 +78,15 @@ fn tui_matches_the_capstone_golden() {
     }
 
     let golden = fixture("capstone-tui.golden");
-    if std::env::var_os("RAYONET_TUI_BLESS").is_some() {
+    if std::env::var_os("RAYONETTE_TUI_BLESS").is_some() {
         std::fs::write(&golden, &snapshot).unwrap();
         return;
     }
     let expected = std::fs::read_to_string(&golden)
-        .expect("golden missing; run the test with RAYONET_TUI_BLESS=1 to create it");
+        .expect("golden missing; run the test with RAYONETTE_TUI_BLESS=1 to create it");
     assert_eq!(
         snapshot, expected,
-        "the TUI render drifted from the golden; review the diff and, if intended, re-bless with RAYONET_TUI_BLESS=1"
+        "the TUI render drifted from the golden; review the diff and, if intended, re-bless with RAYONETTE_TUI_BLESS=1"
     );
 }
 
