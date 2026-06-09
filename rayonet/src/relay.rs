@@ -745,6 +745,12 @@ where
     drop(child_events_tx);
     sched.shutdown().await;
     flush_uplink(&mut uplink_rx, &mut parent_tx).await;
+    // Awaiting every reader here cannot hang: a reader is either already aborted
+    // (its child was declared lost while half-open, in the heartbeat-stale arm) or
+    // belongs to a live child that `shutdown` just sent `Shutdown` to and so
+    // reaches EOF. The one residual edge is a child going half-open during this
+    // final window with the heartbeat off; the bounded-drain follow-up tracked on
+    // the coordinator's matching loop applies here too.
     for reader in readers {
         let _ = reader.await;
     }

@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use rayonet::capability::{pred, Filter, Os, Role};
 use rayonet::fleet::{Fleet, NetMapExt};
-use rayonet::node::{run_node, NodeConfig};
+use rayonet::node::{agent_main, NodeConfig};
 use rayonet::observability::{depth, leaf_of, Event, EventSink};
 use rayonet::process;
 use rayonet::ssh::{parse_host_spec, Ssh};
@@ -87,8 +87,8 @@ async fn main() {
             "ssh-run".to_string(),
             "stable".to_string(),
         );
-        run_node(config).await.expect("agent failed");
-        return;
+        // `agent_main` runs the node then exits the process; it never returns.
+        agent_main(config).await;
     }
 
     let spec = std::env::var("RAYONET_HOSTS")

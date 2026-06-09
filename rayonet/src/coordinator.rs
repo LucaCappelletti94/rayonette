@@ -954,6 +954,14 @@ where
             events.emit(observed);
         }
     }
+    // Awaiting every reader here cannot hang: a reader is either already aborted
+    // (its node was declared lost while half-open, in `lose`) or belongs to a live
+    // node that was just sent `Shutdown` above and so reaches EOF. The same
+    // invariant lets the drain loop above terminate, since each reader holds an
+    // events sender that drops only when the reader finishes. The one residual
+    // edge is a node that goes half-open during this final window with the
+    // heartbeat off (nothing then declares it lost); bounding this drain and
+    // aborting any reader still parked after a short grace is a tracked follow-up.
     for reader in std::mem::take(&mut job.readers) {
         let _ = reader.await;
     }

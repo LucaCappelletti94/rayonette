@@ -43,8 +43,8 @@ multiple_crate_versions = "allow"
 future_not_send = "allow"
 # A few high-value restriction lints on top of the groups.
 dbg_macro = "deny"
-todo = "warn"
-unimplemented = "warn"
+todo = "deny"
+unimplemented = "deny"
 # Force every carve-out to be a reasoned `#[expect]`, so an allow is
 # self-documenting and the build fails when one goes stale.
 allow_attributes = "deny"

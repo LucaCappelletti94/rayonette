@@ -150,10 +150,13 @@ where
 /// Run this node in agent mode over its stdio.
 ///
 /// A leaf if it has no children file, else a relay over the children it names
-/// (which reports its subtree's state up to its parent). Most agent binaries
-/// should call [`agent_main`] instead, which runs this and then exits the
-/// process. This lower-level form returns its result and is what the node and
-/// relay tests drive directly.
+/// (which reports its subtree's state up to its parent).
+///
+/// A binary's `main` must call [`agent_main`], never this, because only
+/// `agent_main` exits the process when serving ends, which avoids the
+/// `tokio::io::stdin` blocking-thread hang on a graceful self-termination (see
+/// its docs for the full reason). This lower-level form returns its result and
+/// exists for the node and relay tests, which drive it directly.
 ///
 /// # Errors
 /// Returns an error on a protocol violation or a transport failure.
