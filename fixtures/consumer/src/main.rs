@@ -18,12 +18,7 @@ async fn main() {
     if process::is_agent() {
         // The one agent entry point: serves as a leaf (or a relay if a children
         // file names children), then exits the process. It never returns.
-        let config = NodeConfig::new(
-            __rayonette_registry(),
-            __rayonette_source(),
-            "consumer".to_string(),
-            "stable".to_string(),
-        );
+        let config = NodeConfig::new(__rayonette_registry(), __rayonette_source());
         agent_main(config).await;
     }
 

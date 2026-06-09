@@ -22,7 +22,7 @@ Fix: at minimum make the runtime error name the missing key and hint that the fu
 
 `NodeConfig::new(registry, source, binary_name: String, toolchain: String)` (`rayonette/src/node.rs`) takes the binary name and toolchain as bare strings. A wrong binary name or a typo such as `"stabel"` compiles cleanly and fails late during remote provisioning, far from the call site.
 
-Fix: default the binary name from `env!("CARGO_BIN_NAME")` or `current_exe`, and make the toolchain a small enum (or default it to `"stable"` through a typed setter), so the common case needs no strings and a wrong value is harder to express.
+Fix: done. A `Toolchain` enum (`Stable` default, `Nightly`, `Named` for a pinned version) replaces the toolchain string in `NodeConfig` and `Ssh::build`, so a typo is unrepresentable. `NodeConfig::new(registry, source)` is now two-arg: the binary name defaults to the running executable's file stem (every node runs the same binary, so `std::env::current_exe()` is correct at every tree position) and the toolchain to `Stable`, with `.binary_name(...)` / `.toolchain(...)` builder overrides. The remote commands built from these values are unchanged, so provisioning behavior is identical. The consumer-side `Ssh::build` still names the binary explicitly; folding that away is item 5.
 
 ## 4. The entire crate is `pub mod`
 
@@ -39,5 +39,6 @@ Fix: a single `rayonette::agent_entrypoint!()` macro, or a `run_agent_if_agent()
 ## Status
 
 - Item 1: done (merged).
-- Item 4: done (this change).
-- Items 2, 3, 5: recorded here, not yet started.
+- Item 3: done (this change).
+- Item 4: done (merged).
+- Items 2 and 5: recorded here, not yet started.

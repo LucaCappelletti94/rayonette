@@ -25,12 +25,7 @@ async fn main() {
 
     // Runs as a leaf (no children file in the test environment); the relay path
     // is exercised by the node/relay unit tests and the real R2 verification.
-    let config = NodeConfig::new(
-        registry,
-        Vec::new(),
-        "rayonette-test-agent".to_string(),
-        "stable".to_string(),
-    );
+    let config = NodeConfig::new(registry, Vec::new());
     // Serve, then exit the process (an agent must not linger on its parent's
     // stdin; see rayonette::node::agent_main).
     agent_main(config).await;

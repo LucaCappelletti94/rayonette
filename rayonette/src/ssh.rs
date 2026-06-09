@@ -16,6 +16,7 @@ use tokio::io::{join, AsyncWriteExt, Join};
 use crate::capability::NodeProfile;
 use crate::fleet::Launch;
 use crate::framing::Connection;
+use crate::node::Toolchain;
 use crate::observability::EventSink;
 use crate::process::AGENT_ENV;
 use crate::provisioning::{node_id, probe, provision, CommandOutput, Remote};
@@ -199,7 +200,7 @@ enum AgentSource {
     /// Run the provisioning ladder first, then spawn what it built.
     Build {
         source_tar: Vec<u8>,
-        toolchain: String,
+        toolchain: Toolchain,
         binary_name: String,
     },
 }
@@ -238,14 +239,14 @@ impl Ssh {
     pub fn build(
         config: SshConfig,
         source_tar: Vec<u8>,
-        toolchain: impl Into<String>,
+        toolchain: Toolchain,
         binary_name: impl Into<String>,
     ) -> Self {
         Self {
             config,
             source: AgentSource::Build {
                 source_tar,
-                toolchain: toolchain.into(),
+                toolchain,
                 binary_name: binary_name.into(),
             },
         }
@@ -300,7 +301,7 @@ impl Launch for Ssh {
                 let provisioned = provision(
                     &remote,
                     source_tar,
-                    toolchain,
+                    toolchain.as_rustup(),
                     binary_name,
                     &self.config.destination,
                     events,
