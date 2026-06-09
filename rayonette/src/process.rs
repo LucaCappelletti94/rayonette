@@ -29,17 +29,6 @@ pub fn agent_connection() -> Connection<Join<Stdin, Stdout>> {
     Connection::new(join(tokio::io::stdin(), tokio::io::stdout()))
 }
 
-/// Serve as an agent over this process's stdio with the given registry.
-///
-/// Call this from the consumer's `main` when [`is_agent`] is true; it returns
-/// when the coordinator sends `Shutdown` or the connection closes.
-///
-/// # Errors
-/// Returns an error on a protocol violation or transport failure.
-pub async fn run_agent(registry: crate::agent::Registry) -> std::io::Result<()> {
-    crate::agent::serve(agent_connection(), registry).await
-}
-
 /// A spawned agent subprocess: its handle and captured stderr.
 pub struct AgentProcess {
     /// The child process handle.
