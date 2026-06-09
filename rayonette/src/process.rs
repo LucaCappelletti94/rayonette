@@ -25,11 +25,12 @@ pub fn is_agent() -> bool {
 /// A connection over this process's stdin (reads) and stdout (writes), for an
 /// agent to serve on.
 #[must_use]
-pub fn agent_connection() -> Connection<Join<Stdin, Stdout>> {
+pub(crate) fn agent_connection() -> Connection<Join<Stdin, Stdout>> {
     Connection::new(join(tokio::io::stdin(), tokio::io::stdout()))
 }
 
 /// A spawned agent subprocess: its handle and captured stderr.
+#[doc(hidden)]
 pub struct AgentProcess {
     /// The child process handle.
     child: Child,
@@ -83,6 +84,7 @@ impl AgentProcess {
 /// # Panics
 /// Panics if a piped stdio handle is missing, which cannot happen here because
 /// all three streams are configured as pipes immediately above.
+#[doc(hidden)]
 pub fn spawn(
     mut command: Command,
 ) -> std::io::Result<(Connection<Join<ChildStdout, ChildStdin>>, AgentProcess)> {

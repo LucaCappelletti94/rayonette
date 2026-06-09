@@ -28,7 +28,7 @@ Fix: default the binary name from `env!("CARGO_BIN_NAME")` or `current_exe`, and
 
 `lib.rs` exposes 16 public modules: the real API is roughly six names, but `coordinator`, `framing`, `protocol`, `provisioning`, `relay`, `graph`, `control`, `telemetry`, `observability`, and the rest are all public, and `testing` ships its test doubles in the public API unconditionally. That is a large and fragile semver surface for a crate about to be published.
 
-Fix: curate the surface. Add a `prelude` (`NetMapExt`/`net_map`, `Fleet`, `install_fleet`, `Ssh`, `NodeConfig`, `agent_main`, `handler`, `pred`, `Role`, `Filter`), mark the internals `pub(crate)` or `#[doc(hidden)]`, and put `testing` behind a `test-util` feature so it does not ship by default.
+Fix: curate the surface. Done. The engine modules with no external use (`graph`, `heartbeat`, `layout`, `protocol`, `relay`, `telemetry`) are now `pub(crate)`; the modules the build-time codegen or the integration tests still reach (`agent`, `coordinator`, `framing`, `provisioning`, `testing`) are `#[doc(hidden)] pub` so they keep working but leave the docs; and within the modules that stay public, internal items were demoted (`node::load_children`, `process::agent_connection`, `observability::parent_of` to `pub(crate)`; `process::{spawn, AgentProcess}` and `ssh::SshRemote` to `#[doc(hidden)]`, since they are reached by the integration tests or forced public by a `Launch` associated type). A `prelude` was added. The public module surface dropped from 16+ to 9 (`capability`, `control`, `fleet`, `node`, `observability`, `process`, `ssh`, `tui`, `prelude`). Per the chosen strategy this used `#[doc(hidden)]` rather than a `test-util` feature, so there were no test changes.
 
 ## 5. Consumer boilerplate is spread thin and easy to get subtly wrong
 
@@ -38,5 +38,6 @@ Fix: a single `rayonette::agent_entrypoint!()` macro, or a `run_agent_if_agent()
 
 ## Status
 
-- Item 1: done (pending CI confirmation of the ssh-localhost coverage leg, which cannot run locally).
-- Items 2 through 5: recorded here, not yet started.
+- Item 1: done (merged).
+- Item 4: done (this change).
+- Items 2, 3, 5: recorded here, not yet started.

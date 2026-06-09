@@ -26,13 +26,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use geometric_traits::{
-    impls::{SortedVec, SquareCSR2D, SymmetricCSR2D, ValuedCSR2D, CSR2D},
+    impls::{SortedVec, SymmetricCSR2D, ValuedCSR2D, CSR2D},
     prelude::*,
     traits::{
         algorithms::connected_components::ConnectedComponentsResult, EdgesBuilder,
         VocabularyBuilder,
     },
 };
+// Only the test-only `directed` acyclicity check uses the square matrix form.
+#[cfg(test)]
+use geometric_traits::impls::SquareCSR2D;
 
 use crate::capability::{NodeProfile, Role};
 use crate::observability::{parent_of, Event, NodeView, RunState};
@@ -60,7 +63,7 @@ fn microseconds_to_millis(microseconds: u64) -> f64 {
 /// Bandwidth comes from an opt-in calibrated transfer, so it is absent until that
 /// probe runs and the widest-path metric is meaningless without it.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LinkMetric {
+pub(crate) struct LinkMetric {
     /// Link round-trip latency in milliseconds (lower is better).
     latency_ms: f64,
     /// Link bandwidth in bytes per second, if probed (higher is better).
@@ -80,7 +83,7 @@ impl Default for LinkMetric {
 
 /// How the coordinator ranks the candidate paths to a multiply-reachable node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Metric {
+pub(crate) enum Metric {
     /// Maximize the path's bottleneck bandwidth (the default: the slowest hop
     /// throttles a large transfer, so the widest bottleneck wins).
     #[default]
@@ -92,7 +95,7 @@ pub enum Metric {
 /// One relay as the coordinator sees it at the handshake: its label, the latency
 /// of the coordinator's link to it, and the children it built and is offering.
 #[derive(Debug)]
-pub struct RelayReport {
+pub(crate) struct RelayReport {
     /// The relay's label under the coordinator (its path segment).
     label: String,
     /// Measured latency (microseconds) of the coordinator's link to this relay.
@@ -106,7 +109,7 @@ impl RelayReport {
     /// the `latency_us` of the coordinator's link to it, and the `children` it
     /// built and is offering.
     #[must_use]
-    pub const fn new(label: String, latency_us: u64, children: Vec<ChildAd>) -> Self {
+    pub(crate) const fn new(label: String, latency_us: u64, children: Vec<ChildAd>) -> Self {
         Self {
             label,
             latency_us,
@@ -123,7 +126,7 @@ impl RelayReport {
 /// reports to dedup redundant paths before any task flows, so a shared node runs
 /// on its best path and the others hold it standby.
 #[must_use]
-pub fn choose_active(relays: &[RelayReport], metric: Metric) -> Vec<Vec<String>> {
+pub(crate) fn choose_active(relays: &[RelayReport], metric: Metric) -> Vec<Vec<String>> {
     let primaries = Topology::from_run_state(&relay_topology(relays)).select_primaries(metric);
     relays
         .iter()
@@ -174,7 +177,7 @@ fn relay_topology(relays: &[RelayReport]) -> RunState {
 /// no alternate path survives that relay's death. A run that requires redundancy
 /// refuses to start when this is non-empty.
 #[must_use]
-pub fn redundancy_gaps(relays: &[RelayReport]) -> Vec<String> {
+pub(crate) fn redundancy_gaps(relays: &[RelayReport]) -> Vec<String> {
     let topology = Topology::from_run_state(&relay_topology(relays));
     let mut gaps = Vec::new();
     let mut seen = BTreeSet::new();
@@ -188,7 +191,7 @@ pub fn redundancy_gaps(relays: &[RelayReport]) -> Vec<String> {
 
 /// The discovered relay tree as a DAG over physical nodes, keyed by stable id.
 #[derive(Debug)]
-pub struct Topology {
+pub(crate) struct Topology {
     /// Physical node ids in vertex-index order. Index 0 is always [`ROOT`].
     ids: Vec<String>,
     /// The vertex index of each physical id (and of [`ROOT`]).
@@ -204,7 +207,7 @@ impl Topology {
     /// physical id (or [`ROOT`] for a top-level node), so a node seen on two
     /// paths becomes one vertex with two parent edges.
     #[must_use]
-    pub fn from_run_state(state: &RunState) -> Self {
+    pub(crate) fn from_run_state(state: &RunState) -> Self {
         // Vertex 0 is the coordinator root, then each distinct physical id in
         // sorted order for a deterministic vertex numbering.
         let physical: BTreeSet<&str> = state.nodes().values().filter_map(NodeView::id).collect();
@@ -255,8 +258,9 @@ impl Topology {
 
     /// Whether the discovered children configuration is acyclic (a sane tree or
     /// DAG). A cycle means a node is reachable as its own ancestor.
+    #[cfg(test)]
     #[must_use]
-    pub fn is_acyclic(&self) -> bool {
+    pub(crate) fn is_acyclic(&self) -> bool {
         self.directed().kahn().is_ok()
     }
 
@@ -264,7 +268,7 @@ impl Topology {
     /// articulation points of the undirected projection, excluding the
     /// coordinator root (whose loss is inherent, not a relay fault).
     #[must_use]
-    pub fn single_points_of_failure(&self) -> BTreeSet<String> {
+    pub(crate) fn single_points_of_failure(&self) -> BTreeSet<String> {
         self.articulation_points()
             .into_iter()
             .filter_map(|v| self.ids.get(v).cloned())
@@ -274,8 +278,9 @@ impl Topology {
 
     /// The physical ids of the relays that are a parent of `id` (the coordinator
     /// root is never listed). More than one means the node is multiply reachable.
+    #[cfg(test)]
     #[must_use]
-    pub fn parents_of(&self, id: &str) -> BTreeSet<String> {
+    pub(crate) fn parents_of(&self, id: &str) -> BTreeSet<String> {
         let Some(&child) = self.index.get(id) else {
             return BTreeSet::new();
         };
@@ -291,7 +296,7 @@ impl Topology {
     /// dies: no articulation point lies on every path from the root to it. A node
     /// reachable through only one relay is not redundant.
     #[must_use]
-    pub fn is_redundant(&self, id: &str) -> bool {
+    pub(crate) fn is_redundant(&self, id: &str) -> bool {
         let Some(&node) = self.index.get(id) else {
             return false;
         };
@@ -312,7 +317,7 @@ impl Topology {
     /// first is the primary path to run the node on, the rest are standbys. Nodes
     /// with a single parent are omitted, since they offer no choice.
     #[must_use]
-    pub fn select_primaries(&self, metric: Metric) -> BTreeMap<String, Vec<String>> {
+    pub(crate) fn select_primaries(&self, metric: Metric) -> BTreeMap<String, Vec<String>> {
         // The cost-to-root of every vertex, in the units the chosen metric ranks
         // by (summed latency, or bottleneck bandwidth).
         let cost = match metric {
@@ -347,7 +352,7 @@ impl Topology {
     /// The physical node ids in vertex-index order, index 0 being the synthetic
     /// coordinator root. A graph layout positions one point per entry.
     #[must_use]
-    pub fn vertices(&self) -> &[String] {
+    pub(crate) fn vertices(&self) -> &[String] {
         &self.ids
     }
 
@@ -355,7 +360,7 @@ impl Topology {
     /// [`vertices`](Self::vertices). A node reached through two relays contributes
     /// two edges into its single vertex.
     #[must_use]
-    pub fn edge_indices(&self) -> Vec<(usize, usize)> {
+    pub(crate) fn edge_indices(&self) -> Vec<(usize, usize)> {
         self.edges.keys().copied().collect()
     }
 
@@ -370,6 +375,7 @@ impl Topology {
 
     /// The directed CSR matrix of the DAG, the form [`Kahn`](geometric_traits::traits::algorithms::kahn::Kahn)
     /// consumes.
+    #[cfg(test)]
     fn directed(&self) -> SquareCSR2D<CSR2D<usize, usize, usize>> {
         DiEdgesBuilder::default()
             .expected_number_of_edges(self.edges.len())

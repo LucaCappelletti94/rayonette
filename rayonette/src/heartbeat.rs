@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// How a run probes node liveness: whether it is on, the ping interval, and the
 /// silence timeout after which a peer is given up on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HeartbeatConfig {
+pub(crate) struct HeartbeatConfig {
     enabled: bool,
     interval_ms: u64,
     timeout_ms: u64,
@@ -38,7 +38,7 @@ impl HeartbeatConfig {
     /// A heartbeat that pings every `interval` and gives up after `timeout` of
     /// silence.
     #[must_use]
-    pub fn new(interval: Duration, timeout: Duration) -> Self {
+    pub(crate) fn new(interval: Duration, timeout: Duration) -> Self {
         Self {
             enabled: true,
             interval_ms: u64::try_from(interval.as_millis()).unwrap_or(u64::MAX),
@@ -49,7 +49,7 @@ impl HeartbeatConfig {
     /// A disabled heartbeat: no pings and no liveness teardown (the behaviour
     /// before the heartbeat existed).
     #[must_use]
-    pub const fn disabled() -> Self {
+    pub(crate) const fn disabled() -> Self {
         Self {
             enabled: false,
             interval_ms: 0,
@@ -59,19 +59,19 @@ impl HeartbeatConfig {
 
     /// Whether the heartbeat is on.
     #[must_use]
-    pub const fn is_enabled(&self) -> bool {
+    pub(crate) const fn is_enabled(&self) -> bool {
         self.enabled
     }
 
     /// How often a parent pings its children.
     #[must_use]
-    pub const fn interval(&self) -> Duration {
+    pub(crate) const fn interval(&self) -> Duration {
         Duration::from_millis(self.interval_ms)
     }
 
     /// How long a peer may be silent before it is given up on.
     #[must_use]
-    pub const fn timeout(&self) -> Duration {
+    pub(crate) const fn timeout(&self) -> Duration {
         Duration::from_millis(self.timeout_ms)
     }
 }

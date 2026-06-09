@@ -29,7 +29,7 @@ const ITERATIONS: usize = 500;
 /// to an `(x, y)` in the unit square `[0, 1]^2`. Deterministic: the same topology
 /// always yields the same positions.
 #[must_use]
-pub fn positions(topology: &Topology) -> BTreeMap<String, (f64, f64)> {
+pub(crate) fn positions(topology: &Topology) -> BTreeMap<String, (f64, f64)> {
     let vertices = topology.vertices();
 
     // A lone coordinator (no nodes discovered yet) has nothing to spread out: it
