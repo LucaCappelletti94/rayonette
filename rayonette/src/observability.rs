@@ -317,7 +317,7 @@ impl EventSink for EventBus {
 /// top-level node. Node ids are `/`-joined paths from the root, so the tree
 /// structure is read straight off the id.
 #[must_use]
-pub fn parent_of(id: &str) -> Option<&str> {
+pub(crate) fn parent_of(id: &str) -> Option<&str> {
     id.rsplit_once('/').map(|(parent, _)| parent)
 }
 

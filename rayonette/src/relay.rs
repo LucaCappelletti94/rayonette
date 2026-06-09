@@ -43,9 +43,13 @@ pub(crate) trait ChildSource<L: Launch>: Send {
     fn poll(&mut self, present: &[String]) -> Vec<L>;
 }
 
-/// The default source for a relay with a fixed child set: it never grows.
+/// The default source for a relay with a fixed child set: it never grows. Only
+/// the tests run a relay this way; the node boot path always supplies a real
+/// child source.
+#[cfg(test)]
 pub(crate) struct NoChildSource;
 
+#[cfg(test)]
 impl<L: Launch> ChildSource<L> for NoChildSource {
     fn poll(&mut self, _present: &[String]) -> Vec<L> {
         Vec::new()
@@ -499,7 +503,8 @@ where
 ///
 /// # Errors
 /// Returns an error on a protocol violation or a transport failure on either side.
-pub async fn relay<P, L>(parent: Connection<P>, children: Vec<L>) -> io::Result<()>
+#[cfg(test)]
+pub(crate) async fn relay<P, L>(parent: Connection<P>, children: Vec<L>) -> io::Result<()>
 where
     P: AsyncRead + AsyncWrite + Unpin + Send,
     L: Launch + Send + Sync,

@@ -41,6 +41,10 @@ multiple_crate_versions = "allow"
 # Would force Send/Sync bounds across the whole async API for a nursery lint;
 # revisit once we commit to a spawnable (Send) transport.
 future_not_send = "allow"
+# Directly conflicts with the rust `unreachable_pub` lint we rely on: once an
+# engine module is `pub(crate)`, its cross-module items must stay `pub(crate)`
+# for sibling visibility, which this nursery lint then flags as redundant.
+redundant_pub_crate = "allow"
 # A few high-value restriction lints on top of the groups.
 dbg_macro = "deny"
 todo = "deny"

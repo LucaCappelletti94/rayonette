@@ -13,7 +13,7 @@ use crate::observability::NodeTelemetry;
 /// Samples local resource utilisation, remembering the previous CPU reading so
 /// each sample reports the busy fraction since the one before it.
 #[derive(Debug, Default)]
-pub struct Sampler {
+pub(crate) struct Sampler {
     /// The previous `(busy, total)` CPU jiffies, for the next delta.
     prev_cpu: Option<(u64, u64)>,
 }
@@ -21,12 +21,12 @@ pub struct Sampler {
 impl Sampler {
     /// A fresh sampler with no prior CPU reading.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// Sample current utilisation, recording `in_flight` tasks running right now.
-    pub fn sample(&mut self, in_flight: usize) -> NodeTelemetry {
+    pub(crate) fn sample(&mut self, in_flight: usize) -> NodeTelemetry {
         let (cpu_pct, mem_pct, gpu) = read_local(&mut self.prev_cpu);
         telemetry_from_reading(cpu_pct, mem_pct, gpu, in_flight, local_interfaces())
     }

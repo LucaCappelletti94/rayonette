@@ -131,6 +131,7 @@ pub fn parse_host_list(content: &str) -> Vec<SshConfig> {
 
 /// A live ssh session that provisioning commands run over (a [`Remote`]).
 #[derive(Debug)]
+#[doc(hidden)]
 pub struct SshRemote {
     session: Arc<Session>,
 }

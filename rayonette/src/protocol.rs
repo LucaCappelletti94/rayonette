@@ -5,10 +5,10 @@ use serde::{Deserialize, Serialize};
 /// Bumped when the wire protocol changes. Because the agent is compiled from the
 /// same source as the coordinator (whole-crate compile), this is a sanity
 /// assertion rather than a true negotiation.
-pub const PROTOCOL_VERSION: u32 = 11;
+pub(crate) const PROTOCOL_VERSION: u32 = 11;
 
 /// Identifies a task within a run.
-pub type TaskId = u64;
+pub(crate) type TaskId = u64;
 
 /// One child a relay has discovered and built, advertised up for path selection.
 ///
@@ -16,7 +16,7 @@ pub type TaskId = u64;
 /// two relays appears once under each, with the same `id`, which is how the
 /// coordinator dedups it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChildAd {
+pub(crate) struct ChildAd {
     /// The child's local label under this relay (its path segment).
     label: String,
     /// The child's stable physical node id (shared across redundant paths).
@@ -33,7 +33,7 @@ impl ChildAd {
     /// physical node `id`, its advertised `slots`, and the relay's measured link
     /// `latency_us` to it.
     #[must_use]
-    pub const fn new(label: String, id: String, slots: usize, latency_us: u64) -> Self {
+    pub(crate) const fn new(label: String, id: String, slots: usize, latency_us: u64) -> Self {
         Self {
             label,
             id,
@@ -44,26 +44,26 @@ impl ChildAd {
 
     /// The child's local label under its relay (its path segment).
     #[must_use]
-    pub fn label(&self) -> &str {
+    pub(crate) fn label(&self) -> &str {
         &self.label
     }
 
     /// The child's stable physical node id, shared across redundant paths.
     #[must_use]
-    pub fn id(&self) -> &str {
+    pub(crate) fn id(&self) -> &str {
         &self.id
     }
 
     /// Measured latency (microseconds) of the relay's link to this child.
     #[must_use]
-    pub const fn latency_us(&self) -> u64 {
+    pub(crate) const fn latency_us(&self) -> u64 {
         self.latency_us
     }
 }
 
 /// Coordinator to agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ToAgent {
+pub(crate) enum ToAgent {
     /// Handshake naming the single function this whole job runs.
     Hello {
         /// Wire protocol version of the coordinator (see [`PROTOCOL_VERSION`]).
@@ -117,7 +117,7 @@ pub enum ToAgent {
 
 /// Agent to coordinator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FromAgent {
+pub(crate) enum FromAgent {
     /// Handshake reply: the agent is built, connected, and ready for work. It
     /// advertises how many tasks it can hold in flight at once: a leaf reports
     /// 1 (one task at a time), a relay reports the number of ready compute slots

@@ -73,7 +73,7 @@ fn read_children_file(path: &Path) -> Vec<SshConfig> {
 
 /// This node's children, read from its children file (empty if it has none).
 #[must_use]
-pub fn load_children() -> Vec<SshConfig> {
+pub(crate) fn load_children() -> Vec<SshConfig> {
     children_path().map_or_else(Vec::new, |path| read_children_file(&path))
 }
 

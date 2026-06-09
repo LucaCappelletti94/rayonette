@@ -22,30 +22,58 @@
     )
 )]
 
-pub mod agent;
+// The user-facing API.
 pub mod capability;
 pub mod control;
-pub mod coordinator;
 pub mod fleet;
-pub mod framing;
-pub mod graph;
-pub mod heartbeat;
-#[cfg(feature = "tui")]
-pub mod layout;
 pub mod node;
 pub mod observability;
 pub mod process;
-pub mod protocol;
-pub mod provisioning;
-pub mod relay;
 pub mod ssh;
-pub mod telemetry;
-pub mod testing;
 #[cfg(feature = "tui")]
 pub mod tui;
 
+// Engine internals, private to the crate.
+pub(crate) mod graph;
+pub(crate) mod heartbeat;
+#[cfg(feature = "tui")]
+pub(crate) mod layout;
+pub(crate) mod protocol;
+pub(crate) mod relay;
+pub(crate) mod telemetry;
+
+// Reachable but not a hand-use API: the build-time-generated registry references
+// `agent`, and the integration tests drive `coordinator`, `framing`,
+// `provisioning`, and `testing` directly. Hidden from the docs.
+#[doc(hidden)]
+pub mod agent;
+#[doc(hidden)]
+pub mod coordinator;
+#[doc(hidden)]
+pub mod framing;
+#[doc(hidden)]
+pub mod provisioning;
+#[doc(hidden)]
+pub mod testing;
+
 /// Install the process-global fleet that bare `net_map(map)` runs against.
 pub use fleet::install_fleet;
+
+/// The common API in one import: `use rayonette::prelude::*;`.
+pub mod prelude {
+    pub use crate::capability::{pred, Filter, Os, Role};
+    pub use crate::control::{Control, ControlClient};
+    #[cfg(feature = "rayon")]
+    pub use crate::fleet::RayonNetMapExt;
+    pub use crate::fleet::{Fleet, Launch, NetMapExt, Subprocess};
+    pub use crate::install_fleet;
+    pub use crate::node::{agent_main, NodeConfig};
+    pub use crate::observability::{Event, EventSink, RunState};
+    pub use crate::process::is_agent;
+    pub use crate::ssh::{parse_host_spec, Ssh, SshConfig};
+    #[cfg(feature = "tui")]
+    pub use crate::tui::{Action, App, Input};
+}
 
 /// Pull in what `rayonette_build::extract()` generated.
 ///
