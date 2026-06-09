@@ -27,6 +27,18 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-features
 
+  # Supply-chain gate: fail on any RustSec advisory (vulnerability, unmaintained,
+  # unsound, or yanked) in the dependency tree. Accepted transitive advisories are
+  # listed with a reason in .cargo/audit.toml.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-audit
+      - name: Audit dependencies
+        run: cargo audit --deny warnings
+
   # Coverage via cargo-llvm-cov (LLVM source-based instrumentation). llvm-cov's
   # region attribution credits async/macro code that line-based tools miss.
   coverage:

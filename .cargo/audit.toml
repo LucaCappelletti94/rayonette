@@ -1,0 +1,19 @@
+# cargo-audit configuration. CI runs `cargo audit --deny warnings`, so a new
+# advisory of any kind (vulnerability, unmaintained, unsound, or yanked) fails
+# the build. The advisories below are accepted with a reason and re-evaluated
+# whenever the dependency that pulls them in is updated.
+[advisories]
+ignore = [
+    # atomic-polyfill is unmaintained. Transitive only, a warning not a
+    # vulnerability, and no exploitable issue; revisit when the dependency that
+    # pulls it in drops it.
+    "RUSTSEC-2023-0089",
+    # paste is unmaintained. Transitive through ratatui (the `tui` feature only),
+    # a warning not a vulnerability; revisit when ratatui drops it.
+    "RUSTSEC-2024-0436",
+    # lru `IterMut` is unsound under Stacked Borrows. Transitive through ratatui's
+    # internal cache; rayonette never iterates an lru mutably itself, so the
+    # unsound path is not on any code path we control. Revisit when ratatui or lru
+    # ships a fix.
+    "RUSTSEC-2026-0002",
+]
