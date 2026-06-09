@@ -783,9 +783,11 @@ where
 /// # Errors
 /// Returns an error on a handshake or transport failure, or if every agent is
 /// lost with no node left able to join before the job completes.
-// The elastic core: the agents, payloads, options, the joins and controls
-// channels, and the sink are each a distinct input to one cohesive run loop.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the elastic core is one cohesive run loop whose inputs (the agents, payloads, options, the joins and controls channels, and the sink) and select arms do not factor cleanly"
+)]
 pub(crate) async fn run_job_raw_with_joins<S>(
     agents: Vec<(String, Connection<S>)>,
     fn_key: &str,

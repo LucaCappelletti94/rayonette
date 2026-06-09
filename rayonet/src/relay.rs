@@ -518,7 +518,10 @@ where
 ///
 /// # Errors
 /// Returns an error on a protocol violation or a transport failure on either side.
-#[allow(clippy::too_many_lines)] // the splice is inlined to avoid an uncovered per-stream helper
+#[expect(
+    clippy::too_many_lines,
+    reason = "the splice is inlined to keep the per-stream monomorphization covered"
+)]
 pub(crate) async fn relay_with_source<P, L, C>(
     parent: Connection<P>,
     children: Vec<L>,
@@ -1650,6 +1653,194 @@ mod tests {
         assert!(sched.on_terminal(7).is_some(), "first terminal is known");
         assert!(sched.on_terminal(7).is_none(), "the duplicate is unknown");
         assert_eq!(sched.load[0], 0);
+    }
+
+    #[tokio::test]
+    async fn resuming_an_idle_child_reports_it_idle_not_working() {
+        // Resuming a paused child with no pending work reports it Idle (the empty
+        // dispatch leaves its load at zero), not Working.
+        use crate::control::ControlAction;
+        use crate::observability::{Event, NodeState};
+        let (client, _server) = connection_pair(64);
+        let (tx, _rx) = client.split();
+        let (uplink_tx, mut uplink_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut sched = super::Relay::new(
+            vec![tx],
+            vec!["leaf".to_string()],
+            vec![1],
+            vec![true],
+            uplink_tx,
+        );
+        sched.paused[0] = true;
+        let alive = sched
+            .control("leaf".to_string(), ControlAction::Resume)
+            .await
+            .unwrap();
+        assert!(alive, "resuming keeps the subtree alive");
+        assert!(!sched.paused[0], "the child is no longer paused");
+        let mut reported = None;
+        while let Ok(Event::Node { state, .. }) = uplink_rx.try_recv() {
+            reported = Some(state);
+        }
+        assert_eq!(reported, Some(NodeState::Idle));
+    }
+
+    #[tokio::test]
+    async fn kill_after_current_on_an_idle_child_kills_it_immediately() {
+        // An after-current kill on a child with nothing in flight takes effect at
+        // once rather than waiting to drain.
+        use crate::control::{ControlAction, KillMode};
+        let (a_client, _a_server) = connection_pair(256);
+        let (a_tx, _ar) = a_client.split();
+        let (b_client, _b_server) = connection_pair(256);
+        let (b_tx, _br) = b_client.split();
+        let (uplink_tx, _uplink_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut sched = super::Relay::new(
+            vec![a_tx, b_tx],
+            vec!["leaf-a".to_string(), "leaf-b".to_string()],
+            vec![1, 1],
+            vec![true, true],
+            uplink_tx,
+        );
+        let alive = sched
+            .control(
+                "leaf-a".to_string(),
+                ControlAction::Kill {
+                    mode: KillMode::AfterCurrent,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(alive, "leaf-b keeps the subtree alive");
+        assert!(!sched.alive[0], "the idle leaf-a was killed immediately");
+        assert!(sched.alive[1], "leaf-b is untouched");
+    }
+
+    #[tokio::test]
+    async fn a_draining_childs_last_completion_tears_the_subtree_down() {
+        // The last alive child, draining toward a kill, finishes its in-flight task:
+        // the completion is forwarded up, then the child is dropped and, with no
+        // sibling left, the relay tears down.
+        let (child_client, _child_server) = connection_pair(256);
+        let (child_tx, _cr) = child_client.split();
+        let (parent_client, parent_server) = connection_pair(256);
+        let (mut parent_tx, _pcr) = parent_client.split();
+        let (_pst, mut parent_rx) = parent_server.split();
+        let (uplink_tx, _uplink_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut sched = super::Relay::new(
+            vec![child_tx],
+            vec!["leaf".to_string()],
+            vec![1],
+            vec![true],
+            uplink_tx,
+        );
+        sched.load[0] = 1;
+        sched.draining[0] = true;
+        sched.inflight.insert(1, (0, vec![]));
+        let alive = sched
+            .handle_child(
+                &mut parent_tx,
+                super::ChildEvent::Message(
+                    0,
+                    FromAgent::Completed {
+                        task_id: 1,
+                        output: vec![],
+                        via: String::new(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !alive,
+            "the last draining child's completion tears the subtree down"
+        );
+        let forwarded = parent_rx.recv::<FromAgent>().await.unwrap();
+        assert!(
+            matches!(forwarded, Some(FromAgent::Completed { task_id: 1, .. })),
+            "the completion is forwarded up first: {forwarded:?}"
+        );
+        assert!(!sched.alive[0], "the drained child is dropped");
+    }
+
+    #[tokio::test]
+    async fn a_draining_childs_last_failure_tears_the_subtree_down() {
+        // As above, but the draining child's final in-flight task fails rather than
+        // completing: the failure is forwarded, then the subtree tears down.
+        let (child_client, _child_server) = connection_pair(256);
+        let (child_tx, _cr) = child_client.split();
+        let (parent_client, parent_server) = connection_pair(256);
+        let (mut parent_tx, _pcr) = parent_client.split();
+        let (_pst, mut parent_rx) = parent_server.split();
+        let (uplink_tx, _uplink_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut sched = super::Relay::new(
+            vec![child_tx],
+            vec!["leaf".to_string()],
+            vec![1],
+            vec![true],
+            uplink_tx,
+        );
+        sched.load[0] = 1;
+        sched.draining[0] = true;
+        sched.inflight.insert(2, (0, vec![]));
+        let alive = sched
+            .handle_child(
+                &mut parent_tx,
+                super::ChildEvent::Message(
+                    0,
+                    FromAgent::Failed {
+                        task_id: 2,
+                        error: "boom".to_string(),
+                        via: String::new(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !alive,
+            "the last draining child's failure tears the subtree down"
+        );
+        let forwarded = parent_rx.recv::<FromAgent>().await.unwrap();
+        assert!(
+            matches!(forwarded, Some(FromAgent::Failed { task_id: 2, .. })),
+            "the failure is forwarded up first: {forwarded:?}"
+        );
+        assert!(!sched.alive[0], "the drained child is dropped");
+    }
+
+    #[tokio::test]
+    async fn a_grandchild_capacity_growth_is_folded_and_reported_up() {
+        // A child that is itself a relay grew its active capacity: the relay folds
+        // the new figure into the child's slot count and reports its enlarged total
+        // up to its own parent.
+        let (child_client, _child_server) = connection_pair(256);
+        let (child_tx, _cr) = child_client.split();
+        let (parent_client, parent_server) = connection_pair(256);
+        let (mut parent_tx, _pcr) = parent_client.split();
+        let (_pst, mut parent_rx) = parent_server.split();
+        let (uplink_tx, _uplink_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut sched = super::Relay::new(
+            vec![child_tx],
+            vec!["sub".to_string()],
+            vec![1],
+            vec![true],
+            uplink_tx,
+        );
+        let alive = sched
+            .handle_child(
+                &mut parent_tx,
+                super::ChildEvent::Message(0, FromAgent::Capacity { slots: 4 }),
+            )
+            .await
+            .unwrap();
+        assert!(alive, "a capacity report keeps the subtree alive");
+        assert_eq!(sched.capacity[0], 4, "the child's capacity grew");
+        let forwarded = parent_rx.recv::<FromAgent>().await.unwrap();
+        assert!(
+            matches!(forwarded, Some(FromAgent::Capacity { slots: 4 })),
+            "the relay reports its enlarged active capacity up: {forwarded:?}"
+        );
     }
 
     #[tokio::test]

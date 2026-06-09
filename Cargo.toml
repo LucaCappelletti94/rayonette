@@ -45,3 +45,7 @@ future_not_send = "allow"
 dbg_macro = "deny"
 todo = "warn"
 unimplemented = "warn"
+# Force every carve-out to be a reasoned `#[expect]`, so an allow is
+# self-documenting and the build fails when one goes stale.
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"

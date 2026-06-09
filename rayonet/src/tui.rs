@@ -291,7 +291,10 @@ impl App {
 
 /// Microseconds as milliseconds for display. A real latency is far below f64's
 /// exact-integer range, so the cast does not lose precision.
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a realistic latency is far below f64's exact-integer range"
+)]
 fn microseconds_to_millis(microseconds: u64) -> f64 {
     microseconds as f64 / 1000.0
 }
@@ -1042,7 +1045,11 @@ const fn node_blink(state: Option<NodeState>) -> Modifier {
 
 /// Project a unit-square position onto a cell of `area`, with y flipped so the top
 /// of the area is `y = 1`.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the rounded coordinate is offset into the cell area, so it fits a u16 and is non-negative"
+)]
 fn project(area: Rect, x: f64, y: f64) -> (u16, u16) {
     let col = area.x + (x * f64::from(area.width.saturating_sub(1))).round() as u16;
     let row = area.y + ((1.0 - y) * f64::from(area.height.saturating_sub(1))).round() as u16;
@@ -1050,7 +1057,11 @@ fn project(area: Rect, x: f64, y: f64) -> (u16, u16) {
 }
 
 /// The cells a straight line from `from` to `to` passes through (Bresenham).
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the Bresenham coordinates stay within the u16 endpoints they interpolate"
+)]
 fn line_cells(from: (u16, u16), to: (u16, u16)) -> Vec<(u16, u16)> {
     let (mut x, mut y) = (i32::from(from.0), i32::from(from.1));
     let (x1, y1) = (i32::from(to.0), i32::from(to.1));

@@ -46,7 +46,10 @@ const ROOT: &str = "\0coordinator";
 /// Convert a microsecond latency to milliseconds for the path metric. A realistic
 /// latency is far below f64's exact-integer range, so the cast does not lose
 /// precision.
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a realistic latency is far below f64's exact-integer range"
+)]
 fn microseconds_to_millis(microseconds: u64) -> f64 {
     microseconds as f64 / 1000.0
 }

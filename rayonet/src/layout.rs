@@ -79,7 +79,10 @@ fn force_atlas2_coords(n: usize, edges: &[(usize, usize)]) -> Vec<(f64, f64)> {
 
 /// Seed positions evenly around the unit circle, so the deterministic layout
 /// starts from a fixed, well-spread configuration instead of a random one.
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a node count is far below f64's exact-integer range"
+)]
 fn circle_positions(n: usize) -> Vec<[f64; 2]> {
     (0..n)
         .map(|i| {

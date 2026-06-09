@@ -317,9 +317,10 @@ enum JoinAttempt<L: Launch> {
 /// The per-attempt handshake (connect, probe, identify, filter, provision,
 /// handshake) is inlined rather than a helper, so it does not monomorphize into a
 /// separate function per launcher type that a fixed fleet would never exercise.
-// Candidates, key, filter, requirement, the joins channel, the retry policy, the
-// heartbeat cadence, and the sink are each a distinct input the rejoin needs.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "candidates, key, filter, requirement, the joins channel, the retry policy, the heartbeat cadence, and the sink are each a distinct input the rejoin needs, inlined rather than a helper to avoid a per-launcher monomorphization"
+)]
 async fn rejoin_driver<L: Launch + Send + Sync>(
     candidates: Vec<&L>,
     fn_key: &str,
