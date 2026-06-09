@@ -8,6 +8,7 @@
 use rayonette::capability::Os;
 use rayonette::coordinator::run_job;
 use rayonette::fleet::Launch;
+use rayonette::node::Toolchain;
 use rayonette::observability::{NodeState, NoopSink};
 use rayonette::provisioning::{remote_agent_path, Remote};
 use rayonette::ssh::{Ssh, SshConfig, SshRemote};
@@ -143,7 +144,7 @@ async fn ssh_build_with_warm_cache_provisions_and_runs() {
     std::fs::copy(env!("CARGO_BIN_EXE_rayonette-test-agent"), &local_path).unwrap();
 
     let events = Recorder::default();
-    let ssh = Ssh::build(config, tar, "stable", "rayonette-test-agent");
+    let ssh = Ssh::build(config, tar, Toolchain::Stable, "rayonette-test-agent");
 
     let session = ssh.connect().await.unwrap();
     let (connection, guard) = ssh.activate(session, &events).await.unwrap();
