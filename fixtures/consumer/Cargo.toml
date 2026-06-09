@@ -10,3 +10,6 @@ tokio = { version = "1", features = ["full"] }
 
 [build-dependencies]
 rayonet-build = { path = "../../rayonet-build" }
+
+[lints]
+workspace = true

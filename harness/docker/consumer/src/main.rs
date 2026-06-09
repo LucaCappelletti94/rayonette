@@ -16,7 +16,7 @@ use rayonet::observability::{Event, EventSink, RecordedEvent, RunState};
 use rayonet::process;
 use rayonet::ssh::{Ssh, SshConfig};
 
-fn double(x: u32) -> u32 {
+const fn double(x: u32) -> u32 {
     x * 2
 }
 
@@ -185,11 +185,19 @@ async fn main() {
     }
     println!("ok: {} results", out.len());
 
-    let state = sink.state.lock().unwrap();
     // Completions are credited to the deep leaf that ran them, so a relay rolls its
     // subtree up: its share line is the work done beneath it (a leaf reports its
-    // own), which is what the topology assertions read.
-    for host in state.nodes().keys() {
-        println!("share {host} {}", state.subtree_completed(host));
+    // own), which is what the topology assertions read. Snapshot under the lock,
+    // then print without holding it.
+    let shares: Vec<(String, usize)> = {
+        let state = sink.state.lock().unwrap();
+        state
+            .nodes()
+            .keys()
+            .map(|host| (host.clone(), state.subtree_completed(host)))
+            .collect()
+    };
+    for (host, completed) in shares {
+        println!("share {host} {completed}");
     }
 }

@@ -118,7 +118,7 @@ fn main() -> io::Result<()> {
 
 /// Translate a terminal event into a dashboard [`Input`], or `None` for events the
 /// dashboard ignores.
-fn to_input(event: CtEvent) -> Option<Input> {
+const fn to_input(event: &CtEvent) -> Option<Input> {
     match event {
         CtEvent::Key(key) => match key.code {
             KeyCode::Char('q') => Some(Input::Quit),
@@ -150,7 +150,7 @@ fn to_input(event: CtEvent) -> Option<Input> {
 /// them asked to quit.
 fn pump_input(app: &mut App, controller: &mut Controller) -> io::Result<Action> {
     while event::poll(Duration::from_millis(0))? {
-        if let Some(input) = to_input(event::read()?) {
+        if let Some(input) = to_input(&event::read()?) {
             match app.on_input(input) {
                 Action::Quit => return Ok(Action::Quit),
                 Action::Control(control) => controller.send(&control),
@@ -163,6 +163,10 @@ fn pump_input(app: &mut App, controller: &mut Controller) -> io::Result<Action> 
 
 /// Open the trace (waiting for it in follow mode), then apply and draw each event,
 /// pacing playback and handling input, until the trace ends or the viewer quits.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "an elapsed-millisecond count is far below f64's exact-integer range"
+)]
 fn replay(
     terminal: &mut Term,
     path: &str,

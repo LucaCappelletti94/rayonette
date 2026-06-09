@@ -2165,6 +2165,7 @@ mod tests {
                     while !*released {
                         released = cvar.wait(released).unwrap();
                     }
+                    drop(released);
                 }
                 x * 2
             }

@@ -15,3 +15,6 @@ serde_json = "1"
 
 [build-dependencies]
 rayonet-build = { path = "../../../rayonet-build" }
+
+[lints]
+workspace = true

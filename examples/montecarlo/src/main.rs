@@ -40,6 +40,10 @@ const TASKS: u32 = 32;
 /// quarter circle. Seeded only by `chunk`, so it is deterministic and
 /// idempotent: re-running it yields the identical count, which is what lets
 /// rayonet replay a lost host's work on a survivor without changing the answer.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "both operands are at most 2^53, which an f64 mantissa holds exactly"
+)]
 fn sample(chunk: u32) -> u64 {
     // xorshift64: a tiny, fast, dependency-free PRNG.
     let mut state = u64::from(chunk)
@@ -56,7 +60,7 @@ fn sample(chunk: u32) -> u64 {
     let mut inside = 0u64;
     for _ in 0..SAMPLES_PER_TASK {
         let (x, y) = (unit(), unit());
-        if x * x + y * y <= 1.0 {
+        if y.mul_add(y, x * x) <= 1.0 {
             inside += 1;
         }
     }
@@ -124,7 +128,10 @@ async fn main() {
         .unwrap_or(0);
 
     let total = u64::from(TASKS) * SAMPLES_PER_TASK;
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the sample counts are far below f64's exact-integer range"
+    )]
     let pi = 4.0 * hits as f64 / total as f64;
     println!("pi ~= {pi:.5} (from {total} samples across {TASKS} tasks on {workers} workers)");
 }

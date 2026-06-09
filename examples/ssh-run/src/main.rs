@@ -25,7 +25,7 @@ use rayonet::process;
 use rayonet::ssh::{parse_host_spec, Ssh};
 
 /// The distributed task: doubles its input.
-fn double(x: u32) -> u32 {
+const fn double(x: u32) -> u32 {
     x * 2
 }
 

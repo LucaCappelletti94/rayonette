@@ -6,7 +6,7 @@
 use rayonet::fleet::{Fleet, NetMapExt, Subprocess};
 use rayonet::process;
 
-fn double(x: u32) -> u32 {
+const fn double(x: u32) -> u32 {
     x * 2
 }
 
