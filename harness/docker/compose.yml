@@ -64,10 +64,12 @@ services:
     image: rayonet-harness-base:latest
     networks: [blockednet]
 
-  # A fast/slow pair (identical but for a CPU cap) to show work-stealing: the
-  # throttled host provably drains fewer CPU-bound tasks (Phase 5). The harness
-  # warms the build cache with a cheap pass first, so the cap bites task
-  # execution, not the one-time compile.
+  # A fast/slow pair (identical but for a CPU cap) for the work-share scenario:
+  # the cap can only slow leaf-slow, so the unthrottled leaf-fast takes at least
+  # as large a share (the scenario asserts that invariant; the cap does not
+  # reliably bite a short CPU burst on a shared runner). The harness warms the
+  # build cache with a cheap pass first, so the cap applies to task execution,
+  # not the one-time compile.
   leaf-fast:
     <<: *agent
     image: rayonet-harness-rust:latest
