@@ -9,6 +9,23 @@
 //! a worker can resolve and build it even when rayonet is an unpublished path
 //! dependency.
 
+// In non-test code the only sanctioned panic surface is a documented `expect()`,
+// so these bans keep `unwrap`, `panic!`, `unreachable!`, and a message-less
+// assert out. Test code is exempt, and any binaries are separate crates this
+// attribute never reaches.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::unwrap_in_result,
+        clippy::panic_in_result_fn,
+        clippy::get_unwrap,
+        clippy::missing_assert_message
+    )
+)]
+
 /// Find the named functions passed to `net_map` call sites in `source`.
 ///
 /// Recognizes `.net_map(IDENT)` and `.net_map_with_fleet(IDENT, ...)`, in source

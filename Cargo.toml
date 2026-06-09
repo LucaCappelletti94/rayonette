@@ -49,3 +49,13 @@ unimplemented = "warn"
 # self-documenting and the build fails when one goes stale.
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
+# Zero-fallout guardrails: cheap to adopt now, each catches a future regression.
+# (The unwrap/panic/unreachable family is denied per-crate, scoped to non-test,
+# in each crate root, since it fires in test code.)
+mem_forget = "deny"
+mutex_atomic = "deny"
+rc_buffer = "deny"
+path_buf_push_overwrite = "deny"
+verbose_file_reads = "deny"
+lossy_float_literal = "deny"
+self_named_module_files = "deny"

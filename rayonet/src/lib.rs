@@ -4,6 +4,24 @@
 //! fans task-parallel work across machines on a network. See `DECISIONS.md` and
 //! `PLAN.md` at the repo root for the design and the phased build.
 
+// In non-test code the only sanctioned panic surface is a documented `expect()`,
+// so these bans keep `unwrap`, `panic!`, `unreachable!`, and a message-less
+// assert out. Test code is exempt (it unwraps and asserts freely), and the
+// integration tests and binaries are separate crates this attribute never
+// reaches.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::unwrap_in_result,
+        clippy::panic_in_result_fn,
+        clippy::get_unwrap,
+        clippy::missing_assert_message
+    )
+)]
+
 pub mod agent;
 pub mod capability;
 pub mod control;

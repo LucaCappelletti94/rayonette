@@ -2143,9 +2143,39 @@ mod tests {
         };
         use crate::observability::{NodeState, RunState};
         use crate::testing::EventRecorder;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Condvar, Mutex};
         use tokio::sync::mpsc;
 
-        let (coord_side, relay_fut) = coord_and_relay_over_two_leaves();
+        // leaf-a's first task blocks on this gate until the test releases it, so the
+        // task is deterministically in flight when the after-current kill lands
+        // (rather than racing a short task that may finish first under load).
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let entered = Arc::new(AtomicBool::new(false));
+        let armed = Arc::new(AtomicBool::new(true));
+        let leaf_a = {
+            let gate = Arc::clone(&gate);
+            let entered = Arc::clone(&entered);
+            let armed = Arc::clone(&armed);
+            move |x: u32| -> u32 {
+                if armed.swap(false, Ordering::SeqCst) {
+                    entered.store(true, Ordering::SeqCst);
+                    let (lock, cvar) = &*gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = cvar.wait(released).unwrap();
+                    }
+                }
+                x * 2
+            }
+        };
+        let children = vec![
+            LocalAgent::new("leaf-a", Registry::new().with("slow", handler(leaf_a))),
+            LocalAgent::new("leaf-b", Registry::new().with("slow", handler(slow))),
+        ];
+        let (coord_side, relay_side) = connection_pair(4096);
+        let relay_fut = relay(relay_side, children);
+
         let recorder = EventRecorder::default();
         let (joins_tx, joins_rx) = mpsc::unbounded_channel();
         drop(joins_tx);
@@ -2162,22 +2192,11 @@ mod tests {
             &recorder,
         );
         let driver = async {
-            // Wait until the leaf is actually running a task, so the after-current
-            // kill has something to drain (robust under slow, instrumented runs).
-            loop {
-                let mut state = RunState::default();
-                for event in &recorder.events() {
-                    state.apply(event);
-                }
-                if state
-                    .nodes()
-                    .get("relay/leaf-a")
-                    .is_some_and(|view| view.state() == NodeState::Working)
-                {
-                    break;
-                }
+            // 1. Wait until leaf-a's first task is in flight (blocked on the gate).
+            while !entered.load(Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
+            // 2. Kill it after-current: with a task in flight it must drain first.
             controls_tx
                 .send(Control::new(
                     "relay/leaf-a".to_string(),
@@ -2186,6 +2205,25 @@ mod tests {
                     },
                 ))
                 .unwrap();
+            // 3. Wait until the relay reports it Draining, proving the kill landed
+            //    while the task was in flight, then release the task to finish.
+            loop {
+                let mut state = RunState::default();
+                for event in &recorder.events() {
+                    state.apply(event);
+                }
+                if state
+                    .nodes()
+                    .get("relay/leaf-a")
+                    .is_some_and(|view| view.state() == NodeState::Draining)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            let (lock, cvar) = &*gate;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
             drop(controls_tx);
         };
         let (relay_res, raw, ()) = tokio::join!(relay_fut, coord_fut, driver);
