@@ -257,6 +257,30 @@ pub async fn agent_main(config: NodeConfig) -> ! {
     std::process::exit(agent_exit_code(run_node(config).await));
 }
 
+/// Serve as an agent and exit if this process was launched as one, otherwise
+/// return so the caller goes on to run as the coordinator.
+///
+/// This is the whole agent half of a "one binary, two roles" consumer in a
+/// single call: it checks [`crate::process::is_agent`] and, when true, hands
+/// `config` to [`agent_main`] (which serves, then exits the process and never
+/// returns). Call it first in `main`, before any fleet setup, so an agent
+/// process does no coordinator work:
+///
+/// ```ignore
+/// rayonette::embed_microcrates!();
+///
+/// #[tokio::main]
+/// async fn main() {
+///     rayonette::serve_if_agent(NodeConfig::new(__rayonette_registry(), __rayonette_source())).await;
+///     // coordinator: build a fleet and net_map over it ...
+/// }
+/// ```
+pub async fn serve_if_agent(config: NodeConfig) {
+    if crate::process::is_agent() {
+        agent_main(config).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -320,6 +344,14 @@ mod tests {
         let _ = NodeConfig::new(Registry::new(), Vec::new())
             .binary_name("custom-agent")
             .toolchain(Toolchain::Nightly);
+    }
+
+    #[tokio::test]
+    async fn serve_if_agent_returns_when_not_an_agent() {
+        // The test process has no agent marker set, so this returns rather than
+        // serving and exiting. The agent path (serve then exit) is covered by the
+        // fixture e2e test, which spawns the consumer as agents.
+        super::serve_if_agent(NodeConfig::new(Registry::new(), Vec::new())).await;
     }
 
     #[test]
