@@ -1,6 +1,6 @@
-# Task registration (API review item 2): deviations from the approved plan
+# Task registration (API review item 2): implementation notes and v1 limitations
 
-This log records every place the implementation departs from the letter of the approved plan (`~/.claude/plans/let-s-start-preparing-a-shimmering-sunset.md`), with the reason. Each entry is something a reviewer reading the plan would not otherwise expect from the diff. The plan's intent and the two standing constraints (never land an uncalled `pub fn`; every deletion atomic with its tests) are preserved throughout.
+This records the notable implementation choices behind API-review item 2 (the `#[rayonette::tasks]` macro and `inventory`-based task registration), focusing on where the build diverged from its original phased plan and on the intentional v1 limitations that resulted. Each entry is a choice a reader would not otherwise infer from the diff, with its reason. Two constraints held throughout: never land an uncalled `pub fn`, and make every deletion atomic with its tests.
 
 ## Phase 1 (library plumbing)
 

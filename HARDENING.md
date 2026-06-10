@@ -1,6 +1,6 @@
 # Hardening writeup: footgun audit and lint policy
 
-This is the Phase 1 deliverable of the hardening epic described in `HANDOFF.md`. It is research and policy only, no behavior change. It audits the seven footgun areas the handoff names, grounds each in the current code, and records a decision (adopt, decline, or scope) for every clippy restriction lint that was evaluated. The later phases (lint adoption, unwrap-family scoping, lint inheritance, final tidy) execute the decisions written here, one gated commit at a time.
+This is the Phase 1 deliverable of the crate-hardening epic, a cleanup pass before new features. It is research and policy only, no behavior change. It audits the seven footgun areas the handoff names, grounds each in the current code, and records a decision (adopt, decline, or scope) for every clippy restriction lint that was evaluated. The later phases (lint adoption, unwrap-family scoping, lint inheritance, final tidy) execute the decisions written here, one gated commit at a time.
 
 The point of writing it down first: if a later mechanical step goes wrong, this document is the record of what was decided and why, so the work can be resumed or reverted without re-deriving the analysis.
 
