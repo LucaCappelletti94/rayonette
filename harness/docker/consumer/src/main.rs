@@ -12,6 +12,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use rayonette::fleet::{Fleet, NetMapExt};
+use rayonette::node::Toolchain;
 use rayonette::observability::{Event, EventSink, RecordedEvent, RunState};
 use rayonette::process;
 use rayonette::ssh::{Ssh, SshConfig};
@@ -107,19 +108,21 @@ async fn main() {
         // without one it serves as a leaf. This is what lets the harness build
         // real relay trees, not just a flat star. agent_main serves, then exits
         // the process (an agent must not linger on its parent's stdin).
-        rayonette::node::agent_main(rayonette::node::NodeConfig::new(
-            __rayonette_registry(),
-            __rayonette_source(),
-            "rayonette-docker-consumer".to_string(),
-            std::env::var("RAYONETTE_TOOLCHAIN").unwrap_or_else(|_| "stable".to_string()),
-        ))
+        rayonette::node::agent_main(
+            rayonette::node::NodeConfig::new(__rayonette_registry(), __rayonette_source())
+                .toolchain(Toolchain::named(
+                    std::env::var("RAYONETTE_TOOLCHAIN").unwrap_or_else(|_| "stable".to_string()),
+                )),
+        )
         .await;
     }
 
     let config_path = env("RAYONETTE_SSH_CONFIG");
     let leaves = env("RAYONETTE_LEAVES");
     let tar = __rayonette_source();
-    let toolchain = std::env::var("RAYONETTE_TOOLCHAIN").unwrap_or_else(|_| "stable".to_string());
+    let toolchain = Toolchain::named(
+        std::env::var("RAYONETTE_TOOLCHAIN").unwrap_or_else(|_| "stable".to_string()),
+    );
     let task = std::env::var("RAYONETTE_TASK").unwrap_or_else(|_| "double".to_string());
     let count: u32 = std::env::var("RAYONETTE_COUNT")
         .ok()

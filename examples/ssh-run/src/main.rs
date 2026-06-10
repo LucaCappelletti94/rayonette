@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use rayonette::capability::{pred, Filter, Os, Role};
 use rayonette::fleet::{Fleet, NetMapExt};
-use rayonette::node::{agent_main, NodeConfig};
+use rayonette::node::{agent_main, NodeConfig, Toolchain};
 use rayonette::observability::{depth, leaf_of, Event, EventSink};
 use rayonette::process;
 use rayonette::ssh::{parse_host_spec, Ssh};
@@ -81,12 +81,7 @@ async fn main() {
     if process::is_agent() {
         // As an agent: a leaf, or a relay if this host has a children file. A
         // relay re-ships this same source bundle down to its own children.
-        let config = NodeConfig::new(
-            __rayonette_registry(),
-            __rayonette_source(),
-            "ssh-run".to_string(),
-            "stable".to_string(),
-        );
+        let config = NodeConfig::new(__rayonette_registry(), __rayonette_source());
         // `agent_main` runs the node then exits the process; it never returns.
         agent_main(config).await;
     }
@@ -98,7 +93,14 @@ async fn main() {
         .split([' ', ','])
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
-        .map(|entry| Ssh::build(parse_host_spec(entry), source.clone(), "stable", "ssh-run"))
+        .map(|entry| {
+            Ssh::build(
+                parse_host_spec(entry),
+                source.clone(),
+                Toolchain::Stable,
+                "ssh-run",
+            )
+        })
         .collect();
     assert!(!launchers.is_empty(), "RAYONETTE_HOSTS named no hosts");
     let hosts = launchers.len();

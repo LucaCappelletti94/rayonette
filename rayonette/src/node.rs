@@ -18,12 +18,44 @@ use crate::process::agent_connection;
 use crate::relay::{relay_with_source, ChildSource};
 use crate::ssh::{parse_host_list, Ssh, SshConfig};
 
+/// The Rust toolchain a relay builds its children's agent with. Defaults to
+/// [`Toolchain::Stable`]; use [`Toolchain::named`] for a pinned version (for
+/// example `Toolchain::named("1.82")`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Toolchain {
+    /// The `stable` toolchain.
+    #[default]
+    Stable,
+    /// The `nightly` toolchain.
+    Nightly,
+    /// A named toolchain (a channel or a pinned version), passed to rustup verbatim.
+    Named(String),
+}
+
+impl Toolchain {
+    /// A named toolchain, for a pinned version or an uncommon channel.
+    #[must_use]
+    pub fn named(name: impl Into<String>) -> Self {
+        Self::Named(name.into())
+    }
+
+    /// The rustup `--default-toolchain` argument for this toolchain.
+    pub(crate) fn as_rustup(&self) -> &str {
+        match self {
+            Self::Stable => "stable",
+            Self::Nightly => "nightly",
+            Self::Named(name) => name,
+        }
+    }
+}
+
 /// What a node needs at boot.
 ///
-/// The `registry` runs tasks when the node is a leaf; `source`, `binary_name`,
-/// and `toolchain` are the build inputs a relay cascades to its children (a relay
-/// re-ships the very `__rayonette_source()` bundle it was itself built from, so the
-/// content-addressed cache stays consistent down the tree).
+/// The `registry` runs tasks when the node is a leaf; `source` is the crate
+/// tarball a relay cascades to its children (a relay re-ships the very
+/// `__rayonette_source()` bundle it was itself built from, so the
+/// content-addressed cache stays consistent down the tree). The binary name and
+/// toolchain those children are built with default sensibly and are overridable.
 #[derive(Debug)]
 pub struct NodeConfig {
     /// The task handlers this node serves as a leaf.
@@ -33,27 +65,55 @@ pub struct NodeConfig {
     /// The agent binary name to build on children.
     binary_name: String,
     /// The rust toolchain to build children with.
-    toolchain: String,
+    toolchain: Toolchain,
 }
 
 impl NodeConfig {
-    /// Assemble a node's boot configuration from its leaf task `registry`, the
-    /// crate `source` tarball a relay cascades to its children, and the
-    /// `binary_name` and `toolchain` those children are built with.
+    /// A node's boot configuration: the leaf task `registry` and the crate
+    /// `source` tarball a relay cascades to its children.
+    ///
+    /// The binary name to build on those children defaults to this process's own
+    /// executable name (every node runs the same binary), and the toolchain to
+    /// [`Toolchain::Stable`]. Override either with [`NodeConfig::binary_name`] or
+    /// [`NodeConfig::toolchain`].
     #[must_use]
-    pub const fn new(
-        registry: Registry,
-        source: Vec<u8>,
-        binary_name: String,
-        toolchain: String,
-    ) -> Self {
+    pub fn new(registry: Registry, source: Vec<u8>) -> Self {
         Self {
             registry,
             source,
-            binary_name,
-            toolchain,
+            binary_name: current_binary_name(),
+            toolchain: Toolchain::default(),
         }
     }
+
+    /// Override the binary/package name a relay builds on its children (defaults
+    /// to this process's own executable name).
+    #[must_use]
+    pub fn binary_name(mut self, name: impl Into<String>) -> Self {
+        self.binary_name = name.into();
+        self
+    }
+
+    /// Override the toolchain a relay builds its children with (defaults to
+    /// [`Toolchain::Stable`]).
+    #[must_use]
+    pub fn toolchain(mut self, toolchain: Toolchain) -> Self {
+        self.toolchain = toolchain;
+        self
+    }
+}
+
+/// This process's own executable name (its file stem): the default agent binary a
+/// relay builds on its children, since every node runs the same binary. Empty
+/// only when the running executable cannot be determined, a pathological case that
+/// matters only to a relay (a leaf never builds children).
+fn current_binary_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(Path::file_stem)
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// The children file path: `$RAYONETTE_CHILDREN` if set, else
@@ -99,7 +159,7 @@ fn child_launchers(children: Vec<SshConfig>, config: &NodeConfig) -> Vec<Ssh> {
 struct FileChildSource {
     path: Option<PathBuf>,
     source: Vec<u8>,
-    toolchain: String,
+    toolchain: Toolchain,
     binary_name: String,
 }
 
@@ -201,6 +261,7 @@ pub async fn agent_main(config: NodeConfig) -> ! {
 mod tests {
     use super::{
         child_launchers, children_path, dispatch, load_children, FileChildSource, NodeConfig,
+        Toolchain,
     };
     use crate::agent::{handler, Registry};
     use crate::fleet::Launch;
@@ -217,7 +278,7 @@ mod tests {
         let mut source = FileChildSource {
             path: Some(file.clone()),
             source: Vec::new(),
-            toolchain: "stable".to_string(),
+            toolchain: Toolchain::Stable,
             binary_name: "consumer".to_string(),
         };
         // alpha is already in the subtree, so only beta is new.
@@ -234,19 +295,31 @@ mod tests {
         let mut rootless = FileChildSource {
             path: None,
             source: Vec::new(),
-            toolchain: "stable".to_string(),
+            toolchain: Toolchain::Stable,
             binary_name: "consumer".to_string(),
         };
         assert!(rootless.poll(&[]).is_empty());
     }
 
     fn config(registry: Registry) -> NodeConfig {
-        NodeConfig::new(
-            registry,
-            b"source-bundle".to_vec(),
-            "consumer".to_string(),
-            "stable".to_string(),
-        )
+        NodeConfig::new(registry, b"source-bundle".to_vec()).binary_name("consumer")
+    }
+
+    #[test]
+    fn toolchain_maps_to_its_rustup_argument() {
+        assert_eq!(Toolchain::default(), Toolchain::Stable);
+        assert_eq!(Toolchain::Stable.as_rustup(), "stable");
+        assert_eq!(Toolchain::Nightly.as_rustup(), "nightly");
+        assert_eq!(Toolchain::named("1.82").as_rustup(), "1.82");
+    }
+
+    #[test]
+    fn node_config_builders_override_the_defaults() {
+        // Exercise both overrides; the defaults (current-exe name, stable) are the
+        // common path used everywhere else.
+        let _ = NodeConfig::new(Registry::new(), Vec::new())
+            .binary_name("custom-agent")
+            .toolchain(Toolchain::Nightly);
     }
 
     #[test]

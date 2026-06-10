@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rayonette::fleet::{Fleet, NetMapExt};
-use rayonette::node::{agent_main, NodeConfig};
+use rayonette::node::{agent_main, NodeConfig, Toolchain};
 use rayonette::observability::{Event, EventSink};
 use rayonette::process;
 use rayonette::ssh::{Ssh, SshConfig};
@@ -90,12 +90,7 @@ async fn main() {
     if process::is_agent() {
         // The one agent entry point: a leaf, or a relay if this worker names
         // children, then exits the process. It never returns.
-        let config = NodeConfig::new(
-            __rayonette_registry(),
-            __rayonette_source(),
-            "montecarlo".to_string(),
-            "stable".to_string(),
-        );
+        let config = NodeConfig::new(__rayonette_registry(), __rayonette_source());
         agent_main(config).await;
     }
 
@@ -117,7 +112,7 @@ async fn main() {
             let config = SshConfig::new(format!("root@{host}"))
                 .port(port)
                 .keyfile(&key);
-            Ssh::build(config, source.clone(), "stable", "montecarlo")
+            Ssh::build(config, source.clone(), Toolchain::Stable, "montecarlo")
         })
         .collect();
     let workers = launchers.len();
