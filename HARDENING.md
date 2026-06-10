@@ -31,10 +31,12 @@ Every other restriction lint that was enabled found zero non-test hits: `panic`,
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-cargo llvm-cov --workspace --all-features --ignore-filename-regex 'src/bin/|fixtures/|harness/|examples/' --fail-under-functions 100 --fail-under-lines 99 -- --include-ignored
+cargo llvm-cov --workspace --all-features --ignore-filename-regex 'src/bin/|fixtures/|harness/|examples/|rayonette-macros/src/' --fail-under-functions 100 --fail-under-lines 99 -- --include-ignored
 ```
 
-Line coverage sits at 99.03 percent against a 99 percent floor, so any step that deletes a covered line or adds an uncovered branch can tip it under. Watch the total after every step.
+The ignore regex excludes `rayonette-macros/src/`, the thin proc-macro shell whose whole body is a one-line delegation. Its logic lives in `rayonette-macros-core`, a normal library that stays instrumented and is held at 100 percent functions and lines by its own unit tests. The proc-macro crate boundary cannot be exercised by an in-process test, so excluding only the shell keeps the gate honest without losing coverage of the real logic.
+
+Line coverage sits just above the 99 percent floor, so any step that deletes a covered line or adds an uncovered branch can tip it under. Watch the total after every step.
 
 ## Footgun audit
 

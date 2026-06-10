@@ -71,6 +71,38 @@ pub use inventory;
 /// and registered automatically (gathered by [`agent::Registry::from_inventory`]),
 /// with no hand-written registry. An unannotated closure whose input type cannot
 /// be recovered is a compile error at the call site, never a silent runtime miss.
+///
+/// # Examples
+/// A named function and an annotated closure both register with no boilerplate:
+/// ```
+/// use rayonette::prelude::*;
+///
+/// fn score(player: u32) -> u32 {
+///     player + 1
+/// }
+///
+/// #[rayonette::tasks]
+/// fn main() {
+///     let _scored = (0u32..10).net_map(score);
+///     let _doubled = (0u32..10).net_map(|x: u32| x * 2);
+/// }
+/// ```
+///
+/// A closure whose input type cannot be recovered is rejected at the call site,
+/// not silently at runtime:
+/// ```compile_fail
+/// use rayonette::prelude::*;
+///
+/// fn produce() -> Vec<u32> {
+///     vec![1, 2, 3]
+/// }
+///
+/// #[rayonette::tasks]
+/// fn main() {
+///     // No annotation and an opaque receiver: a compile error here.
+///     let _ = produce().net_map(|x| x * 2);
+/// }
+/// ```
 pub use rayonette_macros::tasks;
 
 /// Register a task under an explicit wire `key`, submitting it to the inventory
@@ -80,8 +112,28 @@ pub use rayonette_macros::tasks;
 /// the same `key` literal it puts in the rewritten `net_map_task` call, so the
 /// coordinator and the agent agree on the key by construction. `task` must be a
 /// named function or a non-capturing closure (the same contract `net_map`
-/// enforces); its input and output types are recovered generically, so no
+/// enforces). Its input and output types are recovered generically, so no
 /// hand-written decode/encode wrapper is needed.
+///
+/// Most consumers never write this by hand (the macro does), but it is the
+/// escape hatch for registering a generic instance the macro cannot enumerate,
+/// such as `register_task!("app::sum::<u32>", sum::<u32>)`.
+///
+/// # Examples
+/// ```
+/// use rayonette::agent::Registry;
+///
+/// fn double(x: u32) -> u32 {
+///     x * 2
+/// }
+/// rayonette::register_task!("demo::double", double);
+///
+/// fn main() {
+///     // The agent gathers every registered task at boot.
+///     let registry = Registry::from_inventory();
+///     let _ = registry;
+/// }
+/// ```
 #[macro_export]
 macro_rules! register_task {
     ($key:expr, $task:expr $(,)?) => {
@@ -107,6 +159,9 @@ pub mod prelude {
     pub use crate::ssh::{parse_host_spec, Ssh, SshConfig};
     #[cfg(feature = "tui")]
     pub use crate::tui::{Action, App, Input};
+    // The task-registration surface: the `#[tasks]` attribute and the manual
+    // `register_task!` escape hatch.
+    pub use crate::{register_task, tasks};
 }
 
 /// Embed the crate source bundle that `rayonette_build::extract()` produced.

@@ -64,6 +64,16 @@ This log records every place the implementation departs from the letter of the a
 
 5. `extract_into` no longer writes `rayonette_registry.rs` at all (the plan had it lingering as a dead `OUT_DIR` file through 4b). Since the `embed_microcrates!` registry half was already dropped in 4a, there is no reader, so not writing it is cleaner than writing a dead file.
 
+## Phase 5 (backstop, doctests, prelude, docs)
+
+1. The coverage-ignore note went to `HARDENING.md`, not the README. The plan said to update the README and the coverage-command documentation, but the README is a two-line stub with no coverage or crate-layout content. The documented gate command lives in `HARDENING.md`, so the `rayonette-macros/src/` ignore and its rationale were recorded there.
+
+2. The unknown-key backstop reads the registry's keys through a small private `Registry::keys()` accessor rather than the private `handlers` field directly, and the message is branchless: it always joins the sorted keys, so an empty registry simply renders as `[]`. That keeps the single existing `rejects_unknown_fn_key` test sufficient (no separate empty-registry case to cover a branch that does not exist).
+
+3. The `tasks`, `register_task!`, and `from_inventory` doctests use an explicit `fn main()` so the macro's module-scope `register_task!` siblings land at module scope rather than being wrapped inside the doctest's implicit main. The forgotten-annotation `compile_fail` doctest (the plan's mirror of the `fleet.rs` capturing-closure doctest) lives on the `tasks` re-export, its natural home.
+
+4. Coverage stayed above the 99 percent floor across 4b and 5, so no targeted top-up tests were needed. A stray semicolon in the Phase 2 `register_task!` doc was fixed in passing (the prose rule).
+
 ## Process note: stale coverage profdata
 
 cargo-llvm-cov merges `.profraw` across runs within a session. After any edit that shifts line numbers, run `cargo llvm-cov clean --workspace` before measuring, or the report is garbage (a Phase 3 measurement read 79 percent purely from stale data). The four-command gate is reliable from a clean profdata state.

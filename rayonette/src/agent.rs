@@ -141,6 +141,16 @@ impl Registry {
     /// This is how an agent populates itself: the `#[rayonette::tasks]` macro
     /// emits a `register_task!` per task, each submitting an entry to the
     /// inventory this iterates at startup.
+    ///
+    /// # Examples
+    /// ```
+    /// use rayonette::agent::Registry;
+    ///
+    /// // With no `#[rayonette::tasks]` scope compiled in, the gathered registry
+    /// // is empty; a real agent's binary carries the macro's registrations.
+    /// let registry = Registry::from_inventory();
+    /// # let _ = registry;
+    /// ```
     #[must_use]
     pub fn from_inventory() -> Self {
         let mut registry = Self::new();
@@ -185,6 +195,11 @@ impl Registry {
 
     fn get(&self, key: &str) -> Option<&TaskHandler> {
         self.handlers.get(key)
+    }
+
+    /// The keys this registry can serve, for the unknown-key backstop message.
+    fn keys(&self) -> impl Iterator<Item = &str> {
+        self.handlers.keys().map(String::as_str)
     }
 }
 
@@ -233,9 +248,20 @@ where
     let (fn_key, heartbeat) = recv_hello(&mut rx).await?;
 
     let handler = registry.get(&fn_key).cloned().ok_or_else(|| {
+        // A self-explaining backstop for the bare-`net_map`-without-attribute
+        // mistake: name the missing key, list what this agent did register, and
+        // point at the fix. The two ends must agree on the task set.
+        let mut registered: Vec<&str> = registry.keys().collect();
+        registered.sort_unstable();
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("unknown fn_key: {fn_key}"),
+            format!(
+                "unknown task key `{fn_key}`. This agent registered [{}]. The coordinator \
+                 derived a key no registered task matches: scope the `net_map` call sites with \
+                 `#[rayonette::tasks]`, or pass a named function, so the task is registered on \
+                 both sides.",
+                registered.join(", ")
+            ),
         )
     })?;
 
@@ -692,7 +718,12 @@ mod tests {
             .unwrap();
         };
         let (res, ()) = tokio::join!(agent, driver);
-        assert!(res.is_err());
+        let error = res.unwrap_err().to_string();
+        // The backstop names the missing key, lists what the agent registered, and
+        // points at the fix.
+        assert!(error.contains("unknown task key `unknown`"), "{error}");
+        assert!(error.contains("known"), "{error}");
+        assert!(error.contains("#[rayonette::tasks]"), "{error}");
     }
 
     #[tokio::test]
