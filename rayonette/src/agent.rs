@@ -135,6 +135,31 @@ impl Registry {
         Self::default()
     }
 
+    /// Build a registry from every [`TaskEntry`] submitted with `register_task!`
+    /// across the program (the boot-time counterpart to a hand-built registry).
+    ///
+    /// This is how an agent populates itself: the `#[rayonette::tasks]` macro
+    /// emits a `register_task!` per task, each submitting an entry to the
+    /// inventory this iterates at startup.
+    ///
+    /// # Examples
+    /// ```
+    /// use rayonette::agent::Registry;
+    ///
+    /// // With no `#[rayonette::tasks]` scope compiled in, the gathered registry
+    /// // is empty; a real agent's binary carries the macro's registrations.
+    /// let registry = Registry::from_inventory();
+    /// # let _ = registry;
+    /// ```
+    #[must_use]
+    pub fn from_inventory() -> Self {
+        let mut registry = Self::new();
+        for entry in inventory::iter::<TaskEntry> {
+            (entry.register)(&mut registry);
+        }
+        registry
+    }
+
     /// Register `handler` under `key`, returning the registry for chaining.
     #[must_use]
     pub fn with(mut self, key: impl Into<String>, handler: TaskHandler) -> Self {
@@ -155,10 +180,50 @@ impl Registry {
         self.with(std::any::type_name::<F>(), handler(f))
     }
 
+    /// Register a task function under an explicit `key`, in place. The mutable,
+    /// explicit-key sibling of [`Registry::with_fn`]: `register_task!` calls this
+    /// with the macro-assigned key, recovering the input and output types
+    /// generically so an annotated closure registers with no hand-written wrapper.
+    pub fn add<I, O, F>(&mut self, key: impl Into<String>, f: F)
+    where
+        I: DeserializeOwned,
+        O: Serialize,
+        F: Fn(I) -> O + Send + Sync + 'static,
+    {
+        self.handlers.insert(key.into(), handler(f));
+    }
+
     fn get(&self, key: &str) -> Option<&TaskHandler> {
         self.handlers.get(key)
     }
+
+    /// The keys this registry can serve, for the unknown-key backstop message.
+    fn keys(&self) -> impl Iterator<Item = &str> {
+        self.handlers.keys().map(String::as_str)
+    }
 }
+
+/// One task's registration, gathered by `inventory` so [`Registry::from_inventory`]
+/// can build an agent's registry from every `register_task!` in the program.
+///
+/// It holds a function that inserts the task's handler under its macro-assigned
+/// key (rather than the handler itself) so the input and output types stay
+/// generic until the insert, where [`Registry::add`] recovers them.
+#[derive(Debug)]
+pub struct TaskEntry {
+    register: fn(&mut Registry),
+}
+
+impl TaskEntry {
+    /// Wrap a registration function. Called by `register_task!`, whose closure
+    /// inserts one task into the registry it is handed.
+    #[must_use]
+    pub const fn new(register: fn(&mut Registry)) -> Self {
+        Self { register }
+    }
+}
+
+inventory::collect!(TaskEntry);
 
 /// Serve a connection: handshake, then run each assigned task to completion and
 /// report it, until `Shutdown` or end-of-stream.
@@ -183,9 +248,20 @@ where
     let (fn_key, heartbeat) = recv_hello(&mut rx).await?;
 
     let handler = registry.get(&fn_key).cloned().ok_or_else(|| {
+        // A self-explaining backstop for the bare-`net_map`-without-attribute
+        // mistake: name the missing key, list what this agent did register, and
+        // point at the fix. The two ends must agree on the task set.
+        let mut registered: Vec<&str> = registry.keys().collect();
+        registered.sort_unstable();
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("unknown fn_key: {fn_key}"),
+            format!(
+                "unknown task key `{fn_key}`. This agent registered [{}]. The coordinator \
+                 derived a key no registered task matches: scope the `net_map` call sites with \
+                 `#[rayonette::tasks]`, or pass a named function, so the task is registered on \
+                 both sides.",
+                registered.join(", ")
+            ),
         )
     })?;
 
@@ -283,7 +359,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{due_sample, handler, serve, Registry, Sampler, TELEMETRY_INTERVAL};
+    use super::{due_sample, handler, serve, Registry, Sampler, TaskEntry, TELEMETRY_INTERVAL};
     use crate::framing::Receiver;
     use crate::observability::Event;
     use crate::protocol::{FromAgent, ToAgent, PROTOCOL_VERSION};
@@ -642,7 +718,12 @@ mod tests {
             .unwrap();
         };
         let (res, ()) = tokio::join!(agent, driver);
-        assert!(res.is_err());
+        let error = res.unwrap_err().to_string();
+        // The backstop names the missing key, lists what the agent registered, and
+        // points at the fix.
+        assert!(error.contains("unknown task key `unknown`"), "{error}");
+        assert!(error.contains("known"), "{error}");
+        assert!(error.contains("#[rayonette::tasks]"), "{error}");
     }
 
     #[tokio::test]
@@ -698,5 +779,52 @@ mod tests {
         let encode = handler(|_: u32| FailsToSerialize);
         let payload = postcard::to_allocvec(&5u32).unwrap();
         assert!(encode(payload).unwrap_err().contains("encode output"));
+    }
+
+    #[test]
+    fn registry_add_registers_under_explicit_key() {
+        // `add` is the in-place, explicit-key sibling of `with_fn`: it inserts a
+        // task under the key it is handed (here a macro-style string, not the
+        // type_name), recovering the input/output types from the closure itself.
+        let mut registry = Registry::new();
+        registry.add("k", |x: u32| x * 3);
+        let handler = registry.get("k").expect("the task is registered under k");
+        let output = handler(postcard::to_allocvec(&7u32).unwrap()).unwrap();
+        assert_eq!(postcard::from_bytes::<u32>(&output).unwrap(), 21);
+    }
+
+    #[test]
+    fn task_entry_new_builds_a_runnable_entry() {
+        // `register_task!` builds a `TaskEntry` from a registration closure via
+        // `new`; applying that closure must register a runnable task. Exercised at
+        // runtime here (the inventory submit path const-evaluates `new`), which
+        // also renders the entry's `Debug`.
+        let entry = TaskEntry::new(|registry| registry.add("te", |x: u32| x + 100));
+        assert!(format!("{entry:?}").contains("TaskEntry"));
+        let mut registry = Registry::new();
+        (entry.register)(&mut registry);
+        let handler = registry.get("te").expect("the task is registered under te");
+        let output = handler(postcard::to_allocvec(&5u32).unwrap()).unwrap();
+        assert_eq!(postcard::from_bytes::<u32>(&output).unwrap(), 105);
+    }
+
+    // A task submitted at module scope, the way `register_task!` does, so
+    // `from_inventory` has at least one entry to gather (and its loop body runs).
+    inventory::submit! {
+        TaskEntry::new(|registry| {
+            registry.add("phase1::dummy", |x: u32| x + 1);
+        })
+    }
+
+    #[test]
+    fn from_inventory_collects_submitted_entries() {
+        // The boot path: gather every submitted `TaskEntry` into a registry, then
+        // confirm the dummy task is present and actually runnable end to end.
+        let registry = Registry::from_inventory();
+        let handler = registry
+            .get("phase1::dummy")
+            .expect("the submitted entry is present");
+        let output = handler(postcard::to_allocvec(&4u32).unwrap()).unwrap();
+        assert_eq!(postcard::from_bytes::<u32>(&output).unwrap(), 5);
     }
 }

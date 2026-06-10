@@ -558,6 +558,18 @@ enum RunnerRef<'a> {
 #[must_use = "a NetMap runs nothing until `.collect()`, `.net_reduce()`, or `.net_fold()`"]
 pub struct NetMap<'a, F, I> {
     runner: RunnerRef<'a>,
+    /// The wire key the agent looks this task up by. Derived from the task's
+    /// `type_name` by [`NetMapExt::net_map`], or supplied verbatim by the
+    /// `#[rayonette::tasks]` macro via [`NetMapExt::net_map_task`].
+    key: &'static str,
+    /// The task function, kept only to pin `F` (and through it the input and
+    /// output types) for the `Fn(Self::Item) -> O` bound on the terminals. The
+    /// coordinator derives the key and serializes inputs but never calls the
+    /// task, so the value itself is unread.
+    #[expect(
+        dead_code,
+        reason = "carried solely to pin F's type for the terminal's Fn bound; the coordinator never invokes the task"
+    )]
     map: F,
     inputs: Vec<I>,
     requires: Option<Predicate>,
@@ -632,7 +644,7 @@ where
         F: Fn(I) -> O,
         O: DeserializeOwned,
     {
-        let key = fn_key(&self.map);
+        let key = self.key;
         let payloads = serialize_inputs(&self.inputs)?;
         let requires = self.requires;
         let options = RunOptions {
@@ -750,6 +762,34 @@ pub trait NetMapExt: IntoIterator + Sized {
     where
         F: Fn(Self::Item) -> O,
     {
+        let key = fn_key(&map);
+        self.net_map_task(key, map)
+    }
+
+    /// Map `map` over these items, distributed across an explicit `fleet`.
+    /// Otherwise identical to [`NetMapExt::net_map`].
+    fn net_map_with_fleet<F, L, O>(self, map: F, fleet: &Fleet<L>) -> NetMap<'_, F, Self::Item>
+    where
+        F: Fn(Self::Item) -> O,
+        L: Launch + Send + Sync,
+    {
+        let key = fn_key(&map);
+        self.net_map_task_with_fleet(key, map, fleet)
+    }
+
+    /// The keyed terminal behind [`NetMapExt::net_map`]: identical, but the wire
+    /// `key` is supplied explicitly rather than derived from `map`'s `type_name`.
+    ///
+    /// The `#[rayonette::tasks]` macro rewrites a `net_map` call to this, passing
+    /// the deterministic key it also emits in the matching `register_task!`, so
+    /// the agent resolves the task by that key. The `Fn(Self::Item) -> O` bound
+    /// and the no-capture const-assert are unchanged, so the macro's input-type
+    /// guess is still verified at the call site. Not for hand use.
+    #[doc(hidden)]
+    fn net_map_task<F, O>(self, key: &'static str, map: F) -> NetMap<'static, F, Self::Item>
+    where
+        F: Fn(Self::Item) -> O,
+    {
         const {
             assert!(
                 size_of::<F>() == 0,
@@ -758,6 +798,7 @@ pub trait NetMapExt: IntoIterator + Sized {
         }
         NetMap {
             runner: RunnerRef::Global,
+            key,
             map,
             inputs: self.into_iter().collect(),
             requires: None,
@@ -767,9 +808,15 @@ pub trait NetMapExt: IntoIterator + Sized {
         }
     }
 
-    /// Map `map` over these items, distributed across an explicit `fleet`.
-    /// Otherwise identical to [`NetMapExt::net_map`].
-    fn net_map_with_fleet<F, L, O>(self, map: F, fleet: &Fleet<L>) -> NetMap<'_, F, Self::Item>
+    /// The keyed terminal behind [`NetMapExt::net_map_with_fleet`], the
+    /// explicit-fleet counterpart to [`NetMapExt::net_map_task`]. Not for hand use.
+    #[doc(hidden)]
+    fn net_map_task_with_fleet<'a, F, L, O>(
+        self,
+        key: &'static str,
+        map: F,
+        fleet: &'a Fleet<L>,
+    ) -> NetMap<'a, F, Self::Item>
     where
         F: Fn(Self::Item) -> O,
         L: Launch + Send + Sync,
@@ -782,6 +829,7 @@ pub trait NetMapExt: IntoIterator + Sized {
         }
         NetMap {
             runner: RunnerRef::Borrowed(fleet),
+            key,
             map,
             inputs: self.into_iter().collect(),
             requires: None,
@@ -1280,6 +1328,37 @@ mod tests {
         // Terminals other than collect work over the global fleet too.
         let sum = (0..4u32).net_map(double).net_reduce(add).await.unwrap();
         assert_eq!(sum, Some((0..4u32).map(|x| x * 2).sum()));
+    }
+
+    #[tokio::test]
+    async fn net_map_task_carries_the_explicit_key() {
+        // The macro path: a deterministic key that is NOT the task's type_name. The
+        // agent registered exactly "triple", so the run resolves only because
+        // net_map_task carried that key verbatim onto the wire (a type_name key
+        // would miss and the run would error with unknown fn_key).
+        let mut registry = Registry::new();
+        registry.add("triple", double);
+        let fleet = Fleet::new(vec![InProcess::serving_registry(registry)]);
+
+        let out: Vec<Result<u32, String>> = (0..6u32)
+            .net_map_task_with_fleet("triple", double, &fleet)
+            .collect()
+            .await
+            .unwrap();
+
+        assert_eq!(out, (0..6u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn net_map_equivalence_regression() {
+        // Computing the key in the constructor (instead of in run()) must keep both
+        // net_map forms keyed by the task's type_name, exactly as before. Construct
+        // only (no terminal, so no global-fleet access) and inspect the key.
+        let fleet = Fleet::new(vec![InProcess::serving(true)]);
+        let global = (0..3u32).net_map(double);
+        let explicit = (0..3u32).net_map_with_fleet(double, &fleet);
+        assert_eq!(global.key, crate::agent::fn_key(&double));
+        assert_eq!(explicit.key, crate::agent::fn_key(&double));
     }
 
     #[tokio::test]

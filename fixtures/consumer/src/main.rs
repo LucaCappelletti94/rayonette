@@ -12,11 +12,14 @@ const fn double(x: u32) -> u32 {
 
 rayonette::embed_microcrates!();
 
+#[rayonette::tasks]
 #[tokio::main]
 async fn main() {
-    // Serve as an agent and exit if launched as one; else run as coordinator.
+    // Serve as an agent and exit if launched as one; else run as coordinator. The
+    // registry is built from the `#[rayonette::tasks]` registrations gathered by
+    // inventory at boot, not the build-time scan.
     serve_if_agent(NodeConfig::new(
-        __rayonette_registry(),
+        rayonette::agent::Registry::from_inventory(),
         __rayonette_source(),
     ))
     .await;

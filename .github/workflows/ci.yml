@@ -66,7 +66,7 @@ jobs:
       # capped below 100% by generic monomorphization (per-type encode/decode
       # error arms that protocol types never exercise), not by dead code.
       - name: Coverage
-        run: cargo llvm-cov --workspace --all-features --ignore-filename-regex 'src/bin/|fixtures/|harness/|examples/' --fail-under-functions 100 --fail-under-lines 99 -- --include-ignored
+        run: cargo llvm-cov --workspace --all-features --ignore-filename-regex 'src/bin/|fixtures/|harness/|examples/|rayonette-macros/src/' --fail-under-functions 100 --fail-under-lines 99 -- --include-ignored
 
   # Pyramid level 4: the segmented multi-host docker network. Provisions cold
   # hosts (install -> ship -> build -> run), proves the cache, multi-hop

@@ -1,0 +1,19 @@
+[package]
+name = "rayonette-macros-core"
+description = "Internal token-rewriting logic for the rayonette tasks macro (instrumented and unit-tested; the proc-macro shell lives in rayonette-macros)."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "visit-mut"] }
+
+[lints]
+workspace = true

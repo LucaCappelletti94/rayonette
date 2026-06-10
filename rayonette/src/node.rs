@@ -269,9 +269,14 @@ pub async fn agent_main(config: NodeConfig) -> ! {
 /// ```ignore
 /// rayonette::embed_microcrates!();
 ///
+/// #[rayonette::tasks]
 /// #[tokio::main]
 /// async fn main() {
-///     rayonette::serve_if_agent(NodeConfig::new(__rayonette_registry(), __rayonette_source())).await;
+///     rayonette::serve_if_agent(NodeConfig::new(
+///         rayonette::agent::Registry::from_inventory(),
+///         __rayonette_source(),
+///     ))
+///     .await;
 ///     // coordinator: build a fleet and net_map over it ...
 /// }
 /// ```

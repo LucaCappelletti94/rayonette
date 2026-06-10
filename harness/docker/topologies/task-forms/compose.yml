@@ -1,0 +1,18 @@
+# A single leaf used by the task-forms scenario to prove every macro-supported
+# task shape (named fn, annotated closure, binding-inferred closure, turbofished
+# generic) ships to a blank host, builds there, and runs correctly.
+name: rayonette-task-forms
+
+volumes:
+  rayonette-topo-cache:
+    external: true
+
+services:
+  forms:
+    init: true
+    image: rayonette-harness-base:latest
+    volumes:
+      - ../../secrets:/secrets:ro
+      - rayonette-topo-cache:/home/rayonette/.cache
+    ports:
+      - "2280:22"

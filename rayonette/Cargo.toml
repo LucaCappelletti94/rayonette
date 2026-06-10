@@ -25,6 +25,15 @@ bytes = "1"
 futures = "0.3"
 blake3 = "1"
 openssh = "0.11"
+# Link-time task registration: every `register_task!` submits a `TaskEntry` that
+# `Registry::from_inventory` gathers at agent boot, replacing the build-time
+# source scan. `inventory` (ctor-based) is preferred over `linkme` here because
+# its constructors run regardless of where a task is defined, so a task factored
+# into a consumer's sub-crate is never silently dropped.
+inventory = "0.3"
+# The `#[rayonette::tasks]` attribute: a thin proc-macro shell over the
+# instrumented `rayonette-macros-core`, re-exported as `rayonette::tasks`.
+rayonette-macros = { path = "../rayonette-macros" }
 # Coordinator-side topology graph: CSR structs plus Kahn, BiconnectedComponents,
 # and ConnectedComponents over the discovered DAG, and the ForceAtlas2 layout the
 # graph panel positions nodes with. `alloc` is the feature these algorithms need;
@@ -37,6 +46,12 @@ ratatui = { version = "0.29", optional = true }
 
 [dev-dependencies]
 proptest = "1"
+# Compile-pass UI tests for `#[rayonette::tasks]` (tests/ui/pass), proving named
+# functions, annotated closures, receiver-inferred closures, and turbofished
+# generics all compile. The failure cases are `compile_fail` doctests instead of
+# trybuild compile-fail tests, because exact `.stderr` golden output (caret spans,
+# const-eval panic wording) drifts even between stable releases.
+trybuild = "1"
 # The TUI snapshot test (tests/tui_snapshot.rs) renders the committed capstone
 # trace and diffs it against a golden; it needs ratatui's TestBackend and serde
 # JSON to read the trace. Both are test-only.

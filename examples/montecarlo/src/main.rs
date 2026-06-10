@@ -84,11 +84,13 @@ fn cluster_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("cluster")
 }
 
+#[rayonette::tasks]
 #[tokio::main]
 async fn main() {
-    // Serve as an agent and exit if launched as one; else run as coordinator.
+    // Serve as an agent and exit if launched as one; else run as coordinator. The
+    // registry is built from the inventory of `#[rayonette::tasks]` registrations.
     serve_if_agent(NodeConfig::new(
-        __rayonette_registry(),
+        rayonette::agent::Registry::from_inventory(),
         __rayonette_source(),
     ))
     .await;
