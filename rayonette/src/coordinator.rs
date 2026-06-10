@@ -3,7 +3,7 @@
 //! Hands a job's inputs to a set of agents, schedules them by pull (each agent
 //! is kept filled to its advertised capacity from the pending pool, one slot for
 //! a leaf and more for a relay fronting a subtree), and assembles the results in
-//! input order (PLAN.md Phase 1).
+//! input order.
 //!
 //! Each agent connection is split: the coordinator keeps the send half to issue
 //! `Assign`/`Shutdown`, and a per-agent reader task drains the receive half into

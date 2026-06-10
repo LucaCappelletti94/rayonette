@@ -1,4 +1,4 @@
-//! Node capability profiles and the scheduling role filter (PLAN.md R1).
+//! Node capability profiles and the scheduling role filter.
 //!
 //! A [`NodeProfile`] is what probing a host yields: a stable core (OS, cores,
 //! RAM) plus extensible capability lists, today the GPUs. The consumer maps a
@@ -498,7 +498,7 @@ pub fn parse_macos_gpus(out: &str) -> Vec<Gpu> {
         .collect()
 }
 
-/// Composable capability predicates for building filters (PLAN.md R1).
+/// Composable capability predicates for building filters.
 ///
 /// A [`Predicate`] is a reusable test over a [`NodeProfile`], built from the
 /// constructors here and combined with `and` / `or` / `not`. The same

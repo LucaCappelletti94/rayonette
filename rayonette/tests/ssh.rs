@@ -1,4 +1,4 @@
-//! Level-3 ssh-to-localhost smoke tests (PLAN.md Phase 4).
+//! Level-3 ssh-to-localhost smoke tests.
 //!
 //! These exercise the real openssh path against `localhost`. They are
 //! `#[ignore]`d so the default `cargo test` stays ssh-free; run them with

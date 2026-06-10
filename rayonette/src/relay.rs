@@ -1,5 +1,5 @@
 //! The relay: a node that is an agent to its parent and a coordinator to its own
-//! children (PLAN.md R2).
+//! children.
 //!
 //! A relay handshakes its parent like a leaf, but instead of running tasks it
 //! launches a sub-fleet of children, advertises their combined capacity upward

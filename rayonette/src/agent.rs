@@ -1,5 +1,5 @@
 //! The agent side: run a registry of task handlers against a connection,
-//! turning `Assign` messages into `Completed`/`Failed` (PLAN.md Phase 1).
+//! turning `Assign` messages into `Completed`/`Failed`.
 //!
 //! A task fails only by panicking: each task runs
 //! under `catch_unwind` so a panic becomes a `Failed` message rather than

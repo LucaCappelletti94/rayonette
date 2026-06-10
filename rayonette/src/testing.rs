@@ -1,4 +1,4 @@
-//! In-process transport helpers for tests (PLAN.md Phase 0).
+//! In-process transport helpers for tests.
 //!
 //! These wire two `Connection`s together over a `tokio` duplex pipe, using the
 //! exact framing the real ssh transport uses, plus a fault injector that severs

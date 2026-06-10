@@ -1,6 +1,6 @@
-# Task registration (API review item 2): deviations from the approved plan
+# Task registration (API review item 2): implementation notes and v1 limitations
 
-This log records every place the implementation departs from the letter of the approved plan (`~/.claude/plans/let-s-start-preparing-a-shimmering-sunset.md`), with the reason. Each entry is something a reviewer reading the plan would not otherwise expect from the diff. The plan's intent and the two standing constraints (never land an uncalled `pub fn`; every deletion atomic with its tests) are preserved throughout.
+This records the notable implementation choices behind API-review item 2 (the `#[rayonette::tasks]` macro and `inventory`-based task registration), focusing on where the build diverged from its original phased plan and on the intentional v1 limitations that resulted. Each entry is a choice a reader would not otherwise infer from the diff, with its reason. Two constraints held throughout: never land an uncalled `pub fn`, and make every deletion atomic with its tests.
 
 ## Phase 1 (library plumbing)
 
@@ -66,7 +66,7 @@ This log records every place the implementation departs from the letter of the a
 
 ## Phase 5 (backstop, doctests, prelude, docs)
 
-1. The coverage-ignore note went to `HARDENING.md`, not the README. The plan said to update the README and the coverage-command documentation, but the README is a two-line stub with no coverage or crate-layout content. The documented gate command lives in `HARDENING.md`, so the `rayonette-macros/src/` ignore and its rationale were recorded there.
+1. There was no README coverage section to update. The plan said to update the README and the coverage-command documentation, but the README is a two-line stub with no coverage content, and the gate command lives in the CI workflow. The `rayonette-macros/src/` ignore was added in `.github/workflows/ci.yml`, with a comment there explaining why the proc-macro shell is excluded while `rayonette-macros-core` stays instrumented.
 
 2. The unknown-key backstop reads the registry's keys through a small private `Registry::keys()` accessor rather than the private `handlers` field directly, and the message is branchless: it always joins the sorted keys, so an empty registry simply renders as `[]`. That keeps the single existing `rejects_unknown_fn_key` test sufficient (no separate empty-registry case to cover a branch that does not exist).
 

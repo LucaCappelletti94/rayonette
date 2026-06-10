@@ -1,4 +1,4 @@
-//! Boot-time node role (PLAN.md R2).
+//! Boot-time node role.
 //!
 //! When a process starts in agent mode it reads its own children file and runs
 //! as a leaf (serving tasks over stdio) or, if it names any children, as a relay

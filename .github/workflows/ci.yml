@@ -65,6 +65,10 @@ jobs:
       # 100% functions and ~100% lines are attainable; region coverage is
       # capped below 100% by generic monomorphization (per-type encode/decode
       # error arms that protocol types never exercise), not by dead code.
+      # The ignore-regex excludes rayonette-macros/src/, the thin proc-macro
+      # shell whose whole body is a one-line delegation; its logic lives in
+      # rayonette-macros-core, which stays instrumented and at 100/100. A
+      # proc-macro crate boundary cannot be exercised by an in-process test.
       - name: Coverage
         run: cargo llvm-cov --workspace --all-features --ignore-filename-regex 'src/bin/|fixtures/|harness/|examples/|rayonette-macros/src/' --fail-under-functions 100 --fail-under-lines 99 -- --include-ignored
 
