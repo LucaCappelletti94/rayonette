@@ -1,8 +1,8 @@
 //! rayonette: SSH-transport task distribution.
 //!
 //! Where rayon fans data-parallel work across the cores of one machine, rayonette
-//! fans task-parallel work across machines on a network. See `DECISIONS.md` and
-//! `PLAN.md` at the repo root for the design and the phased build.
+//! fans task-parallel work across machines on a network. See `DECISIONS.md` at the
+//! repo root for the design rationale.
 
 // In non-test code the only sanctioned panic surface is a documented `expect()`,
 // so these bans keep `unwrap`, `panic!`, `unreachable!`, and a message-less

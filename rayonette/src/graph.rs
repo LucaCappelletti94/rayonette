@@ -1,4 +1,4 @@
-//! The coordinator-side topology graph (PLAN.md R5).
+//! The coordinator-side topology graph.
 //!
 //! Discovery reports each node's stable physical id and its parent up to the
 //! coordinator. This module folds those facts into one directed graph keyed by

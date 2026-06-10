@@ -1,7 +1,7 @@
 # rayonette docker harness (test pyramid level 4)
 
 A deliberately segmented multi-host network for exercising the real provisioning
-ladder and ssh transport (PLAN.md Phase 4). The point is partial connectivity:
+ladder and ssh transport. The point is partial connectivity:
 the coordinator cannot reach most nodes directly, so work is forced through ssh
 `ProxyJump` chains, the way decision 21 says it should be.
 

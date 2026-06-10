@@ -1,4 +1,4 @@
-//! The serializable event stream and the in-memory run state (PLAN.md Phase 5).
+//! The serializable event stream and the in-memory run state.
 //!
 //! The core emits a single stream of [`Event`]s, the one source of truth that
 //! every renderer subscribes to. [`EventBus`] is the

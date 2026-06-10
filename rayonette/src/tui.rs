@@ -1,4 +1,4 @@
-//! The terminal TUI renderer (PLAN.md Phase 5), behind the `tui` feature.
+//! The terminal TUI renderer, behind the `tui` feature.
 //!
 //! [`App`] is the live dashboard state: the reduced [`RunState`], a rolling event
 //! log, and the elapsed time the driver feeds it. [`draw`] turns an [`App`] into a

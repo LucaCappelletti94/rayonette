@@ -66,7 +66,7 @@ This records the notable implementation choices behind API-review item 2 (the `#
 
 ## Phase 5 (backstop, doctests, prelude, docs)
 
-1. The coverage-ignore note went to `HARDENING.md`, not the README. The plan said to update the README and the coverage-command documentation, but the README is a two-line stub with no coverage or crate-layout content. The documented gate command lives in `HARDENING.md`, so the `rayonette-macros/src/` ignore and its rationale were recorded there.
+1. There was no README coverage section to update. The plan said to update the README and the coverage-command documentation, but the README is a two-line stub with no coverage content, and the gate command lives in the CI workflow. The `rayonette-macros/src/` ignore was added in `.github/workflows/ci.yml`, with a comment there explaining why the proc-macro shell is excluded while `rayonette-macros-core` stays instrumented.
 
 2. The unknown-key backstop reads the registry's keys through a small private `Registry::keys()` accessor rather than the private `handlers` field directly, and the message is branchless: it always joins the sorted keys, so an empty registry simply renders as `[]`. That keeps the single existing `rejects_unknown_fn_key` test sufficient (no separate empty-registry case to cover a branch that does not exist).
 

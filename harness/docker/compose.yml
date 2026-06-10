@@ -1,4 +1,4 @@
-# Segmented multi-host network for rayonette's level-4 tests (PLAN.md Phase 4).
+# Segmented multi-host network for rayonette's level-4 tests.
 #
 # The coordinator runs on the host and can only reach `bastion` (the one
 # published port). Every other node is reachable solely by name through an ssh

@@ -1,4 +1,4 @@
-//! Getting a cold ssh-only host to a running agent (PLAN.md Phase 4).
+//! Getting a cold ssh-only host to a running agent.
 //!
 //! [`provision`] drives the ladder: probe the host, install rust if missing,
 //! ship and unpack the crate source, build it, and report the agent binary

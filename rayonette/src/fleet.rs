@@ -1,4 +1,4 @@
-//! The user-facing fleet and its distributed map (PLAN.md Phase 3).
+//! The user-facing fleet and its distributed map.
 //!
 //! A [`Fleet`] is a homogeneous set of agent launchers. The [`NetMapExt`] iterator
 //! adapter (`inputs.net_map_with_fleet(map, &fleet)`) derives the wire key from

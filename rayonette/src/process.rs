@@ -1,4 +1,4 @@
-//! Real-process transport (PLAN.md Phase 2).
+//! Real-process transport.
 //!
 //! Detect agent mode, build a connection over the current process's stdio (agent
 //! side), and spawn an agent subprocess with a connection over its stdio plus
