@@ -75,12 +75,14 @@ fn filter_from_env() -> Option<Filter> {
     }
 }
 
+#[rayonette::tasks]
 #[tokio::main]
 async fn main() {
     // As an agent (a leaf, or a relay if this host has a children file): serve
-    // and exit. Otherwise fall through and run as the coordinator.
+    // and exit. Otherwise fall through and run as the coordinator. The registry is
+    // built from the inventory of `#[rayonette::tasks]` registrations.
     serve_if_agent(NodeConfig::new(
-        __rayonette_registry(),
+        rayonette::agent::Registry::from_inventory(),
         __rayonette_source(),
     ))
     .await;

@@ -1,0 +1,5 @@
+error: rayonette: annotate the closure's input type (for example `|x: u32|`) or pass a named function. Its type cannot be recovered at this call site
+  --> tests/ui/fail/tier_d_give_up_emits_compile_error.rs:12:34
+   |
+12 |     let _job = produce().net_map(|x| x * 2);
+   |                                  ^^^^^^^^^

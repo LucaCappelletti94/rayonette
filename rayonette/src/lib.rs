@@ -59,6 +59,40 @@ pub mod testing;
 /// Install the process-global fleet that bare `net_map(map)` runs against.
 pub use fleet::install_fleet;
 
+/// Re-exported so [`register_task!`] can name `inventory::submit!` through
+/// `$crate` in a consumer crate that does not depend on `inventory` directly.
+#[doc(hidden)]
+pub use inventory;
+
+/// Scope a function's `net_map` call sites so each becomes a registered task.
+///
+/// Put `#[rayonette::tasks]` on the function containing the `net_map` /
+/// `net_map_with_fleet` calls: each annotated closure or named function is keyed
+/// and registered automatically (gathered by [`agent::Registry::from_inventory`]),
+/// with no hand-written registry. An unannotated closure whose input type cannot
+/// be recovered is a compile error at the call site, never a silent runtime miss.
+pub use rayonette_macros::tasks;
+
+/// Register a task under an explicit wire `key`, submitting it to the inventory
+/// that [`agent::Registry::from_inventory`] gathers at agent boot.
+///
+/// The `#[rayonette::tasks]` macro emits one of these per task call site, using
+/// the same `key` literal it puts in the rewritten `net_map_task` call, so the
+/// coordinator and the agent agree on the key by construction. `task` must be a
+/// named function or a non-capturing closure (the same contract `net_map`
+/// enforces); its input and output types are recovered generically, so no
+/// hand-written decode/encode wrapper is needed.
+#[macro_export]
+macro_rules! register_task {
+    ($key:expr, $task:expr $(,)?) => {
+        $crate::inventory::submit! {
+            $crate::agent::TaskEntry::new(|registry| {
+                registry.add($key, $task);
+            })
+        }
+    };
+}
+
 /// The common API in one import: `use rayonette::prelude::*;`.
 pub mod prelude {
     pub use crate::capability::{pred, Filter, Os, Role};
@@ -75,20 +109,16 @@ pub mod prelude {
     pub use crate::tui::{Action, App, Input};
 }
 
-/// Pull in what `rayonette_build::extract()` generated.
+/// Embed the crate source bundle that `rayonette_build::extract()` produced.
 ///
 /// Invoke once at the consumer's crate root, after its `build.rs` has called
-/// `rayonette_build::extract()`. Expands to `__rayonette_registry()`, returning the
-/// agent [`agent::Registry`], and `__rayonette_source()`, returning the source
-/// bundle to ship to workers (so a consumer never tars its own source).
+/// `rayonette_build::extract()`. Expands to `__rayonette_source()`, returning the
+/// source bundle to ship to workers (so a consumer never tars its own source).
+/// The agent's task registry is no longer generated here: it is built at boot
+/// from the `#[rayonette::tasks]` registrations via [`agent::Registry::from_inventory`].
 #[macro_export]
 macro_rules! embed_microcrates {
     () => {
-        #[allow(dead_code)]
-        fn __rayonette_registry() -> $crate::agent::Registry {
-            include!(concat!(env!("OUT_DIR"), "/rayonette_registry.rs"))
-        }
-
         #[allow(dead_code)]
         fn __rayonette_source() -> ::std::vec::Vec<u8> {
             include_bytes!(concat!(env!("OUT_DIR"), "/rayonette_source.tar")).to_vec()

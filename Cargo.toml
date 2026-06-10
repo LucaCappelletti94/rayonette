@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "rayonette",
     "rayonette-build",
+    "rayonette-macros-core",
+    "rayonette-macros",
     "fixtures/consumer",
     "harness/docker/consumer",
     "examples/montecarlo",

@@ -100,14 +100,20 @@ fn env(key: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| panic!("{key} must be set"))
 }
 
+#[rayonette::tasks]
 #[tokio::main]
 async fn main() {
     // Relay-capable agent: with a children file it relays to its own subtree,
     // without one it serves as a leaf. serve_if_agent serves then exits (an agent
     // must not linger on its parent's stdin); it carries the env-selected
-    // toolchain a relay builds its children with.
+    // toolchain a relay builds its children with. The registry is built from the
+    // inventory of `#[rayonette::tasks]` registrations.
     serve_if_agent(
-        NodeConfig::new(__rayonette_registry(), __rayonette_source()).toolchain(Toolchain::named(
+        NodeConfig::new(
+            rayonette::agent::Registry::from_inventory(),
+            __rayonette_source(),
+        )
+        .toolchain(Toolchain::named(
             std::env::var("RAYONETTE_TOOLCHAIN").unwrap_or_else(|_| "stable".to_string()),
         )),
     )

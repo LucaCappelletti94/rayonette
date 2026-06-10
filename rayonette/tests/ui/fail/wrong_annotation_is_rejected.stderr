@@ -1,0 +1,20 @@
+error[E0631]: type mismatch in closure arguments
+  --> tests/ui/fail/wrong_annotation_is_rejected.rs:10:31
+   |
+10 |     let _job = values.net_map(|x: String| x.len() as u32);
+   |                       ------- -----------^^^^^^^^^^^^^^^
+   |                       |       |
+   |                       |       expected due to this
+   |                       |       found signature defined here
+   |                       required by a bound introduced by this call
+   |
+   = note: expected closure signature `fn(u32) -> _`
+              found closure signature `fn(String) -> _`
+note: required by a bound in `rayonette::fleet::NetMapExt::net_map_task`
+  --> src/fleet.rs
+   |
+   |     fn net_map_task<F, O>(self, key: &'static str, map: F) -> NetMap<'static, F, Self::Item>
+   |        ------------ required by a bound in this associated function
+   |     where
+   |         F: Fn(Self::Item) -> O,
+   |            ^^^^^^^^^^^^^^^^^^^ required by this bound in `NetMapExt::net_map_task`
