@@ -52,6 +52,18 @@ This log records every place the implementation departs from the letter of the a
 
 4. The optional annotated-closure `net_map` was not added to any consumer. All four stay on named functions for the lowest-risk cutover (the plan's preference for `fixtures/consumer`). The Tier A and Tier C closure paths are already proven end to end by `macro_inprocess.rs` and the trybuild pass cases.
 
+## Phase 4b (delete the scanner and registry emission)
+
+1. `collect_rs_files` was deleted, not kept. The plan's keep-list named it, but its only caller was the scan loop in `extract_into`; removing the scan orphans it, and a kept-but-uncalled private function fails the 100-percent-functions gate. It had no dedicated test (it was covered only through the scan path), so the deletion is atomic. The rerun-if-changed list still comes from `bundle_source`'s returned bundled files, which is workspace-wide and strictly broader than a src-only enumeration would have been.
+
+2. `extract_into_rejects_unparseable_source` was also deleted. The plan named only the `find_net_map_calls`-based `rejects_unparseable_source`, but once `extract_into` is bundling-only it no longer parses Rust, so it cannot error on unparseable source and that test's premise is gone.
+
+3. `extract_into_scans_subdirs` was renamed to `extract_into_bundles_nested_subdirs` and its sample files changed to neutral content, since "scans" no longer describes it; it now asserts only that a nested file lands in the bundle.
+
+4. Removed the now-unused `syn` dependency from `rayonette-build` (the scanner was its only user) and updated the crate's stale "extraction and codegen" description to "source bundling." A stale `serve_if_agent` doc example in `node.rs` that still showed `__rayonette_registry()` was updated to `Registry::from_inventory()`.
+
+5. `extract_into` no longer writes `rayonette_registry.rs` at all (the plan had it lingering as a dead `OUT_DIR` file through 4b). Since the `embed_microcrates!` registry half was already dropped in 4a, there is no reader, so not writing it is cleaner than writing a dead file.
+
 ## Process note: stale coverage profdata
 
 cargo-llvm-cov merges `.profraw` across runs within a session. After any edit that shifts line numbers, run `cargo llvm-cov clean --workspace` before measuring, or the report is garbage (a Phase 3 measurement read 79 percent purely from stale data). The four-command gate is reliable from a clean profdata state.

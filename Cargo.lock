@@ -1002,7 +1002,6 @@ dependencies = [
 name = "rayonette-build"
 version = "0.0.0"
 dependencies = [
- "syn",
  "tar",
  "tempfile",
  "toml 0.8.23",
