@@ -12,6 +12,7 @@ node online mid-run (the fleet grows and absorbs it).
 
 | topology            | shape                                   | experiment                                                              |
 |---------------------|-----------------------------------------|------------------------------------------------------------------------|
+| `task-forms`        | coordinator -> one leaf                 | run every macro task shape (named fn, annotated closure, binding-inferred closure, turbofished generic) and check each ships, builds, and returns the right answer |
 | `line2`             | coordinator -> relay -> two leaves      | kill the sole relay: subtree stranded, run fails legibly               |
 | `line3`             | coordinator -> relay1 -> relay2 -> leaf | depth-3 cascade completes, kill the interior relay strands the leaf    |
 | `diamond`           | leaf reachable via relayA and relayB    | dedup to one primary, kill the primary bridge, standby finishes        |

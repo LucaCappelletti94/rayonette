@@ -47,3 +47,40 @@ async fn unannotated_closure_over_literal_range_runs() {
     let out = ranged().await.unwrap();
     assert_eq!(out, (0..5u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
 }
+
+// A Tier B closure with NO annotation: the macro recovers `u32` from the typed
+// `let` binding in scope, so a bare `|x| ...` over `values` becomes a task.
+#[rayonette::tasks]
+async fn over_a_binding(fleet: &Fleet<LocalAgent>) -> std::io::Result<Vec<Result<u32, String>>> {
+    let values: Vec<u32> = (0..5u32).collect();
+    values.net_map_with_fleet(|x| x * 2, fleet).collect().await
+}
+
+#[tokio::test]
+async fn binding_inferred_closure_runs_as_a_distributed_task() {
+    let fleet = Fleet::new(vec![LocalAgent::new("leaf", Registry::from_inventory())]);
+    let out = over_a_binding(&fleet).await.unwrap();
+    assert_eq!(out, (0..5u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+}
+
+// A doubler reached as a turbofished generic instance: the macro passes the
+// turbofish through verbatim and keys the concrete instantiation, so the agent
+// registers and runs exactly `twice::<u32>`.
+fn twice<T: std::ops::Add<Output = T> + Copy>(x: T) -> T {
+    x + x
+}
+
+#[rayonette::tasks]
+async fn over_a_generic(fleet: &Fleet<LocalAgent>) -> std::io::Result<Vec<Result<u32, String>>> {
+    (0..5u32)
+        .net_map_with_fleet(twice::<u32>, fleet)
+        .collect()
+        .await
+}
+
+#[tokio::test]
+async fn turbofished_generic_runs_as_a_distributed_task() {
+    let fleet = Fleet::new(vec![LocalAgent::new("leaf", Registry::from_inventory())]);
+    let out = over_a_generic(&fleet).await.unwrap();
+    assert_eq!(out, (0..5u32).map(|x| Ok(x * 2)).collect::<Vec<_>>());
+}

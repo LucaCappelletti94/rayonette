@@ -40,6 +40,14 @@ fn dawdle(x: u32) -> u32 {
     x
 }
 
+/// A generic doubler, registered through an explicit turbofish (`twice::<u32>`).
+/// The `task-forms` scenario runs it to prove a monomorphized generic instance
+/// survives the ship-and-build-remotely round trip, where the old scanner dropped
+/// the turbofish and miscompiled.
+fn twice<T: std::ops::Add<Output = T> + Copy>(x: T) -> T {
+    x + x
+}
+
 rayonette::embed_microcrates!();
 
 /// Appends each event to the `RAYONETTE_EVENT_LOG` file as JSONL, timestamped from
@@ -148,8 +156,13 @@ async fn main() {
     let fleet = Fleet::observed(launchers, sink.clone());
 
     let inputs: Vec<u32> = (0..count).collect();
-    // Task functions must appear literally in `net_map_with_fleet(<fn>, ...)` so
-    // the build-time extractor registers them, hence the duplicated branches.
+    // Each task call site must name its task literally so `#[rayonette::tasks]`
+    // can rewrite it, hence the duplicated branches. The first three are the
+    // topology tasks (named functions, with the require-redundancy variants the
+    // kill scenarios use); the last three are the `task-forms` corner cases that
+    // prove every macro-supported task shape ships and runs: an annotated closure,
+    // an unannotated closure recovered from a typed binding, and a turbofished
+    // generic instance.
     let require_redundancy = std::env::var("RAYONETTE_REQUIRE_REDUNDANCY").is_ok();
     let result = if task == "crunch" {
         let job = inputs.clone().net_map_with_fleet(crunch, &fleet);
@@ -165,6 +178,23 @@ async fn main() {
         } else {
             job.collect().await
         }
+    } else if task == "closure" {
+        inputs
+            .clone()
+            .net_map_with_fleet(|x: u32| x * 2, &fleet)
+            .collect()
+            .await
+    } else if task == "inferred" {
+        // A bare typed binding receiver, so the macro recovers the input type
+        // (`u32`) with no annotation (Tier B).
+        let nums: Vec<u32> = inputs.clone();
+        nums.net_map_with_fleet(|x| x * 2, &fleet).collect().await
+    } else if task == "generic" {
+        inputs
+            .clone()
+            .net_map_with_fleet(twice::<u32>, &fleet)
+            .collect()
+            .await
     } else {
         let job = inputs.clone().net_map_with_fleet(double, &fleet);
         if require_redundancy {
@@ -185,7 +215,9 @@ async fn main() {
 
     assert_eq!(out.len(), inputs.len());
     assert!(out.iter().all(Result::is_ok), "some task failed: {out:?}");
-    if task == "double" {
+    // Every doubling task form (the named fn and the three corner cases) must
+    // produce the same answer, which is the point of the `task-forms` scenario.
+    if matches!(task.as_str(), "double" | "closure" | "inferred" | "generic") {
         let expected: Vec<Result<u32, String>> = inputs.iter().map(|x| Ok(x * 2)).collect();
         assert_eq!(out, expected);
     }
