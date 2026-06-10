@@ -1,16 +1,20 @@
-//! Compile-pass and compile-fail UI tests for `#[rayonette::tasks]`.
+//! Compile-pass UI tests for `#[rayonette::tasks]`.
 //!
-//! The pass cases prove a named function and an annotated closure both become
-//! tasks that compile. The fail cases are the soundness guarantees: a closure
-//! annotated with the wrong input type is rejected at its own call site (the
-//! macro only proposes a type, `net_map`'s `Fn(Self::Item) -> O` bound verifies
-//! it), a capturing closure is rejected by the no-capture const-assert, and an
-//! unannotated closure whose type cannot be recovered is a legible compile error
-//! rather than a silent runtime miss.
+//! These prove that every supported task shape compiles: a named function, an
+//! annotated closure, a closure whose input type is recovered from a typed
+//! binding or a literal or range receiver, and a turbofished generic instance.
+//!
+//! The failure guarantees (a wrong annotation rejected at the call site, a
+//! capturing closure rejected by the const-assert, an unrecoverable closure type
+//! rejected with a legible message) are `compile_fail` doctests on the public
+//! surface instead of trybuild compile-fail tests, because matching exact
+//! `.stderr` golden output is toolchain-specific (caret span widths and the
+//! const-eval panic wording drift even between stable releases) while a
+//! `compile_fail` doctest only asserts that the code does not compile, which
+//! holds on every channel.
 
 #[test]
-fn ui() {
+fn ui_pass() {
     let t = trybuild::TestCases::new();
     t.pass("tests/ui/pass/*.rs");
-    t.compile_fail("tests/ui/fail/*.rs");
 }

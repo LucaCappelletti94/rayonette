@@ -46,9 +46,11 @@ ratatui = { version = "0.29", optional = true }
 
 [dev-dependencies]
 proptest = "1"
-# Compile-pass and compile-fail UI tests for `#[rayonette::tasks]` (tests/ui/),
-# proving annotated closures and named fns compile and that wrong-type or
-# unannotated tasks fail at the call site with a legible message.
+# Compile-pass UI tests for `#[rayonette::tasks]` (tests/ui/pass), proving named
+# functions, annotated closures, receiver-inferred closures, and turbofished
+# generics all compile. The failure cases are `compile_fail` doctests instead of
+# trybuild compile-fail tests, because exact `.stderr` golden output (caret spans,
+# const-eval panic wording) drifts even between stable releases.
 trybuild = "1"
 # The TUI snapshot test (tests/tui_snapshot.rs) renders the committed capstone
 # trace and diffs it against a golden; it needs ratatui's TestBackend and serde

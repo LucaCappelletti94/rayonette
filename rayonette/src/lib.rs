@@ -103,6 +103,20 @@ pub use inventory;
 ///     let _ = produce().net_map(|x| x * 2);
 /// }
 /// ```
+///
+/// A wrong input-type annotation is rejected the same way: the macro only
+/// proposes the type, and `net_map`'s `Fn(Self::Item) -> O` bound verifies it at
+/// the call site, so a mistaken guess can never become a runtime mis-decode:
+/// ```compile_fail
+/// use rayonette::prelude::*;
+///
+/// #[rayonette::tasks]
+/// fn main() {
+///     let values: Vec<u32> = vec![1, 2, 3];
+///     // `String` over a `Vec<u32>`: rejected at this call site.
+///     let _ = values.net_map(|x: String| x.len());
+/// }
+/// ```
 pub use rayonette_macros::tasks;
 
 /// Register a task under an explicit wire `key`, submitting it to the inventory
