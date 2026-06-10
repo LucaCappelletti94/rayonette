@@ -34,11 +34,12 @@ Fix: curate the surface. Done. The engine modules with no external use (`graph`,
 
 A consumer must wire `build.rs` to call `rayonette_build::extract()`, invoke `embed_microcrates!()`, hand-write an `if is_agent() { agent_main(NodeConfig::new(...)).await }` branch, and then `install_fleet` plus `net_map`. The mistakes (doing fleet setup before the `is_agent` check, not realizing the agent branch must exit, the binary-name string) all surface at runtime.
 
-Fix: a single `rayonette::agent_entrypoint!()` macro, or a `run_agent_if_agent()` helper that assembles `NodeConfig` from the macro plus `CARGO_BIN_NAME`, would collapse the agent half to one line and remove the foot-guns in items 1 and 3 at the same time.
+Fix: done. A single `rayonette::serve_if_agent(config: NodeConfig)` async helper collapses the agent half to one call: it checks `is_agent`, and when true hands the config to `agent_main` (which serves then exits), otherwise returns so the caller runs as the coordinator. A consumer now writes `embed_microcrates!()` plus one line at the top of `main` (`serve_if_agent(NodeConfig::new(__rayonette_registry(), __rayonette_source())).await`), with no hand-written `is_agent` branch and no way to forget the exit. A plain async helper was chosen over a macro because a macro would either fail cross-macro hygiene reaching `embed_microcrates!`'s generated functions or re-embed the source tar; taking a `NodeConfig` also preserves builder overrides (the docker harness keeps its env-selected toolchain). The remaining footgun (calling it after fleet setup) is inherent to not taking over `main` and is documented.
 
 ## Status
 
 - Item 1: done (merged).
-- Item 3: done (this change).
+- Item 3: done (merged).
 - Item 4: done (merged).
-- Items 2 and 5: recorded here, not yet started.
+- Item 5: done (this change).
+- Item 2: recorded here, not yet started.

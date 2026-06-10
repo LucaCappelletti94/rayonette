@@ -27,9 +27,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rayonette::fleet::{Fleet, NetMapExt};
-use rayonette::node::{agent_main, NodeConfig, Toolchain};
+use rayonette::node::{serve_if_agent, NodeConfig, Toolchain};
 use rayonette::observability::{Event, EventSink};
-use rayonette::process;
 use rayonette::ssh::{Ssh, SshConfig};
 
 /// Samples each task draws. Large enough that the compute dwarfs the transport.
@@ -87,12 +86,12 @@ fn cluster_dir() -> PathBuf {
 
 #[tokio::main]
 async fn main() {
-    if process::is_agent() {
-        // The one agent entry point: a leaf, or a relay if this worker names
-        // children, then exits the process. It never returns.
-        let config = NodeConfig::new(__rayonette_registry(), __rayonette_source());
-        agent_main(config).await;
-    }
+    // Serve as an agent and exit if launched as one; else run as coordinator.
+    serve_if_agent(NodeConfig::new(
+        __rayonette_registry(),
+        __rayonette_source(),
+    ))
+    .await;
 
     // `cluster/up.sh` writes the key and one `host port` line per worker.
     let cluster = cluster_dir();

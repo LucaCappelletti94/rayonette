@@ -19,9 +19,8 @@ use std::sync::Arc;
 
 use rayonette::capability::{pred, Filter, Os, Role};
 use rayonette::fleet::{Fleet, NetMapExt};
-use rayonette::node::{agent_main, NodeConfig, Toolchain};
+use rayonette::node::{serve_if_agent, NodeConfig, Toolchain};
 use rayonette::observability::{depth, leaf_of, Event, EventSink};
-use rayonette::process;
 use rayonette::ssh::{parse_host_spec, Ssh};
 
 /// The distributed task: doubles its input.
@@ -78,13 +77,13 @@ fn filter_from_env() -> Option<Filter> {
 
 #[tokio::main]
 async fn main() {
-    if process::is_agent() {
-        // As an agent: a leaf, or a relay if this host has a children file. A
-        // relay re-ships this same source bundle down to its own children.
-        let config = NodeConfig::new(__rayonette_registry(), __rayonette_source());
-        // `agent_main` runs the node then exits the process; it never returns.
-        agent_main(config).await;
-    }
+    // As an agent (a leaf, or a relay if this host has a children file): serve
+    // and exit. Otherwise fall through and run as the coordinator.
+    serve_if_agent(NodeConfig::new(
+        __rayonette_registry(),
+        __rayonette_source(),
+    ))
+    .await;
 
     let spec = std::env::var("RAYONETTE_HOSTS")
         .expect("set RAYONETTE_HOSTS to a space/comma list of ssh destinations");

@@ -12,9 +12,8 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use rayonette::fleet::{Fleet, NetMapExt};
-use rayonette::node::Toolchain;
+use rayonette::node::{serve_if_agent, NodeConfig, Toolchain};
 use rayonette::observability::{Event, EventSink, RecordedEvent, RunState};
-use rayonette::process;
 use rayonette::ssh::{Ssh, SshConfig};
 
 const fn double(x: u32) -> u32 {
@@ -103,19 +102,16 @@ fn env(key: &str) -> String {
 
 #[tokio::main]
 async fn main() {
-    if process::is_agent() {
-        // Relay-capable agent: with a children file it relays to its own subtree,
-        // without one it serves as a leaf. This is what lets the harness build
-        // real relay trees, not just a flat star. agent_main serves, then exits
-        // the process (an agent must not linger on its parent's stdin).
-        rayonette::node::agent_main(
-            rayonette::node::NodeConfig::new(__rayonette_registry(), __rayonette_source())
-                .toolchain(Toolchain::named(
-                    std::env::var("RAYONETTE_TOOLCHAIN").unwrap_or_else(|_| "stable".to_string()),
-                )),
-        )
-        .await;
-    }
+    // Relay-capable agent: with a children file it relays to its own subtree,
+    // without one it serves as a leaf. serve_if_agent serves then exits (an agent
+    // must not linger on its parent's stdin); it carries the env-selected
+    // toolchain a relay builds its children with.
+    serve_if_agent(
+        NodeConfig::new(__rayonette_registry(), __rayonette_source()).toolchain(Toolchain::named(
+            std::env::var("RAYONETTE_TOOLCHAIN").unwrap_or_else(|_| "stable".to_string()),
+        )),
+    )
+    .await;
 
     let config_path = env("RAYONETTE_SSH_CONFIG");
     let leaves = env("RAYONETTE_LEAVES");

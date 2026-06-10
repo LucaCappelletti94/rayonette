@@ -67,7 +67,7 @@ pub mod prelude {
     pub use crate::fleet::RayonNetMapExt;
     pub use crate::fleet::{Fleet, Launch, NetMapExt, Subprocess};
     pub use crate::install_fleet;
-    pub use crate::node::{agent_main, NodeConfig, Toolchain};
+    pub use crate::node::{agent_main, serve_if_agent, NodeConfig, Toolchain};
     pub use crate::observability::{Event, EventSink, RunState};
     pub use crate::process::is_agent;
     pub use crate::ssh::{parse_host_spec, Ssh, SshConfig};
