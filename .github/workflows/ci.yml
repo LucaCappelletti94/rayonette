@@ -16,7 +16,7 @@ jobs:
   # and format gates. ssh-localhost (level 3) runs in the coverage job; docker
   # multi-host (level 4) runs in the docker job.
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@stable
@@ -34,7 +34,7 @@ jobs:
   # unsound, or yanked) in the dependency tree. Accepted transitive advisories are
   # listed with a reason in .cargo/audit.toml.
   audit:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@stable
@@ -45,7 +45,7 @@ jobs:
   # Coverage via cargo-llvm-cov (LLVM source-based instrumentation). llvm-cov's
   # region attribution credits async/macro code that line-based tools miss.
   coverage:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@stable
@@ -79,7 +79,7 @@ jobs:
   # hosts (install -> ship -> build -> run), proves the cache, multi-hop
   # ProxyJump, and legible per-host failure. Also runs the flagship example.
   docker:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@stable
